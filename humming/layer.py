@@ -488,12 +488,12 @@ class HummingMethod(torch.nn.Module):
         old_kernel_configs = []
         if sublayer_name in layer.humming_kernel_config_modules:
             old_kernel_configs = layer.humming_kernel_config_modules[sublayer_name]()
-        old_kernel_configs += [min_shape_m, max_shape_m, kernel.kernel_id]
+        old_kernel_configs = [min_shape_m, max_shape_m, kernel.kernel_id] + old_kernel_configs
 
         block_size_configs = []
         if sublayer_name in layer.humming_block_size_configs:
             block_size_configs = layer.humming_block_size_configs[sublayer_name]
-        block_size_configs += [min_shape_m, max_shape_m, block_shape[0]]
+        block_size_configs = [min_shape_m, max_shape_m, block_shape[0]] + block_size_configs
         module = make_humming_module("get_kernel_configs", old_kernel_configs)
         layer.humming_kernel_config_modules[sublayer_name] = module.get_kernel_configs
         layer.humming_block_size_configs[sublayer_name] = block_size_configs
@@ -528,6 +528,8 @@ class HummingMethod(torch.nn.Module):
         expert_ids: Optional[torch.Tensor] = None,
         num_tokens_post_padded: Optional[torch.Tensor] = None,
         sublayer_name: str = "",
+        num_ctas_per_sm: int = 1,
+        num_sms: Optional[int] = None,
     ):
         meta = layer.humming_metas[sublayer_name]
         inputs, input_scale = cls.may_quant_input(meta, inputs, input_scale)
@@ -547,6 +549,8 @@ class HummingMethod(torch.nn.Module):
             expert_ids,
             num_tokens_post_padded,
             layer.locks,
+            num_ctas_per_sm,
+            num_sms,
         )
 
 
@@ -573,6 +577,23 @@ class HummingLayer(torch.nn.Module):
             global_scale=global_scale,
             bias=bias,
             expert_id=expert_id,
+        )
+
+    def add_kernel_config(
+        self,
+        min_shape_m: int,
+        max_shape_m: int,
+        block_shape: tuple[int],
+        warp_shape: tuple[int],
+        **kwargs,
+    ):
+        HummingMethod.add_kernel_config(
+            layer=self,
+            min_shape_m=min_shape_m,
+            max_shape_m=max_shape_m,
+            block_shape=block_shape,
+            warp_shape=warp_shape,
+            **kwargs
         )
 
     def finish_load(self):

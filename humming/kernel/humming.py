@@ -357,7 +357,7 @@ class HummingKernel(KernelRuntime):
 
         if self.mma_config.use_f16_accum:
             if self.a_dtype == dtypes.float8e4m3:
-                assert self.b_dtype.is_integer_type or self.b_dtype.exponent_bits <= 3
+                assert self.b_dtype.is_integer_type or self.b_dtype.exponent_bits <= 4
             elif self.a_dtype == dtypes.float16:
                 pass
             else:

@@ -108,7 +108,7 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
     if constexpr (PipelineConfig::kUseTmaC) tma_wait_store_group<0, true>();
     producer.load_stage<true, true>(0);
     PRAGMA_UNROLL
-    for (uint32_t stage_id = 1; stage_id < kNumStages - 1; stage_id++) {
+    for (uint32_t stage_id = 1; stage_id < MAX(kNumStages - 1, 2); stage_id++) {
       producer.load_stage(stage_id, stage_id < slice_iters);
     };
 
@@ -128,8 +128,15 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
           s2r_pipe.load_stage_iter(stage_id, warp_k_iter_id + 1);
           mma.run(stage_id, warp_k_iter_id);
           if (warp_k_iter_id == warp_k_iters - 2) {
-            producer.load_stage(stage_id + kNumStages - 1, slice_iters >= kNumStages);
-            consumer.wait_stage((stage_id + 1) % kNumStages);
+            if constexpr (kNumStages == 2) {
+              __syncthreads();
+              consumer.wait_stage((stage_id + 1) % kNumStages);
+              producer.load_stage(stage_id, slice_iters > kNumStages);
+            } else {
+              producer.load_stage(stage_id + kNumStages - 1, slice_iters >= kNumStages);
+              consumer.wait_stage((stage_id + 1) % kNumStages);
+            }
+
             __syncthreads();
           }
 
