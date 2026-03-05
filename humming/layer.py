@@ -1,5 +1,4 @@
 import dataclasses
-from typing import Optional
 
 import torch
 
@@ -28,15 +27,18 @@ class HummingLayerMeta(object):
     shape_k: int
     pad_shape_n: int = 0
     pad_shape_k: int = 0
-    num_experts: Optional[int] = None
-    has_input_scale: Optional[bool] = None
+    num_experts: int | None = None
+    has_input_scale: bool | None = None
     has_weight_scale: bool = True
     input_scale_group_size: int = 0
     weight_scale_group_size: int = 0
     has_dynamic_zp: bool = False
     has_bias: bool = False
     has_global_scale: bool = False
-    mma_type: Optional[str] = "mma"
+    mma_type: str | None = "mma"
+    top_k: int | None = None
+    is_moe: bool | None = None
+    is_moe_down: bool = False
     sublayer_name: str = ""
 
     @property
@@ -66,6 +68,9 @@ class HummingLayerMeta(object):
     def __post_init__(self):
         if self.a_dtype.num_bits != 16 and self.has_input_scale is None:
             self.has_input_scale = True
+        self.is_moe = self.num_experts is not None
+        if self.is_moe:
+            assert self.top_k is not None
 
 
 class HummingMethod(torch.nn.Module):
@@ -79,8 +84,8 @@ class HummingMethod(torch.nn.Module):
         layer: torch.nn.Module,
         name: str,
         data: torch.Tensor,
-        offset: Optional[int] = None,
-        expert_id: Optional[int] = None,
+        offset: int | None = None,
+        expert_id: int | None = None,
     ):
         param = getattr(layer, name, None)
         if name.endswith("bias"):
@@ -170,13 +175,13 @@ class HummingMethod(torch.nn.Module):
     def load_weight(
         cls,
         layer: torch.nn.Module,
-        weight: Optional[torch.Tensor] = None,
-        weight_scale: Optional[torch.Tensor] = None,
-        zero_point: Optional[torch.Tensor] = None,
-        global_scale: Optional[torch.Tensor] = None,
-        bias: Optional[torch.Tensor] = None,
-        offset_n: Optional[int] = None,
-        expert_id: Optional[int] = None,
+        weight: torch.Tensor | None = None,
+        weight_scale: torch.Tensor | None = None,
+        zero_point: torch.Tensor | None = None,
+        global_scale: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+        offset_n: int | None = None,
+        expert_id: int | None = None,
         sublayer_name: str = "",
         packed: bool = False,
         padded: bool = False,
@@ -503,7 +508,7 @@ class HummingMethod(torch.nn.Module):
         cls,
         meta: HummingLayerMeta,
         inputs: torch.Tensor,
-        input_scale: Optional[torch.Tensor] = None,
+        input_scale: torch.Tensor | None = None,
     ):
         assert meta.a_dtype.num_bits
         if meta.a_dtype.num_bits == 16:
@@ -521,15 +526,15 @@ class HummingMethod(torch.nn.Module):
         cls,
         layer: torch.nn.Module,
         inputs: torch.Tensor,
-        outputs: Optional[torch.Tensor] = None,
-        input_scale: Optional[torch.Tensor] = None,
-        topk_weights: Optional[torch.Tensor] = None,
-        sorted_token_ids: Optional[torch.Tensor] = None,
-        expert_ids: Optional[torch.Tensor] = None,
-        num_tokens_post_padded: Optional[torch.Tensor] = None,
+        outputs: torch.Tensor | None = None,
+        input_scale: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
+        sorted_token_ids: torch.Tensor | None = None,
+        expert_ids: torch.Tensor | None = None,
+        num_tokens_post_padded: torch.Tensor | None = None,
         sublayer_name: str = "",
         num_ctas_per_sm: int = 1,
-        num_sms: Optional[int] = None,
+        num_sms: int | None = None,
     ):
         meta = layer.humming_metas[sublayer_name]
         inputs, input_scale = cls.may_quant_input(meta, inputs, input_scale)
@@ -562,12 +567,12 @@ class HummingLayer(torch.nn.Module):
 
     def load_weight(
         self,
-        weight: Optional[torch.Tensor] = None,
-        weight_scale: Optional[torch.Tensor] = None,
-        zero_point: Optional[torch.Tensor] = None,
-        global_scale: Optional[torch.Tensor] = None,
-        bias: Optional[torch.Tensor] = None,
-        expert_id: Optional[int] = None,
+        weight: torch.Tensor | None = None,
+        weight_scale: torch.Tensor | None = None,
+        zero_point: torch.Tensor | None = None,
+        global_scale: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+        expert_id: int | None = None,
     ):
         HummingMethod.load_weight(
             layer=self,
@@ -593,7 +598,7 @@ class HummingLayer(torch.nn.Module):
             max_shape_m=max_shape_m,
             block_shape=block_shape,
             warp_shape=warp_shape,
-            **kwargs
+            **kwargs,
         )
 
     def finish_load(self):

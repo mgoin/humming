@@ -1,6 +1,5 @@
 import dataclasses
 import re
-from typing import Optional
 
 from humming.config.base import BaseHummingConfigClass
 from humming.config.enum import ActivationType, MmaType
@@ -13,21 +12,21 @@ class SchedulerConfig(BaseHummingConfigClass):
 
 @dataclasses.dataclass
 class PipelineConfig(BaseHummingConfigClass):
-    use_warp_spec: Optional[bool] = None
+    use_warp_spec: bool | None = None
     num_stages: int = 2
-    num_threads: Optional[int] = None
+    num_threads: int | None = None
     num_ctas_per_sm: int = 1
-    num_math_threads: Optional[int] = None
-    num_load_threads: Optional[int] = None
-    use_mbarrier: Optional[bool] = None
-    use_cp_async: Optional[bool] = None
-    use_tma: Optional[bool] = None
-    use_tma_a: Optional[bool] = None
-    use_tma_b: Optional[bool] = None
-    use_tma_c: Optional[bool] = None
-    use_tma_bs: Optional[bool] = None
-    use_tma_bzp: Optional[bool] = None
-    use_tma_bias: Optional[bool] = None
+    num_math_threads: int | None = None
+    num_load_threads: int | None = None
+    use_mbarrier: bool | None = None
+    use_cp_async: bool | None = None
+    use_tma: bool | None = None
+    use_tma_a: bool | None = None
+    use_tma_b: bool | None = None
+    use_tma_c: bool | None = None
+    use_tma_bs: bool | None = None
+    use_tma_bzp: bool | None = None
+    use_tma_bias: bool | None = None
 
     _name_map = {
         "use_mbarrier": "kUseMBarrier",
@@ -74,7 +73,7 @@ class PipelineConfig(BaseHummingConfigClass):
 
 @dataclasses.dataclass
 class QuantParamConfig(BaseHummingConfigClass):
-    has_input_scale: Optional[bool] = None
+    has_input_scale: bool | None = None
     has_weight_scale: bool = True
     input_scale_group_size: int = 0
     weight_scale_group_size: int = 0
@@ -127,7 +126,7 @@ class MoEConfig(BaseHummingConfigClass):
 
 @dataclasses.dataclass
 class MmaConfig(BaseHummingConfigClass):
-    mma_type: Optional[MmaType] = None
+    mma_type: MmaType | None = None
     use_f16_accum: bool = False
 
     @classmethod

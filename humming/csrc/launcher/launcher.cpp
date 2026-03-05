@@ -44,7 +44,6 @@ inline cudaStream_t get_current_cuda_stream(int64_t dev) {
   return static_cast<cudaStream_t>(stream_ptr);
 #else
   return at::cuda::getCurrentCUDAStream(dev);
-
 #endif
 }
 
@@ -76,7 +75,7 @@ Tensor launch_humming(
     int64_t num_ctas_per_sm = 1,
     std::optional<int64_t> num_sms = std::nullopt,
     bool should_check_tensor = true) {
-  
+
   if (a.is_meta()) {
     KernelData kernel_data = find_kernel(configs, 1);
     Tensor c = may_make_tensor_c(c_, a, kernel_data);

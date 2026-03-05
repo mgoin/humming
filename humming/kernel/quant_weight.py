@@ -1,7 +1,6 @@
 import ctypes
 import torch
 import cuda.bindings.driver as cbd
-from typing import Optional
 from humming.jit.runtime import KernelRuntime
 
 
@@ -54,9 +53,9 @@ class QuantWeightKernel(KernelRuntime):
     def __call__(
         self,
         inputs: torch.Tensor,
-        outputs: Optional[torch.Tensor] = None,
-        scales: Optional[torch.Tensor] = None,
-        zero_point: Optional[torch.Tensor] = None,
+        outputs: torch.Tensor | None = None,
+        scales: torch.Tensor | None = None,
+        zero_point: torch.Tensor | None = None,
     ):
         group_size = self.group_size
         if group_size <= 0:

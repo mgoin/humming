@@ -1,7 +1,6 @@
 import ctypes
 import torch
 import cuda.bindings.driver as cbd
-from typing import Optional
 from humming.jit.runtime import KernelRuntime
 
 
@@ -24,7 +23,7 @@ class UnpackWeightKernel(KernelRuntime):
         self.arg_types = (ctypes.c_void_p, ctypes.c_void_p)
         self.prepare()
 
-    def __call__(self, inputs: torch.Tensor, outputs: Optional[torch.Tensor] = None):
+    def __call__(self, inputs: torch.Tensor, outputs: torch.Tensor | None = None):
         assert inputs.is_cuda
         assert inputs.is_contiguous()
         assert inputs.size(-1) % self.num_bits == 0

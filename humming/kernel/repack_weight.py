@@ -2,7 +2,6 @@ import torch
 import ctypes
 import math
 import cuda.bindings.driver as cbd
-from typing import Optional
 from humming.jit.runtime import KernelRuntime
 
 
@@ -68,10 +67,10 @@ class WeightRepackKernel(KernelRuntime):
     def __call__(
         self,
         inputs: torch.Tensor,
-        outputs: Optional[torch.Tensor] = None,
-        zero_point: Optional[torch.Tensor] = None,
-        padded_shape_n: Optional[int] = None,
-        padded_shape_k: Optional[int] = None,
+        outputs: torch.Tensor | None = None,
+        zero_point: torch.Tensor | None = None,
+        padded_shape_n: int | None = None,
+        padded_shape_k: int | None = None,
     ):
         assert inputs.ndim in [2, 3]
         assert inputs.is_cuda

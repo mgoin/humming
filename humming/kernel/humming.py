@@ -2,7 +2,6 @@ import ctypes
 import math
 import os
 import zlib
-from typing import Optional
 
 import torch
 import torch.utils.cpp_extension
@@ -386,19 +385,19 @@ class HummingKernel(KernelRuntime):
         self,
         inputs: torch.Tensor,
         weight: torch.Tensor,
-        outputs: Optional[torch.Tensor] = None,
-        input_scale: Optional[torch.Tensor] = None,
-        weight_scale: Optional[torch.Tensor] = None,
-        zero_point: Optional[torch.Tensor] = None,
-        bias: Optional[torch.Tensor] = None,
-        global_scale: Optional[torch.Tensor] = None,
-        topk_weights: Optional[torch.Tensor] = None,
-        sorted_token_ids: Optional[torch.Tensor] = None,
-        expert_ids: Optional[torch.Tensor] = None,
-        num_tokens_post_padded: Optional[torch.Tensor] = None,
-        locks: Optional[torch.Tensor] = None,
+        outputs: torch.Tensor | None = None,
+        input_scale: torch.Tensor | None = None,
+        weight_scale: torch.Tensor | None = None,
+        zero_point: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+        global_scale: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
+        sorted_token_ids: torch.Tensor | None = None,
+        expert_ids: torch.Tensor | None = None,
+        num_tokens_post_padded: torch.Tensor | None = None,
+        locks: torch.Tensor | None = None,
         num_ctas_per_sm: int = 1,
-        num_sms: Optional[int] = None,
+        num_sms: int | None = None,
     ):
         # We need to integrate the module containing the kernel_id
         # into the forward path. This ensures that when the kernel changes,

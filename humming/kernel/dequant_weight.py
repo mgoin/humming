@@ -2,7 +2,6 @@ import torch
 import math
 import ctypes
 import cuda.bindings.driver as cbd
-from typing import Optional
 from humming.jit.runtime import KernelRuntime
 
 
@@ -35,7 +34,7 @@ class DequantKernel(KernelRuntime):
     def __call__(
         self,
         inputs: torch.Tensor,
-        outputs: Optional[torch.Tensor],
+        outputs: torch.Tensor | None,
         exponent_bits: int,
         mantissa_bits: int,
         is_signed: bool,

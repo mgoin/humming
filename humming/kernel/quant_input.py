@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 import triton
 import triton.language as tl
@@ -226,7 +224,6 @@ def humming_quant_input_fake(
     if group_size is None or group_size == 0:
         group_size = inputs.size(1)
     assert inputs.size(1) % group_size == 0
-    num_blocks = inputs.nelement() // group_size
 
     if is_dynamic:
         scales = torch.empty(
