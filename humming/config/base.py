@@ -39,6 +39,7 @@ def name_value_to_extern_const_style(name: str, value: Any) -> str:
 @dataclasses.dataclass
 class BaseHummingConfigClass(object):
     _name_map = {}
+    _cpp_ignore_names = set()
 
     def __post_init__(self):
         for field in dataclasses.fields(self):
@@ -47,7 +48,7 @@ class BaseHummingConfigClass(object):
             value = getattr(self, name)
             msg = f"NAME: {name} ; FIELDTYPE: {field_type}; VALUE: {value}"
 
-            if "typing.Optional" in str(field_type):
+            if "typing.Optional" in str(field_type) or " | None" in str(field_type):
                 if value is None:
                     continue
                 field_type = field_type.__args__[0]
@@ -72,6 +73,8 @@ class BaseHummingConfigClass(object):
         str_list = []
         for field in dataclasses.fields(self):
             name = field.name
+            if name in self._cpp_ignore_names:
+                continue
             value = getattr(self, name)
             keep_name = name in self._name_map
             if keep_name:
@@ -91,6 +94,8 @@ class BaseHummingConfigClass(object):
         str_list = []
         for field in dataclasses.fields(self):
             name = field.name
+            if name in self._cpp_ignore_names:
+                continue
             value = getattr(self, name)
             line = name_value_to_extern_const_style(name, value)
             str_list.append(line)

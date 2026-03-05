@@ -78,15 +78,19 @@ class QuantParamConfig(BaseHummingConfigClass):
     input_scale_group_size: int = 0
     weight_scale_group_size: int = 0
     has_global_scale: bool = False
-    has_dynamic_zero_point: bool = False
+    has_zero_point: bool = False
 
 
 @dataclasses.dataclass
 class EpilogueConfig(BaseHummingConfigClass):
     has_bias: bool = False
     activation_type: ActivationType = ActivationType.NONE
+    custom_activation_func_impl: str | None = None
 
-    def prepare_custom_activation_func(self, impl_text):
+    _cpp_ignore_names = {"custom_activation_func_impl"}
+
+    def prepare_custom_activation_func(self):
+        impl_text = self.custom_activation_func_impl
         if self.activation_type == ActivationType.CUSTOM:
             template = (
                 "template <>\n"

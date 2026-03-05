@@ -158,7 +158,7 @@ def test_zeropoint(a_dtype, b_dtype, c_dtype):
         group_size=0,
         dtype=b_dtype,
         scale_dtype=bs_dtype,
-        has_dynamic_zp=True,
+        has_zero_point=True,
     )
 
     _, weight_ref, weight, weight_scale, zero_point, _ = random_weight_data
@@ -186,7 +186,7 @@ def test_zeropoint(a_dtype, b_dtype, c_dtype):
         use_warp_spec=False,
         use_tma=False,
         use_cp_async=False,
-        has_dynamic_zero_point=True,
+        has_zero_point=True,
         mma_type="mma",
         use_stream_k=False,
     )

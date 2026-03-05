@@ -63,7 +63,7 @@ CUDA_INLINE void calculate_buffer_range_value(float &max_val, float &min_val, ui
 };
 
 
-template <class SourceType, class TargetType, bool kHasDynamicZeroPoint>
+template <class SourceType, class TargetType, bool kHasZeroPoint>
 CUDA_INLINE void quant_buffer(
     float &inv_scale_val, uint4 buffer, uint4 *out_buffer_ptr,
     float max_abs_val, float min_val) {
@@ -89,12 +89,12 @@ CUDA_INLINE void quant_buffer(
 
   PRAGMA_UNROLL
   for (uint32_t i = 0; i < num_elements; i++) {
-    if constexpr (TargetType::kIsIntegerType && kHasDynamicZeroPoint) {
+    if constexpr (TargetType::kIsIntegerType && kHasZeroPoint) {
       int32_t *out_vals = reinterpret_cast<int32_t *>(out_buffer_ptr);
       out_vals[i] = __float2int_rn((vals[i] - min_val) * inv_scale_val);
       out_vals[i] = fmaxf(out_vals[i], 0);
       out_vals[i] = fminf(out_vals[i], (1 << TargetType::kBits) - 1);
-    } else if constexpr (TargetType::kIsIntegerType && !kHasDynamicZeroPoint) {
+    } else if constexpr (TargetType::kIsIntegerType && !kHasZeroPoint) {
       int32_t *out_vals = reinterpret_cast<int32_t *>(out_buffer_ptr);
       out_vals[i] = __float2int_rn(vals[i] * inv_scale_val);
       if constexpr (!TargetType::kIsSigned) out_vals[i] += 1 << (TargetType::kBits - 1);
@@ -155,7 +155,7 @@ CUDA_INLINE float warp_reduce_min(float val) {
 template <
     class SourceType, class TargetType,
     uint32_t kQuantGroupSize, bool kHasScale,
-    bool kUseUE8M0Scale, bool kHasDynamicZeroPoint>
+    bool kUseUE8M0Scale, bool kHasZeroPoint>
 __global__ void quant_weight(uint4 *in_ptr, uint4 *out_ptr, uint32_t *out_scale_ptr, uint32_t *zero_point_ptr) {
 
   static_assert(std::is_same<SourceType, Float16>::value ||
@@ -204,7 +204,7 @@ __global__ void quant_weight(uint4 *in_ptr, uint4 *out_ptr, uint32_t *out_scale_
 
     if constexpr (TargetType::kIsFloatingPointType) {
       scale_val = max_abs_val / get_data_type_max_num<TargetType>();
-    } else if constexpr (!kHasDynamicZeroPoint) {
+    } else if constexpr (!kHasZeroPoint) {
       float min_abs_val = fminf(max_val, fabsf(min_val));
       float dtype_max_val = get_data_type_max_num<TargetType>();
       float scale_val1 = max_abs_val / (dtype_max_val + 1.499);
@@ -235,7 +235,7 @@ __global__ void quant_weight(uint4 *in_ptr, uint4 *out_ptr, uint32_t *out_scale_
         out_scale_ptr_float[blockIdx.x] = scale_val;
       }
 
-      if constexpr (kHasDynamicZeroPoint) {
+      if constexpr (kHasZeroPoint) {
         zero_point_ptr[blockIdx.x] = static_cast<uint32_t>(zero_point);
       }
     }
@@ -256,7 +256,7 @@ __global__ void quant_weight(uint4 *in_ptr, uint4 *out_ptr, uint32_t *out_scale_
 
     uint4 out_buffer[32 / SourceType::kBits];
 
-    quant_buffer<SourceType, TargetType, kHasDynamicZeroPoint>(
+    quant_buffer<SourceType, TargetType, kHasZeroPoint>(
         inv_scale_val, buffer, out_buffer, max_abs_val, min_val);
 
     if (offset < kQuantGroupSize) {

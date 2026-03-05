@@ -65,7 +65,7 @@ See support matrix in `README.md`.
 
 - `has_global_scale`🔔: Enable global scale or not. Note that this is not conflict with `has_weight_scale`, you can set both to `True` (for example, NVFP4).
 
-- `has_dynamic_zero_point`🔔: Enable dynamic zero point or not.
+- `has_zero_point`🔔: Enable dynamic zero point or not.
   - Must be `False` if `has_weight_scale` is False.
   - Share the same group size with `weight_scale_group_size`.
 

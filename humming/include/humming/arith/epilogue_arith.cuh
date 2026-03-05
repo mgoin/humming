@@ -27,7 +27,7 @@ private:
   static constexpr bool kIsChannelInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
   static constexpr bool kIsChannelWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
   static constexpr bool kHasGlobalScale = QuantParamConfig::kHasGlobalScale;
-  static constexpr bool kHasDynamicZeroPoint = QuantParamConfig::kHasDynamicZeroPoint;
+  static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
 
   static constexpr bool kHasActivation = EpilogueConfig::kActivationType != ActivationType::NONE;
@@ -36,7 +36,7 @@ private:
   static constexpr bool kHasIndentityActivation = kHasActivation && !kHasGLUActivation;
 
   static constexpr uint2 kExpOffset = get_epilogue_exp_offset<
-      ElementA, ElementB, ElementC, ElementBS, kHasDynamicZeroPoint,
+      ElementA, ElementB, ElementC, ElementBS, kHasZeroPoint,
       kIsF16Accum, kIsGroupInputScale, kIsGroupWeightScale>();
 
   static constexpr uint32_t kSizeAS = WarpShape::M / 8;

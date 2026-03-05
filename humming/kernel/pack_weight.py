@@ -1,14 +1,16 @@
 import ctypes
-import torch
+
 import cuda.bindings.driver as cbd
+import jinja2
+import torch
+
 from humming.jit.runtime import KernelRuntime
 
-
-CODE_TEMPLATE = """
+CODE_TEMPLATE = jinja2.Template("""
 #include <humming/kernel/pack_weight.cuh>
 
-auto ptr = reinterpret_cast<void*>(&pack_weight_kernel<{num_bits}>);
-"""
+auto ptr = reinterpret_cast<void*>(&pack_weight_kernel<{{num_bits}}>);
+""")
 
 
 class PackWeightKernel(KernelRuntime):
@@ -19,7 +21,7 @@ class PackWeightKernel(KernelRuntime):
             return
         self._set_sm_version(sm_version, device_index)
         self.num_bits = num_bits
-        self.code = CODE_TEMPLATE.format(num_bits=num_bits)
+        self.code = CODE_TEMPLATE.render(num_bits=num_bits)
         self.arg_types = (ctypes.c_void_p, ctypes.c_void_p)
         self.prepare()
 

@@ -1,4 +1,5 @@
 import dataclasses
+from typing import Any
 
 import torch
 
@@ -32,7 +33,7 @@ class HummingLayerMeta(object):
     has_weight_scale: bool = True
     input_scale_group_size: int = 0
     weight_scale_group_size: int = 0
-    has_dynamic_zp: bool = False
+    has_zero_point: bool = False
     has_bias: bool = False
     has_global_scale: bool = False
     mma_type: str | None = "mma"
@@ -143,7 +144,7 @@ class HummingMethod(torch.nn.Module):
             weight_scale = torch.empty(weight_scale_shape, dtype=torch_dtype)
             cls.set_param(layer, meta.weight_scale_name, weight_scale)
 
-            if meta.has_dynamic_zp:
+            if meta.has_zero_point:
                 zero_point = torch.empty(zero_point_shape, dtype=torch.int32)
                 cls.set_param(layer, meta.zero_point_name, zero_point)
 
@@ -207,7 +208,7 @@ class HummingMethod(torch.nn.Module):
                 dtype=meta.b_dtype,
                 scale_dtype=meta.bs_dtype,
                 group_size=meta.weight_scale_group_size,
-                has_dynamic_zp=meta.has_dynamic_zp,
+                has_zero_point=meta.has_zero_point,
                 has_global_scale=meta.has_global_scale,
             )
 
@@ -456,6 +457,35 @@ class HummingMethod(torch.nn.Module):
             )
 
     @classmethod
+    def prepare_kernel(
+        cls,
+        layer: torch.nn.Module,
+        block_shape: tuple[int],
+        warp_shape: tuple[int],
+        sublayer_name: str = "",
+        **kwargs,
+    ):
+        meta: HummingLayerMeta = layer.humming_metas[sublayer_name]
+        layer_kwargs = dict(
+            (key, value)
+            for key, value in dataclasses.asdict(meta)
+            if "shape" not in key and "name" not in key
+        )
+        conflict_keys = set(kwargs) & set(layer_kwargs)
+        msg = f"the following keys are derived from layers, {conflict_keys}"
+        assert not conflict_keys, msg
+        kernel = HummingKernel(
+            problem_shape=(0, meta.shape_n, meta.shape_k),
+            block_shape=block_shape,
+            warp_shape=warp_shape,
+            pad_shape=(0, meta.pad_shape_n, meta.pad_shape_k),
+            **layer_kwargs,
+            **kwargs,
+        )
+
+        return [kernel.kernel_id, kwargs.get("num_sms", 0)]
+
+    @classmethod
     def add_kernel_config(
         cls,
         layer: torch.nn.Module,
@@ -466,26 +496,7 @@ class HummingMethod(torch.nn.Module):
         sublayer_name: str = "",
         **kwargs,
     ):
-        meta: HummingLayerMeta = layer.humming_metas[sublayer_name]
-        kernel = HummingKernel(
-            problem_shape=(0, meta.shape_n, meta.shape_k),
-            block_shape=block_shape,
-            warp_shape=warp_shape,
-            pad_shape=(0, meta.pad_shape_n, meta.pad_shape_k),
-            a_dtype=meta.a_dtype,
-            b_dtype=meta.b_dtype,
-            c_dtype=meta.c_dtype,
-            bs_dtype=meta.bs_dtype,
-            has_input_scale=meta.has_input_scale,
-            has_weight_scale=meta.has_weight_scale,
-            input_scale_group_size=meta.input_scale_group_size,
-            weight_scale_group_size=meta.weight_scale_group_size,
-            has_dynamic_zero_point=meta.has_dynamic_zp,
-            has_bias=meta.has_bias,
-            has_global_scale=meta.has_global_scale,
-            mma_type=meta.mma_type,
-            **kwargs,
-        )
+        kernel_config = cls.prepare_kernel(layer, block_shape, warp_shape, sublayer_name, **kwargs)
         if not hasattr(layer, "humming_kernel_config_modules"):
             layer.humming_kernel_config_modules = {}
         if not hasattr(layer, "humming_block_size_configs"):
@@ -493,7 +504,7 @@ class HummingMethod(torch.nn.Module):
         old_kernel_configs = []
         if sublayer_name in layer.humming_kernel_config_modules:
             old_kernel_configs = layer.humming_kernel_config_modules[sublayer_name]()
-        old_kernel_configs = [min_shape_m, max_shape_m, kernel.kernel_id] + old_kernel_configs
+        old_kernel_configs = [min_shape_m, max_shape_m, *kernel_config] + old_kernel_configs
 
         block_size_configs = []
         if sublayer_name in layer.humming_block_size_configs:
@@ -531,14 +542,20 @@ class HummingMethod(torch.nn.Module):
         topk_weights: torch.Tensor | None = None,
         sorted_token_ids: torch.Tensor | None = None,
         expert_ids: torch.Tensor | None = None,
-        num_tokens_post_padded: torch.Tensor | None = None,
+        num_tokens_padded: torch.Tensor | None = None,
         sublayer_name: str = "",
-        num_ctas_per_sm: int = 1,
-        num_sms: int | None = None,
+        kernel_config: dict[str, Any] | None = None,
     ):
         meta = layer.humming_metas[sublayer_name]
         inputs, input_scale = cls.may_quant_input(meta, inputs, input_scale)
-        configs = layer.humming_kernel_config_modules[sublayer_name]()
+        if kernel_config is None:
+            assert hasattr(layer, "humming_kernel_config_modules"), (
+                "To forward humming layer, you should either specify kernel_config or "
+                "run prepare_default_kernel_configs / add_kernel_config before forwarding."
+            )
+            configs = layer.humming_kernel_config_modules[sublayer_name]()
+        else:
+            configs = cls.prepare_kernel(layer, sublayer_name=sublayer_name, **kernel_config)
         return torch.ops.humming.launch_humming(
             configs,
             inputs,
@@ -552,10 +569,8 @@ class HummingMethod(torch.nn.Module):
             topk_weights,
             sorted_token_ids,
             expert_ids,
-            num_tokens_post_padded,
+            num_tokens_padded,
             layer.locks,
-            num_ctas_per_sm,
-            num_sms,
         )
 
 
@@ -565,44 +580,16 @@ class HummingLayer(torch.nn.Module):
         self.meta = HummingLayerMeta(**kwargs)
         HummingMethod.create_weights(self, self.meta)
 
-    def load_weight(
-        self,
-        weight: torch.Tensor | None = None,
-        weight_scale: torch.Tensor | None = None,
-        zero_point: torch.Tensor | None = None,
-        global_scale: torch.Tensor | None = None,
-        bias: torch.Tensor | None = None,
-        expert_id: int | None = None,
-    ):
-        HummingMethod.load_weight(
-            layer=self,
-            weight=weight,
-            weight_scale=weight_scale,
-            zero_point=zero_point,
-            global_scale=global_scale,
-            bias=bias,
-            expert_id=expert_id,
-        )
+    def load_weight(self, **kwargs):
+        HummingMethod.load_weight(self, **kwargs)
 
-    def add_kernel_config(
-        self,
-        min_shape_m: int,
-        max_shape_m: int,
-        block_shape: tuple[int],
-        warp_shape: tuple[int],
-        **kwargs,
-    ):
-        HummingMethod.add_kernel_config(
-            layer=self,
-            min_shape_m=min_shape_m,
-            max_shape_m=max_shape_m,
-            block_shape=block_shape,
-            warp_shape=warp_shape,
-            **kwargs,
-        )
+    def add_kernel_config(self, **kwargs):
+        HummingMethod.add_kernel_config(self, **kwargs)
 
     def finish_load(self):
         HummingMethod.finish_load(self)
+
+    def prepare_default_kernel_configs(self):
         HummingMethod.prepare_default_kernel_configs(self)
 
     def forward(self, **kwargs):

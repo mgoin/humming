@@ -11,7 +11,7 @@ template <
 struct WMMA {
 public:
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
-  static constexpr bool kHasDynamicZeroPoint = QuantParamConfig::kHasDynamicZeroPoint;
+  static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
 
   using MmaOpClass = MmaOpClass_;
   using MmaShape = class MmaOpClass::MmaShape;
@@ -44,7 +44,7 @@ public:
       uint32_t *regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id][i * 16 / MmaShape::N]);
       uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, i);
       uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
-      dequant<ElementB, ElementA, kHasDynamicZeroPoint>(regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
+      dequant<ElementB, ElementA, kHasZeroPoint>(regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
       arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
     };
   };

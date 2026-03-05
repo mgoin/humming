@@ -17,7 +17,7 @@ private:
   static constexpr bool kHasGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
   static constexpr bool kHasChannelWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
   static constexpr bool kHasGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
-  static constexpr bool kHasDynamicZeroPoint = QuantParamConfig::kHasDynamicZeroPoint;
+  static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
 
 public:
   static constexpr uint32_t kNumStages = PipelineConfig::kNumStages;
@@ -47,7 +47,7 @@ public:
 
   static constexpr uint32_t kChannelSizeAS = kHasChannelInputScale ? BlockShape::M / 4 : 0;
   static constexpr uint32_t kChannelSizeBS = kHasChannelWeightScale ? kSmemStrideBS : 0;
-  static constexpr uint32_t kChannelSizeBZP = (kHasChannelWeightScale && kHasDynamicZeroPoint) ? kSmemStrideBZP : 0;
+  static constexpr uint32_t kChannelSizeBZP = (kHasChannelWeightScale && kHasZeroPoint) ? kSmemStrideBZP : 0;
   static constexpr uint32_t kBiasSize = EpilogueConfig::kHasBias ? kSmemStrideBias : 0;
 
   static constexpr bool kUseWarpSpec = PipelineConfig::kUseWarpSpec;

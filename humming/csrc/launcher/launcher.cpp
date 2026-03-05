@@ -12,29 +12,32 @@
 
 static std::unordered_map<int64_t, KernelData> g_kernel_data;
 
-inline int64_t find_kernel_id(IntArrayRef &configs, int64_t shape_m) {
+inline int64_t find_kernel_configs_target_index(IntArrayRef &configs, int64_t shape_m) {
   size_t n = configs.size();
-  if (n == 1) return configs[0];
-  if (n > 0 && n % 3 == 0) {
-    for (size_t i = 0; i < n; i += 3) {
+  if (n <= 2) return 0;
+  if (n > 0 && n % 4 == 0) {
+    for (size_t i = 0; i < n; i += 4) {
       int64_t min_val = configs[i];
       int64_t max_val = configs[i + 1];
       max_val = max_val > 0 ? max_val : (1 << 30);
-      int64_t target = configs[i + 2];
-      if (shape_m >= min_val && shape_m <= max_val) return target;
+      if (shape_m >= min_val && shape_m <= max_val) return i + 2;
     }
 
     STD_TORCH_CHECK(false, "shape_m is not within any range defined in configs.");
   }
 
-  STD_TORCH_CHECK(false, "configs length must be 1 or a non-zero multiple of 3.");
+  STD_TORCH_CHECK(false, "configs length must be 1-2 or a non-zero multiple of 4.");
 };
 
-inline KernelData find_kernel(IntArrayRef &configs, int64_t shape_m) {
-  int64_t kernel_id = find_kernel_id(configs, shape_m);
+inline KernelLaunchData find_kernel_launch_data(IntArrayRef &configs, int64_t shape_m) {
+  auto n = configs.size();
+  int64_t index = find_kernel_configs_target_index(configs, shape_m);
+  int64_t kernel_id = configs[index];
+  int64_t num_sms = n < 2 ? 0 : configs[index + 1];
   STD_TORCH_CHECK(g_kernel_data.find(kernel_id) != g_kernel_data.end(), "kernel not existed.");
   KernelData &kernel_data = g_kernel_data[kernel_id];
-  return kernel_data;
+  KernelLaunchData kernel_launch_data = {kernel_data, num_sms};
+  return kernel_launch_data;
 };
 
 inline cudaStream_t get_current_cuda_stream(int64_t dev) {
@@ -47,11 +50,8 @@ inline cudaStream_t get_current_cuda_stream(int64_t dev) {
 #endif
 }
 
-inline int64_t get_num_sms(std::optional<int64_t> num_sms, int64_t dev) {
-  if (num_sms.has_value()) {
-    ASSERT_CHECK(num_sms.value() > 0, "error: num_sms < 1 => ", num_sms.value(), " < 1");
-    return num_sms.value();
-  }
+inline int64_t get_num_sms(int64_t num_sms, int64_t dev) {
+  if (num_sms > 0) return num_sms;
   int32_t dev_sms;
   cudaDeviceGetAttribute(&dev_sms, cudaDevAttrMultiProcessorCount, dev);
   return static_cast<int64_t>(dev_sms);
@@ -68,16 +68,15 @@ Tensor launch_humming(
     std::optional<Tensor> bias_,
     std::optional<Tensor> gs_,
     std::optional<Tensor> topk_weights_,
-    std::optional<Tensor> sorted_token_ids_,
+    std::optional<Tensor> sorted_ids_,
     std::optional<Tensor> expert_ids_,
-    std::optional<Tensor> num_tokens_post_padded_,
+    std::optional<Tensor> num_tokens_padded_,
     std::optional<Tensor> locks_,
-    int64_t num_ctas_per_sm = 1,
-    std::optional<int64_t> num_sms = std::nullopt,
     bool should_check_tensor = true) {
 
   if (a.is_meta()) {
-    KernelData kernel_data = find_kernel(configs, 1);
+    KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, 1);
+    KernelData& kernel_data = kernel_launch_data.kernel_data;
     Tensor c = may_make_tensor_c(c_, a, kernel_data);
     return may_reshape_tensor_c(c, kernel_data);
   }
@@ -85,7 +84,9 @@ Tensor launch_humming(
   int64_t dev = a.get_device();
   int64_t shape_m = a.size(0);
   int64_t num_experts = b.dim() == 3 ? b.size(0) : 0;
-  KernelData kernel_data = find_kernel(configs, shape_m);
+  KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, shape_m);
+  KernelData& kernel_data = kernel_launch_data.kernel_data;
+  int64_t &num_sms = kernel_launch_data.num_sms;
   int64_t actual_shape_m = shape_m * (kernel_data.is_moe_down ? kernel_data.top_k : 1);
   Tensor c = may_make_tensor_c(c_, a, kernel_data);
   a = a.contiguous();
@@ -100,7 +101,7 @@ Tensor launch_humming(
     check_tensor_bias(bias_, kernel_data, dev, num_experts);
     check_tensor_gs(gs_, kernel_data, dev, num_experts);
     check_tensor_locks(locks_, kernel_data, dev);
-    check_tensor_moe(topk_weights_, sorted_token_ids_, expert_ids_, num_tokens_post_padded_, kernel_data, dev);
+    check_tensor_moe(topk_weights_, sorted_ids_, expert_ids_, num_tokens_padded_, kernel_data, dev);
   }
 
   void *a_ptr = a.data_ptr();
@@ -112,9 +113,9 @@ Tensor launch_humming(
   void *bias_ptr = bias_.has_value() ? bias_->data_ptr() : nullptr;
   void *gs_ptr = gs_.has_value() ? gs_->data_ptr() : nullptr;
   void *topk_weights_ptr = topk_weights_.has_value() ? topk_weights_->data_ptr() : nullptr;
-  void *sorted_token_ids_ptr = sorted_token_ids_.has_value() ? sorted_token_ids_->data_ptr() : nullptr;
+  void *sorted_ids_ptr = sorted_ids_.has_value() ? sorted_ids_->data_ptr() : nullptr;
   void *expert_ids_ptr = expert_ids_.has_value() ? expert_ids_->data_ptr() : nullptr;
-  void *num_tokens_post_padded_ptr = num_tokens_post_padded_.has_value() ? num_tokens_post_padded_->data_ptr() : nullptr;
+  void *num_tokens_padded_ptr = num_tokens_padded_.has_value() ? num_tokens_padded_->data_ptr() : nullptr;
   void *locks_ptr = locks_.has_value() ? locks_->data_ptr() : nullptr;
 
   auto tensor_map_a = make_tma_desc_a(a, kernel_data);
@@ -135,14 +136,14 @@ Tensor launch_humming(
       kernel_data.use_tma_bias ? to_void_ptr(&tensor_map_bias) : to_void_ptr(&bias_ptr),
       &gs_ptr,
       &topk_weights_ptr,
-      &sorted_token_ids_ptr,
+      &sorted_ids_ptr,
       &expert_ids_ptr,
-      &num_tokens_post_padded_ptr,
+      &num_tokens_padded_ptr,
       &locks_ptr,
       &actual_shape_m};
 
   CUlaunchConfig config = {};
-  config.gridDimX = num_ctas_per_sm * get_num_sms(num_sms, dev);
+  config.gridDimX = kernel_data.num_ctas_per_sm * get_num_sms(num_sms, dev);
   config.gridDimY = 1;
   config.gridDimZ = 1;
   config.blockDimX = kernel_data.num_threads;
@@ -194,6 +195,7 @@ int64_t register_kernel(const std::string &cubin_path, const std::string &func_n
         reader.getUint32("INPUT_SCALE_GROUP_SIZE"),
         reader.getUint32("WEIGHT_SCALE_GROUP_SIZE"),
         reader.getUint32("TOP_K"),
+        reader.getUint32("NUM_CTAS_PER_SM"),
 
         reader.getBool("USE_STREAM_K"),
         reader.getBool("IS_MOE"),
@@ -201,7 +203,7 @@ int64_t register_kernel(const std::string &cubin_path, const std::string &func_n
         reader.getBool("IS_GLU_ACTIVATION"),
         reader.getBool("HAS_INPUT_SCALE"),
         reader.getBool("HAS_WEIGHT_SCALE"),
-        reader.getBool("HAS_DYNAMIC_ZERO_POINT"),
+        reader.getBool("HAS_ZERO_POINT"),
         reader.getBool("HAS_BIAS"),
         reader.getBool("HAS_GLOBAL_SCALE"),
         reader.getBool("USE_TMA_A"),
@@ -219,8 +221,8 @@ COMMON_TORCH_LIBRARY(humming, m) {
   m.def(
       "launch_humming(int[] configs, Tensor a, Tensor b, Tensor(c!)? c, "
       "Tensor? as_, Tensor? bs, Tensor? bzp, Tensor? bias, Tensor? gs, "
-      "Tensor? topk_weights, Tensor? sorted_token_ids, Tensor? expert_ids, Tensor? num_tokens_post_padded, "
-      "Tensor(locks!)? locks, int num_ctas_per_sm = 1, int? num_sms = None, bool should_check_tensor = True) -> Tensor");
+      "Tensor? topk_weights, Tensor? sorted_ids, Tensor? expert_ids, Tensor? num_tokens_padded, "
+      "Tensor(locks!)? locks, bool should_check_tensor = True) -> Tensor");
   m.def("register_kernel(str cubin_path, str func_name) -> int");
 };
 

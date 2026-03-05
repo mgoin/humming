@@ -1,9 +1,10 @@
-import torch
-import math
 import ctypes
-import cuda.bindings.driver as cbd
-from humming.jit.runtime import KernelRuntime
+import math
 
+import cuda.bindings.driver as cbd
+import torch
+
+from humming.jit.runtime import KernelRuntime
 
 CODE_TEMPLATE = """
 #include <humming/kernel/dequant_weight.cuh>

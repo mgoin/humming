@@ -1,8 +1,10 @@
 import ctypes
+import dataclasses
 import math
 import os
 import zlib
 
+import jinja2
 import torch
 import torch.utils.cpp_extension
 
@@ -11,63 +13,59 @@ import humming.jit.utils as jit_utils
 from humming.config import (
     EpilogueConfig,
     MmaConfig,
+    MmaOpClass,
+    MmaType,
     MoEConfig,
     PipelineConfig,
     QuantParamConfig,
     SchedulerConfig,
 )
-from humming.config.enum import MmaType
-from humming.config.mma import MmaOpClass
-from humming.dtypes import DataType
 from humming.jit.runtime import KernelRuntime
-from humming.jit.utils import make_humming_module
 
-CODE_TEMPLATE = """
-#if {use_warp_spec}
+CODE_TEMPLATE = jinja2.Template("""
+#if {{use_warp_spec}}
 #include <humming/kernel/humming_ws.cuh>
 #else
 #include <humming/kernel/humming.cuh>
 #endif
 
-class MmaOpClass {{
+class MmaOpClass {
 public:
-{mma_op_class}
-}};
+{{mma_op_class}}
+};
 
-class SchedulerConfig {{
+class SchedulerConfig {
 public:
-{scheduler_config}
-}};
+{{scheduler_config}}
+};
 
-class PipelineConfig {{
+class PipelineConfig {
 public:
-{pipeline_config}
-}};
+{{pipeline_config}}
+};
 
-class EpilogueConfig {{
+class EpilogueConfig {
 public:
-{epilogue_config}
-}};
+{{epilogue_config}}
+};
 
-class QuantParamConfig {{
+class QuantParamConfig {
 public:
-{quant_param_config}
-}};
+{{quant_param_config}}
+};
 
-class MoEConfig {{
+class MoEConfig {
 public:
-{moe_config}
-}};
-
-{custom_activation_func}
+{{moe_config}}
+};
 
 using SharedStorageType = SharedStorage<
     MmaOpClass,
-    Shape<{block_m}, {block_n}, {block_k}>,
-    Shape<{warp_m}, {warp_n}, {warp_k}>,
-    {a_dtype},
-    {b_dtype},
-    {bs_dtype},
+    Shape<{{block_shape[0]}}, {{block_shape[1]}}, {{block_shape[2]}}>,
+    Shape<{{warp_shape[0]}}, {{warp_shape[1]}}, {{warp_shape[2]}}>,
+    {{a_dtype}},
+    {{b_dtype}},
+    {{bs_dtype}},
     PipelineConfig,
     EpilogueConfig,
     QuantParamConfig,
@@ -75,14 +73,14 @@ using SharedStorageType = SharedStorage<
 
 auto ptr = reinterpret_cast<void*>(&humming<
     MmaOpClass,
-    Shape<0, {shape_n}, {shape_k}>,
-    Shape<{block_m}, {block_n}, {block_k}>,
-    Shape<{warp_m}, {warp_n}, {warp_k}>,
-    Shape<0, {pad_n}, {pad_k}>,
-    {a_dtype},
-    {b_dtype},
-    {c_dtype},
-    {bs_dtype},
+    Shape<0, {{problem_shape[1]}}, {{problem_shape[2]}}>,
+    Shape<{{block_shape[0]}}, {{block_shape[1]}}, {{block_shape[2]}}>,
+    Shape<{{warp_shape[0]}}, {{warp_shape[1]}}, {{warp_shape[2]}}>,
+    Shape<0, {{pad_shape[1]}}, {{pad_shape[2]}}>,
+    {{a_dtype}},
+    {{b_dtype}},
+    {{c_dtype}},
+    {{bs_dtype}},
     SchedulerConfig,
     PipelineConfig,
     EpilogueConfig,
@@ -95,38 +93,38 @@ extern "C" __constant__ uint32_t SMEM_SIZE_A = sizeof(SharedStorageType::a);
 extern "C" __constant__ uint32_t SMEM_SIZE_B = sizeof(SharedStorageType::b);
 extern "C" __constant__ uint32_t SMEM_SIZE_REDUCE = sizeof(SharedStorageType::reduce);
 
-extern "C" __constant__ uint32_t PROBLEM_SHAPE_N = {shape_n};
-extern "C" __constant__ uint32_t PROBLEM_SHAPE_K = {shape_k};
+extern "C" __constant__ uint32_t PROBLEM_SHAPE_N = {{problem_shape[1]}};
+extern "C" __constant__ uint32_t PROBLEM_SHAPE_K = {{problem_shape[2]}};
 
-extern "C" __constant__ uint32_t BLOCK_SHAPE_M = {block_m};
-extern "C" __constant__ uint32_t BLOCK_SHAPE_N = {block_n};
-extern "C" __constant__ uint32_t BLOCK_SHAPE_K = {block_k};
+extern "C" __constant__ uint32_t BLOCK_SHAPE_M = {{block_shape[0]}};
+extern "C" __constant__ uint32_t BLOCK_SHAPE_N = {{block_shape[1]}};
+extern "C" __constant__ uint32_t BLOCK_SHAPE_K = {{block_shape[2]}};
 
-extern "C" __constant__ uint32_t WARP_SHAPE_M = {warp_m};
-extern "C" __constant__ uint32_t WARP_SHAPE_N = {warp_n};
-extern "C" __constant__ uint32_t WARP_SHAPE_K = {warp_k};
+extern "C" __constant__ uint32_t WARP_SHAPE_M = {{warp_shape[0]}};
+extern "C" __constant__ uint32_t WARP_SHAPE_N = {{warp_shape[1]}};
+extern "C" __constant__ uint32_t WARP_SHAPE_K = {{warp_shape[2]}};
 
-extern "C" __constant__ uint32_t PAD_SHAPE_N = {pad_n};
-extern "C" __constant__ uint32_t PAD_SHAPE_K = {pad_k};
+extern "C" __constant__ uint32_t PAD_SHAPE_N = {{pad_shape[1]}};
+extern "C" __constant__ uint32_t PAD_SHAPE_K = {{pad_shape[2]}};
 
-extern "C" __constant__ uint32_t A_DTYPE_ID = {a_dtype}::kId;
-extern "C" __constant__ uint32_t B_DTYPE_ID = {b_dtype}::kId;
-extern "C" __constant__ uint32_t C_DTYPE_ID = {c_dtype}::kId;
-extern "C" __constant__ uint32_t BS_DTYPE_ID = {bs_dtype}::kId;
+extern "C" __constant__ uint32_t A_DTYPE_ID = {{a_dtype}}::kId;
+extern "C" __constant__ uint32_t B_DTYPE_ID = {{b_dtype}}::kId;
+extern "C" __constant__ uint32_t C_DTYPE_ID = {{c_dtype}}::kId;
+extern "C" __constant__ uint32_t BS_DTYPE_ID = {{bs_dtype}}::kId;
 
-extern "C" __constant__ uint32_t IS_GLU_ACTIVATION = {is_glu_activation};
+extern "C" __constant__ uint32_t IS_GLU_ACTIVATION = {{is_glu_activation}};
 
-{scheduler_config_extern}
+{{scheduler_config_extern}}
 
-{pipeline_config_extern}
+{{pipeline_config_extern}}
 
-{epilogue_config_extern}
+{{epilogue_config_extern}}
 
-{quant_param_config_extern}
+{{quant_param_config_extern}}
 
-{moe_config_extern}
+{{moe_config_extern}}
 
-"""
+""")
 
 
 def init_humming_launcher():
@@ -164,6 +162,7 @@ class HummingKernel(KernelRuntime):
     ):
         if self.inited:
             return
+        self.check_kwarg_keys(list(kwargs))
         sm_version = kwargs.get("sm_version", None)
         device_index = kwargs.get("device_index", None)
         self._set_sm_version(sm_version, device_index)
@@ -174,10 +173,10 @@ class HummingKernel(KernelRuntime):
         self.num_warps = math.prod(block_shape) // math.prod(warp_shape)
         self.num_math_threads = self.num_warps * 32
 
-        self.a_dtype = DataType.from_str(a_dtype)
-        self.b_dtype = DataType.from_str(b_dtype)
-        self.c_dtype = DataType.from_str(c_dtype)
-        self.bs_dtype = DataType.from_str(bs_dtype)
+        self.a_dtype = dtypes.DataType.from_str(a_dtype)
+        self.b_dtype = dtypes.DataType.from_str(b_dtype)
+        self.c_dtype = dtypes.DataType.from_str(c_dtype)
+        self.bs_dtype = dtypes.DataType.from_str(bs_dtype)
 
         config_dict = kwargs.copy()
         config_dict.update(self.__dict__)
@@ -196,24 +195,15 @@ class HummingKernel(KernelRuntime):
         self.mma_op_class = self.select_mma_op_class()
 
         epilogue_config = self.epilogue_config
-        custom_activation_func = epilogue_config.prepare_custom_activation_func(
-            kwargs.get("custom_activation_func_impl", None)
-        )
-        self.custom_activation_func = custom_activation_func
+        custom_activation_func = epilogue_config.prepare_custom_activation_func()
         is_glu_activation = "_glu" in str(self.epilogue_config.activation_type).lower()
-        self.code = CODE_TEMPLATE.format(
+        self.code = CODE_TEMPLATE.render(
             use_warp_spec=int(self.pipeline_config.use_warp_spec),
             mma_op_class=self.mma_op_class.to_cpp_str(),
-            shape_n=self.problem_shape[1],
-            shape_k=self.problem_shape[2],
-            block_m=self.block_shape[0],
-            block_n=self.block_shape[1],
-            block_k=self.block_shape[2],
-            warp_m=self.warp_shape[0],
-            warp_n=self.warp_shape[1],
-            warp_k=self.warp_shape[2],
-            pad_n=self.pad_shape[1],
-            pad_k=self.pad_shape[2],
+            problem_shape=self.problem_shape,
+            block_shape=self.block_shape,
+            warp_shape=self.warp_shape,
+            pad_shape=self.pad_shape,
             a_dtype=self.a_dtype.to_cpp_str(),
             b_dtype=self.b_dtype.to_cpp_str(),
             c_dtype=self.c_dtype.to_cpp_str(),
@@ -247,13 +237,28 @@ class HummingKernel(KernelRuntime):
         self.prepare()
         self.smem_size = self.get_cubin_symbol_value("SMEM_SIZE")
 
+    def check_kwarg_keys(self, keys):
+        def get_field_names(c):
+            return [x.name for x in dataclasses.fields(c)]
+
+        valid_keys = ["pad_shape"]
+        valid_keys += get_field_names(SchedulerConfig)
+        valid_keys += get_field_names(PipelineConfig)
+        valid_keys += get_field_names(EpilogueConfig)
+        valid_keys += get_field_names(QuantParamConfig)
+        valid_keys += get_field_names(MoEConfig)
+        valid_keys += get_field_names(MmaConfig)
+        valid_keys = [x for x in valid_keys if not x.endswith("_threads")]
+        invalid_keys = set(keys) - set(valid_keys)
+        assert not invalid_keys, f"{invalid_keys}"
+
     def load_cubin(self, kernel_filename, kernel_name):
         self.kernel_id = torch.ops.humming.register_kernel(kernel_filename, kernel_name)
         self.kernel_dirname = os.path.dirname(kernel_filename)
         ref_kernel_id = zlib.crc32(kernel_filename.encode()) << 30
         ref_kernel_id += zlib.crc32(kernel_name.encode())
         assert ref_kernel_id == self.kernel_id
-        module = make_humming_module("get_kernel_id", self.kernel_id)
+        module = jit_utils.make_humming_module("get_kernel_id", self.kernel_id)
         self.get_kernel_id = module.get_kernel_id
 
     def select_mma_op_class(self):
@@ -343,7 +348,7 @@ class HummingKernel(KernelRuntime):
                 assert not self.b_dtype.is_signed
         elif self.b_dtype.is_integer_type and self.a_dtype.is_floating_point_type:
             assert not self.b_dtype.is_signed
-            if self.quant_param_config.has_dynamic_zero_point:
+            if self.quant_param_config.has_zero_point:
                 assert self.b_dtype.num_bits <= self.a_dtype.mantissa_bits + 1
             else:
                 assert self.b_dtype.num_bits <= self.a_dtype.mantissa_bits + 2
@@ -376,7 +381,7 @@ class HummingKernel(KernelRuntime):
             assert self.pipeline_config.use_mbarrier
         if not self.quant_param_config.has_weight_scale:
             self.pipeline_config.use_tma_bs = False
-        if not self.quant_param_config.has_dynamic_zero_point:
+        if not self.quant_param_config.has_zero_point:
             self.pipeline_config.use_tma_bzp = False
         if not self.epilogue_config.has_bias:
             self.pipeline_config.use_tma_bias = False
@@ -394,16 +399,15 @@ class HummingKernel(KernelRuntime):
         topk_weights: torch.Tensor | None = None,
         sorted_token_ids: torch.Tensor | None = None,
         expert_ids: torch.Tensor | None = None,
-        num_tokens_post_padded: torch.Tensor | None = None,
+        num_tokens_padded: torch.Tensor | None = None,
         locks: torch.Tensor | None = None,
-        num_ctas_per_sm: int = 1,
-        num_sms: int | None = None,
+        num_sms: int = 0,
     ):
         # We need to integrate the module containing the kernel_id
         # into the forward path. This ensures that when the kernel changes,
         # torch.compile can recognize it and update the cache accordingly.
         return torch.ops.humming.launch_humming(
-            [self.get_kernel_id()],
+            [self.get_kernel_id(), num_sms],
             inputs,
             weight,
             outputs,
@@ -415,8 +419,6 @@ class HummingKernel(KernelRuntime):
             topk_weights,
             sorted_token_ids,
             expert_ids,
-            num_tokens_post_padded,
+            num_tokens_padded,
             locks,
-            num_ctas_per_sm,
-            num_sms,
         )

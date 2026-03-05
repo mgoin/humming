@@ -30,7 +30,7 @@ private:
   static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
   static constexpr bool kIsChannelWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
   static constexpr bool kIsGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
-  static constexpr bool kHasDynamicZeroPoint = QuantParamConfig::kHasDynamicZeroPoint;
+  static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kHasBias = EpilogueConfig::kHasBias;
 
   using MmaOpClass = class MMA::MmaOpClass;
@@ -72,7 +72,7 @@ public:
       loader_as.load(smem.as[stage_id], mma.arith.regs_as_as_ptr(buffer_id), iter_id);
     if constexpr (kIsGroupWeightScale)
       loader_bs.load(smem.bs[stage_id], mma.arith.regs_bs_as_ptr(buffer_id), iter_id);
-    if constexpr (kHasDynamicZeroPoint && (kIsGroupWeightScale || kIsFirst))
+    if constexpr (kHasZeroPoint && (kIsGroupWeightScale || kIsFirst))
       loader_bzp.load(smem.bzp[stage_id], mma.arith.regs_zp_as_ptr(buffer_id), iter_id);
   }
 

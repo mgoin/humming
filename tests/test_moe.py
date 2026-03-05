@@ -23,7 +23,7 @@ def test_moe(m, num_experts, top_k, is_moe_down):
     b_dtype = dtypes.uint4
     bs_dtype = dtypes.bfloat16
 
-    topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded = (
+    topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_padded = (
         generate_random_moe_tensors(
             m,
             num_experts=num_experts,
@@ -85,7 +85,7 @@ def test_moe(m, num_experts, top_k, is_moe_down):
         weight_scale=weight_scale,
         topk_weights=topk_weights,
         expert_ids=expert_ids,
-        num_tokens_post_padded=num_tokens_post_padded,
+        num_tokens_padded=num_tokens_padded,
         sorted_token_ids=sorted_token_ids,
     )
 

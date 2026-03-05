@@ -37,7 +37,7 @@ private:
   static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
   static constexpr bool kIsChannelWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
   static constexpr bool kIsGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
-  static constexpr bool kHasDynamicZeroPoint = QuantParamConfig::kHasDynamicZeroPoint;
+  static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kHasBias = EpilogueConfig::kHasBias;
 
   static constexpr bool kIsMoE = MoEConfig::kIsMoE;
@@ -64,7 +64,7 @@ private:
       else legacy_load_bytes += sizeof(smem.bs[0]);
     }
 
-    if constexpr (kHasDynamicZeroPoint && (kIsGroupWeightScale || kIsFirst)) {
+    if constexpr (kHasZeroPoint && (kIsGroupWeightScale || kIsFirst)) {
       if constexpr (kUseTmaBZP) tma_load_bytes += sizeof(smem.bzp[0]);
       else legacy_load_bytes += sizeof(smem.bzp[0]);
     }
@@ -193,7 +193,7 @@ public:
       if constexpr (kIsGroupWeightScale) {
         loader_bs.load<kShouldAdvance>(smem.bs[stage_id], &smem.load_mbar[mbar_index]);
       };
-      if constexpr (kHasDynamicZeroPoint && (kIsGroupWeightScale || kIsFirst)) {
+      if constexpr (kHasZeroPoint && (kIsGroupWeightScale || kIsFirst)) {
         loader_bzp.load<kShouldAdvance>(smem.bzp[stage_id], &smem.load_mbar[mbar_index]);
       }
 

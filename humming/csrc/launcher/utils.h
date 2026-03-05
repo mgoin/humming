@@ -77,6 +77,7 @@ struct KernelData {
   uint32_t input_scale_group_size;
   uint32_t weight_scale_group_size;
   uint32_t top_k;
+  uint32_t num_ctas_per_sm;
 
   bool use_stream_k;
   bool is_moe;
@@ -84,7 +85,7 @@ struct KernelData {
   bool is_glu_activation;
   bool has_input_scale;
   bool has_weight_scale;
-  bool has_dynamic_zero_point;
+  bool has_zero_point;
   bool has_bias;
   bool has_global_scale;
   bool use_tma_a;
@@ -93,4 +94,9 @@ struct KernelData {
   bool use_tma_bs;
   bool use_tma_bzp;
   bool use_tma_bias;
+};
+
+struct KernelLaunchData {
+  KernelData kernel_data;
+  int64_t num_sms;
 };

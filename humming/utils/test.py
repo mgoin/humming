@@ -32,7 +32,7 @@ def generate_random_inputs(
             dtype=dtype,
             scale_dtype=dtypes.float32,
             group_size=group_size,
-            has_dynamic_zp=False,
+            has_zero_point=False,
             has_global_scale=False,
         )
 
@@ -74,12 +74,12 @@ def generate_random_weight(
     scale_dtype,
     num_experts=None,
     has_global_scale=False,
-    has_dynamic_zp=False,
+    has_zero_point=False,
 ):
     e = 1 if num_experts is None else num_experts
     dtype_orig = dtype
     group_size = group_size if group_size > 0 else k
-    if has_dynamic_zp:
+    if has_zero_point:
         assert dtype.is_integer_type and not dtype.is_signed, (
             "dynamic zero point only supports for uint dtype"
         )
@@ -102,13 +102,13 @@ def generate_random_weight(
         dtype=dtype,
         scale_dtype=scale_dtype,
         group_size=group_size,
-        has_dynamic_zp=has_dynamic_zp,
+        has_zero_point=has_zero_point,
         has_global_scale=has_global_scale,
     )
 
-    if dtype.is_integer_type and has_dynamic_zp:
+    if dtype.is_integer_type and has_zero_point:
         weight_ref = quanted_weight.float() - zero_point.repeat_interleave(group_size, -1)
-    elif dtype.is_integer_type and not has_dynamic_zp:
+    elif dtype.is_integer_type and not has_zero_point:
         weight_ref = quanted_weight.float() - 2 ** (dtype.num_bits - 1)
     else:
         weight_ref = torch.empty_like(quanted_weight).view(torch.float32)
@@ -174,10 +174,10 @@ def generate_random_moe_tensors(m, num_experts, topk, block_size):
 
     sorted_token_ids = torch.cat(part_token_ids_list, dim=0).to(torch.int32)
     expert_ids = torch.tensor(expert_id_list, dtype=torch.int32, device=tensor.device)
-    num_tokens_post_padded = torch.tensor(
+    num_tokens_padded = torch.tensor(
         sorted_token_ids.size(0),
         dtype=torch.int32,
         device=tensor.device,
     )
 
-    return topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded
+    return topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_padded

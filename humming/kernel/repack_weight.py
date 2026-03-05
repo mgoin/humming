@@ -1,22 +1,24 @@
-import torch
 import ctypes
 import math
+
 import cuda.bindings.driver as cbd
+import jinja2
+import torch
+
 from humming.jit.runtime import KernelRuntime
 
-
-CODE_TEMPLATE = """
+CODE_TEMPLATE = jinja2.Template("""
 #include <humming/kernel/process.cuh>
 
 auto ptr = reinterpret_cast<void*>(&weight_repack_nk<
-    {weight_bits},
-    {activation_bits},
-    {is_weight_pakced},
-    {should_preprocess_for_int2fp},
-    {should_preprocess_with_zp},
-    {group_size_zp}
+    {{weight_bits}},
+    {{activation_bits}},
+    {{is_weight_pakced}},
+    {{should_preprocess_for_int2fp}},
+    {{should_preprocess_with_zp}},
+    {{group_size_zp}}
   >);
-"""
+""")
 
 
 class WeightRepackKernel(KernelRuntime):
@@ -45,7 +47,7 @@ class WeightRepackKernel(KernelRuntime):
         if self.should_preprocess_with_zp:
             assert should_preprocess_for_int2fp
 
-        self.code = CODE_TEMPLATE.format(
+        self.code = CODE_TEMPLATE.render(
             weight_bits=weight_bits,
             activation_bits=activation_bits,
             is_weight_pakced=int(is_weight_pakced),

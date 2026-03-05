@@ -11,12 +11,12 @@ def quantize_weight(
     dtype: dtypes.DataType,
     scale_dtype: dtypes.DataType,
     group_size: int,
-    has_dynamic_zp: bool = False,
+    has_zero_point: bool = False,
     has_global_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert weight.dtype in [torch.float16, torch.bfloat16, torch.float32]
     assert weight.ndim in [2, 3]
-    assert not has_dynamic_zp or scale_dtype is not None
+    assert not has_zero_point or scale_dtype is not None
 
     origin_ndim = weight.ndim
     weight = weight.unsqueeze(0) if weight.ndim == 2 else weight
@@ -37,7 +37,7 @@ def quantize_weight(
     else:
         weight_scale = None
 
-    if has_dynamic_zp:
+    if has_zero_point:
         assert scale_dtype is not None
         zero_point = torch.empty(scale_shape, dtype=torch.int32, device=device)
     else:
@@ -53,7 +53,7 @@ def quantize_weight(
         group_size=quant_group_size,
         use_e8m0_scale=weight_scale.dtype == torch.float8_e8m0fnu,
         has_scale=weight_scale is not None,
-        has_dynamic_zero_point=has_dynamic_zp,
+        has_zero_point=has_zero_point,
     )
 
     if scale_dtype is None and has_global_scale:
@@ -129,25 +129,25 @@ def prepare_humming_weight(
     assert padded_shape_k % (2 * packed_block_size_k) == 0
 
     should_preprocess_for_int2fp = False
-    has_dynamic_zero_point = zero_point is not None and zero_point.nelement()
+    has_zero_point = zero_point is not None and zero_point.nelement()
     if b_dtype.is_integer_type and a_dtype.is_floating_point_type:
         if a_dtype.num_bits < 16:
             should_preprocess_for_int2fp = True
-        elif a_dtype == dtypes.bfloat16 and has_dynamic_zero_point:
+        elif a_dtype == dtypes.bfloat16 and has_zero_point:
             should_preprocess_for_int2fp = b_dtype.num_bits > 6
-        elif a_dtype == dtypes.bfloat16 and not has_dynamic_zero_point:
+        elif a_dtype == dtypes.bfloat16 and not has_zero_point:
             should_preprocess_for_int2fp = b_dtype.num_bits > 7
 
-    if not should_preprocess_for_int2fp and has_dynamic_zero_point:
-        has_dynamic_zero_point = False
+    if not should_preprocess_for_int2fp and has_zero_point:
+        has_zero_point = False
 
-    group_size_zp = 0 if not has_dynamic_zero_point else (shape_k // zero_point.size(-1))
+    group_size_zp = 0 if not has_zero_point else (shape_k // zero_point.size(-1))
     kernel = WeightRepackKernel(
         weight_bits=b_dtype.num_bits,
         activation_bits=a_dtype.num_bits,
         is_weight_pakced=packed,
         should_preprocess_for_int2fp=should_preprocess_for_int2fp,
-        should_preprocess_with_zp=has_dynamic_zero_point,
+        should_preprocess_with_zp=has_zero_point,
         group_size_zp=group_size_zp,
         sm_version=None,
     )

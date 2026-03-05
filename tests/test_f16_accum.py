@@ -152,10 +152,4 @@ def test_scale(
         outputs_ref = inputs_ref.half().matmul(weight_ref.half().T)
         outputs_ref = outputs_ref * weight_scale_orig.half().T
 
-    try:
-        torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=0.5)
-    except BaseException:
-        torch.save(
-            (inputs, inputs_ref, weight_scale, weight_ref, outputs, outputs_ref), "/root/aa.pt"
-        )
-        raise
+    torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=0.5)

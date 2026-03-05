@@ -1,21 +1,23 @@
 import ctypes
-import torch
+
 import cuda.bindings.driver as cbd
+import jinja2
+import torch
+
 from humming.jit.runtime import KernelRuntime
 
-
-CODE_TEMPLATE = """
+CODE_TEMPLATE = jinja2.Template("""
 #include <humming/kernel/quant_weight.cuh>
 
 auto ptr = reinterpret_cast<void*>(&quant_weight<
-    {source_dtype},
-    {target_dtype},
-    {group_size},
-    {has_scale},
-    {use_e8m0_scale},
-    {has_dynamic_zero_point}
+    {{source_dtype}},
+    {{target_dtype}},
+    {{group_size}},
+    {{has_scale}},
+    {{use_e8m0_scale}},
+    {{has_zero_point}}
   >);
-"""
+""")
 
 
 class QuantWeightKernel(KernelRuntime):
@@ -28,7 +30,7 @@ class QuantWeightKernel(KernelRuntime):
         group_size,
         has_scale,
         use_e8m0_scale,
-        has_dynamic_zero_point=False,
+        has_zero_point=False,
         sm_version=None,
         device_index=None,
     ):
@@ -38,14 +40,14 @@ class QuantWeightKernel(KernelRuntime):
         self.group_size = group_size
         self.has_scale = has_scale
         self.use_e8m0_scale = use_e8m0_scale
-        self.has_dynamic_zero_point = has_dynamic_zero_point
-        self.code = CODE_TEMPLATE.format(
+        self.has_zero_point = has_zero_point
+        self.code = CODE_TEMPLATE.render(
             source_dtype=source_dtype.to_cpp_str(),
             target_dtype=target_dtype.to_cpp_str(),
             group_size=group_size,
             has_scale=int(has_scale),
             use_e8m0_scale=int(use_e8m0_scale),
-            has_dynamic_zero_point=int(has_dynamic_zero_point),
+            has_zero_point=int(has_zero_point),
         )
         self.arg_types = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
         self.prepare()
@@ -84,9 +86,9 @@ class QuantWeightKernel(KernelRuntime):
                 assert scales.shape == scale_shape
                 assert scales.device.index == inputs.device.index
 
-            if self.has_dynamic_zero_point and zero_point is None:
+            if self.has_zero_point and zero_point is None:
                 zero_point = torch.empty(scale_shape, device=inputs.device, dtype=torch.int32)
-            elif self.has_dynamic_zero_point:
+            elif self.has_zero_point:
                 assert zero_point.is_contiguous()
                 assert zero_point.dtype == torch.int32
                 assert zero_point.shape == scale_shape

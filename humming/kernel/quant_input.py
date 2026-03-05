@@ -1,8 +1,8 @@
 import torch
 import triton
 import triton.language as tl
-from torch.library import custom_op, register_fake
 from torch._subclasses.fake_tensor import FakeTensor
+from torch.library import custom_op, register_fake
 
 
 @triton.jit

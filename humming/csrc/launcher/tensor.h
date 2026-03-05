@@ -140,8 +140,8 @@ inline void check_tensor_bs(std::optional<Tensor> &tensor, KernelData &kernel_da
 };
 
 inline void check_tensor_bzp(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t num_experts) {
-  if (!kernel_data.has_dynamic_zero_point) return;
-  ASSERT_CHECK(tensor.has_value(), "bzp must not be none if has_dynamic_zero_point");
+  if (!kernel_data.has_zero_point) return;
+  ASSERT_CHECK(tensor.has_value(), "bzp must not be none if has_zero_point");
 
   uint32_t num_bits = get_dtype_num_bits(kernel_data.b_dtype_id) <= 4 ? 4 : 8;
   uint32_t problem_shape_k = kernel_data.problem_shape_k;
@@ -182,17 +182,17 @@ inline void check_tensor_moe(
     std::optional<Tensor> &topk_weights,
     std::optional<Tensor> &sorted_token_ids,
     std::optional<Tensor> &expert_ids,
-    std::optional<Tensor> &num_tokens_post_padded,
+    std::optional<Tensor> &num_tokens_padded,
     KernelData &kernel_data,
     int64_t dev) {
 
   if (!kernel_data.is_moe) return;
   ASSERT_CHECK(sorted_token_ids.has_value(), "sorted_token_ids must not be none if is_moe");
   ASSERT_CHECK(expert_ids.has_value(), "expert_ids must not be none if is_moe");
-  ASSERT_CHECK(num_tokens_post_padded.has_value(), "num_tokens_post_padded must not be none if is_moe");
+  ASSERT_CHECK(num_tokens_padded.has_value(), "num_tokens_padded must not be none if is_moe");
   check_tensor_common(sorted_token_ids.value(), "sorted_token_ids", dev, ScalarType::Int);
   check_tensor_common(expert_ids.value(), "expert_ids", dev, ScalarType::Int);
-  check_tensor_common(num_tokens_post_padded.value(), "num_tokens_post_padded", dev, ScalarType::Int);
+  check_tensor_common(num_tokens_padded.value(), "num_tokens_padded", dev, ScalarType::Int);
 
   if (!kernel_data.is_moe_down) return;
   ASSERT_CHECK(topk_weights.has_value(), "topk_weights must not be none if is_moe_down");

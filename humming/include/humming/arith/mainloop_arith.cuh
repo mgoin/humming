@@ -29,14 +29,14 @@ private:
   static constexpr bool kIsGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
   static constexpr bool kIsChannelInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
   static constexpr bool kIsChannelWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
-  static constexpr bool kHasDynamicZeroPoint = QuantParamConfig::kHasDynamicZeroPoint;
+  static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
 
   static constexpr uint32_t kInputScaleGroupSize = kIsGroupInputScale ? QuantParamConfig::kInputScaleGroupSize : 1;
   static constexpr uint32_t kWeightScaleGroupSize = kIsGroupWeightScale ? QuantParamConfig::kWeightScaleGroupSize : 1;
   static constexpr uint32_t kNumGroupsA = kIsGroupInputScale ? CEIL_DIV(kPartMmaShapeK, kInputScaleGroupSize) : 1;
   static constexpr uint32_t kNumGroupsB = kIsGroupWeightScale ? CEIL_DIV(kPartMmaShapeK, kWeightScaleGroupSize) : 1;
   static constexpr uint2 kExpOffset = get_mainloop_exp_offset<
-      ElementA, ElementB, ElementBS, kHasDynamicZeroPoint,
+      ElementA, ElementB, ElementBS, kHasZeroPoint,
       kIsF16Accum, kIsGroupInputScale, kIsGroupWeightScale>();
 
   static constexpr uint32_t kDequantBSBits = (ElementA::kBits < 16 && !kIsF16Accum) ? 32 : 16;
@@ -65,7 +65,7 @@ public:
 
     buffer_id = kIsChannelWeightScale ? 0 : buffer_id;
 
-    if constexpr (kHasDynamicZeroPoint) {
+    if constexpr (kHasZeroPoint) {
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < 2; i++) {
         PRAGMA_UNROLL

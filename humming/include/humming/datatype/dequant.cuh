@@ -5,7 +5,7 @@
 #include <humming/utils/all.cuh>
 
 
-template <class SourceType, class TargetType, bool kHasDynamicZeroPoint>
+template <class SourceType, class TargetType, bool kHasZeroPoint>
 CUDA_INLINE void dequant_b1248(const uint32_t *qb, uint32_t *res, uint32_t j, uint32_t *zp_vals = nullptr) {
   static_assert(SourceType::kBits <= TargetType::kBits);
   constexpr uint32_t kResultPackedNums = 32 / TargetType::kBits;
@@ -30,16 +30,16 @@ CUDA_INLINE void dequant_b1248(const uint32_t *qb, uint32_t *res, uint32_t j, ui
     if (kIsFpToFp && shift_count) qb_val = qb_val << shift_count;
     if (!kIsFpToFp && shift_count) qb_val = qb_val >> shift_count;
     if constexpr (!kIsFpToFp) {
-      res[i] = dequant_single<SourceType, TargetType, kHasDynamicZeroPoint>(qb_val, zp_val);
+      res[i] = dequant_single<SourceType, TargetType, kHasZeroPoint>(qb_val, zp_val);
     } else {
       uint32_t reversed_index = i / reverse_pattern * reverse_pattern + reverse_pattern - 1 - i % reverse_pattern;
-      res[reversed_index] = dequant_single<SourceType, TargetType, kHasDynamicZeroPoint>(qb_val, zp_val);
+      res[reversed_index] = dequant_single<SourceType, TargetType, kHasZeroPoint>(qb_val, zp_val);
     }
   }
 }
 
 
-template <class SourceType, class TargetType, bool kHasDynamicZeroPoint>
+template <class SourceType, class TargetType, bool kHasZeroPoint>
 CUDA_INLINE void dequant_b3567(const uint32_t *qb, uint32_t *res, uint32_t j, uint32_t *zp_vals = nullptr) {
   static_assert(SourceType::kBits <= TargetType::kBits);
   constexpr uint32_t kPaddedNumBits = static_next_power_of_2(SourceType::kBits);
@@ -71,20 +71,20 @@ CUDA_INLINE void dequant_b3567(const uint32_t *qb, uint32_t *res, uint32_t j, ui
     if (!kIsFpToFp && shift_count) qb_val2 = qb_val >> shift_count;
 
     if constexpr (!kIsFpToFp) {
-      res[i] = dequant_single<SourceType, TargetType, kHasDynamicZeroPoint>(qb_val2, zp_val);
+      res[i] = dequant_single<SourceType, TargetType, kHasZeroPoint>(qb_val2, zp_val);
     } else {
       uint32_t reversed_index = i / reverse_pattern * reverse_pattern + reverse_pattern - 1 - i % reverse_pattern;
-      res[reversed_index] = dequant_single<SourceType, TargetType, kHasDynamicZeroPoint>(qb_val2, zp_val);
+      res[reversed_index] = dequant_single<SourceType, TargetType, kHasZeroPoint>(qb_val2, zp_val);
     }
   }
 }
 
 
-template <class SourceType, class TargetType, bool kHasDynamicZeroPoint = false>
+template <class SourceType, class TargetType, bool kHasZeroPoint = false>
 CUDA_INLINE void dequant(const uint32_t *qb, uint32_t *res, uint32_t j, uint32_t *zp_vals = nullptr) {
   if constexpr (SourceType::kBits == static_next_power_of_2(SourceType::kBits)) {
-    dequant_b1248<SourceType, TargetType, kHasDynamicZeroPoint>(qb, res, j, zp_vals);
+    dequant_b1248<SourceType, TargetType, kHasZeroPoint>(qb, res, j, zp_vals);
   } else {
-    dequant_b3567<SourceType, TargetType, kHasDynamicZeroPoint>(qb, res, j, zp_vals);
+    dequant_b3567<SourceType, TargetType, kHasZeroPoint>(qb, res, j, zp_vals);
   }
 }

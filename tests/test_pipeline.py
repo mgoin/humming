@@ -146,10 +146,4 @@ def test_scale(
         weight_ref = weight_ref.to(torch_dtype).float()
 
     outputs_ref = inputs_ref.matmul(weight_ref.T).to(torch_dtype) + bias_ref.view(1, -1)
-    try:
-        torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=0.1)
-    except BaseException:
-        torch.save(
-            (inputs, inputs_ref, weight_scale, weight_ref, outputs, outputs_ref), "/root/aa.pt"
-        )
-        raise
+    torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=0.1)
