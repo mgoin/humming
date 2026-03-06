@@ -9,7 +9,7 @@ from humming.jit.runtime import KernelRuntime
 CODE_TEMPLATE = jinja2.Template("""
 #include <humming/kernel/pack_weight.cuh>
 
-auto ptr = reinterpret_cast<void*>(&unpack_weight_kernel<{num_bits}>);
+auto ptr = reinterpret_cast<void*>(&unpack_weight_kernel<{{num_bits}}>);
 """)
 
 

@@ -37,8 +37,8 @@ class HummingLayerMeta(object):
     has_bias: bool = False
     has_global_scale: bool = False
     mma_type: str | None = "mma"
-    top_k: int | None = None
-    is_moe: bool | None = None
+    top_k: int = 0
+    is_moe: bool = False
     is_moe_down: bool = False
     sublayer_name: str = ""
 
@@ -71,7 +71,7 @@ class HummingLayerMeta(object):
             self.has_input_scale = True
         self.is_moe = self.num_experts is not None
         if self.is_moe:
-            assert self.top_k is not None
+            assert self.top_k > 0
 
 
 class HummingMethod(torch.nn.Module):
@@ -468,8 +468,8 @@ class HummingMethod(torch.nn.Module):
         meta: HummingLayerMeta = layer.humming_metas[sublayer_name]
         layer_kwargs = dict(
             (key, value)
-            for key, value in dataclasses.asdict(meta)
-            if "shape" not in key and "name" not in key
+            for key, value in dataclasses.asdict(meta).items()
+            if "shape" not in key and "name" not in key and key != "num_experts"
         )
         conflict_keys = set(kwargs) & set(layer_kwargs)
         msg = f"the following keys are derived from layers, {conflict_keys}"
