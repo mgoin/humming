@@ -38,7 +38,7 @@ def generate_random_inputs(
 
         inputs_ref = inputs.float()
         if dtype.is_floating_point_type:
-            inputs_ref = ops.humming_dequant_weight(
+            inputs_ref = ops.dequant_weight(
                 inputs,
                 exponent_bits=dtype.exponent_bits,
                 mantissa_bits=dtype.mantissa_bits,
@@ -109,7 +109,7 @@ def generate_random_weight(
     elif dtype.is_integer_type and not has_zero_point:
         weight_ref = quanted_weight.float() - 2 ** (dtype.num_bits - 1)
     else:
-        weight_ref = ops.humming_dequant_weight(
+        weight_ref = ops.dequant_weight(
             quanted_weight,
             exponent_bits=dtype.exponent_bits,
             mantissa_bits=dtype.mantissa_bits,

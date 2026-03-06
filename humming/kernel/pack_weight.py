@@ -38,17 +38,3 @@ class PackWeightKernel(KernelRuntime):
         arg_values = (inputs.data_ptr(), outputs.data_ptr())
 
         cbd.cuLaunchKernelEx(config, self.kernel, (arg_values, self.arg_types), 0)
-
-
-def humming_pack_weight(inputs: torch.Tensor, num_bits: int) -> torch.Tensor:
-    assert inputs.is_cuda
-    assert inputs.is_contiguous()
-    assert inputs.nelement() % (32 * 32) == 0
-    assert inputs.size(-1) * num_bits % 32 == 0
-    assert inputs.dtype == torch.int32
-
-    output_shape = inputs.shape[:-1] + (inputs.size(-1) * num_bits // 32,)
-    outputs = torch.empty(output_shape, dtype=torch.int32, device=inputs.device)
-
-    kernel = PackWeightKernel(num_bits)
-    return kernel(inputs=inputs, outputs=outputs)

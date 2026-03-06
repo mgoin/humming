@@ -90,7 +90,7 @@ def test_moe(block_shape, warp_shape, a_dtype, b_dtype):
     torch_dtype = dtypes.torch_dtype_map[c_dtype]
     outputs = torch.empty((234, 1024), dtype=torch_dtype, device=inputs.device)
 
-    outputs = ops.humming_launch_kernel(
+    outputs = ops.launch_kernel(
         configs=[humming_kernel.kernel_id],
         inputs=inputs,
         weight=weight,

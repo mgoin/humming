@@ -61,26 +61,3 @@ class DequantKernel(KernelRuntime):
 
         cbd.cuLaunchKernelEx(config, self.kernel, (arg_values, self.arg_types), 0)
         return outputs
-
-
-def humming_dequant_weight(
-    inputs: torch.Tensor,
-    exponent_bits: int,
-    mantissa_bits: int,
-    is_signed: bool,
-) -> torch.Tensor:
-    assert inputs.dtype == torch.int32
-    assert inputs.is_cuda
-    assert inputs.is_contiguous()
-    outputs = torch.empty_like(inputs, dtype=torch.float32)
-
-    kernel = DequantKernel()
-    kernel(
-        inputs=inputs,
-        outputs=outputs,
-        exponent_bits=exponent_bits,
-        mantissa_bits=mantissa_bits,
-        is_signed=is_signed,
-    )
-
-    return outputs

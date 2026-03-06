@@ -63,7 +63,7 @@ def test_bias(a_dtype, c_dtype):
     torch_dtype = dtypes.torch_dtype_map[c_dtype]
     outputs = torch.zeros((128, 1024), dtype=torch_dtype, device=inputs.device)
 
-    outputs = ops.humming_launch_kernel(
+    outputs = ops.launch_kernel(
         configs=[humming_kernel.kernel_id],
         inputs=inputs,
         weight=weight,
@@ -151,7 +151,7 @@ def test_activation(activation):
     outputs = torch.zeros((128, 1024), dtype=torch_dtype, device=inputs.device)
 
     locks = torch.zeros((1024,), dtype=torch.int32, device=inputs.device)
-    outputs = ops.humming_launch_kernel(
+    outputs = ops.launch_kernel(
         configs=[humming_kernel.kernel_id],
         inputs=inputs,
         weight=weight,

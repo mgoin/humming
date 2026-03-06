@@ -2,7 +2,6 @@ import ctypes
 
 import cuda.bindings.driver as cbd
 import jinja2
-from humming import dtypes
 import torch
 
 from humming.jit.runtime import KernelRuntime
@@ -78,46 +77,3 @@ class QuantWeightKernel(KernelRuntime):
         )
 
         cbd.cuLaunchKernelEx(config, self.kernel, (arg_values, self.arg_types), 0)
-
-
-def humming_quant_weight(
-    inputs: torch.Tensor,
-    source_dtype_str: str,
-    target_dtype_str: str,
-    group_size: int,
-    has_scale: bool,
-    use_e8m0_scale: bool,
-    has_zero_point: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    group_size = inputs.size(-1) if group_size <= 0 else group_size
-    source_dtype = dtypes.DataType.from_str(source_dtype_str)
-    target_dtype = dtypes.DataType.from_str(target_dtype_str)
-
-    assert inputs.is_cuda
-    assert inputs.is_contiguous()
-    outputs = torch.empty_like(inputs, dtype=torch.int32)
-
-    if has_scale:
-        scale_shape = inputs.shape[:-1] + (inputs.size(-1) // group_size,)
-        scale_dtype = torch.float8_e8m0fnu if use_e8m0_scale else torch.float32
-        scales = torch.empty(scale_shape, device=inputs.device, dtype=scale_dtype)
-        zero_point = torch.empty(scale_shape, device=inputs.device, dtype=torch.int32)
-    else:
-        scales = torch.empty(0)
-
-    if has_scale and has_zero_point:
-        zero_point = torch.empty(scale_shape, device=inputs.device, dtype=torch.int32)
-    else:
-        zero_point = torch.empty(0)
-
-    kernel = QuantWeightKernel(
-        source_dtype=source_dtype,
-        target_dtype=target_dtype,
-        group_size=group_size,
-        has_scale=has_scale,
-        has_zero_point=has_zero_point,
-        use_e8m0_scale=use_e8m0_scale,
-    )
-    kernel(inputs=inputs, outputs=outputs, scales=scales, zero_point=zero_point)
-
-    return outputs, scales, zero_point

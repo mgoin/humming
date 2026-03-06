@@ -29,7 +29,7 @@ def quantize_weight(
         quant_group_size = weight.nelement() // e
     flatten_weight = weight.view(e, 1, -1)
     use_flatten_weight = scale_dtype is None and has_global_scale
-    quanted_weight, weight_scale, zero_point = ops.humming_quant_weight(
+    quanted_weight, weight_scale, zero_point = ops.quant_weight(
         flatten_weight if use_flatten_weight else weight,
         source_dtype_str=str(origin_dtype),
         target_dtype_str=str(dtype),
@@ -120,7 +120,7 @@ def prepare_humming_weight(
 
     group_size_zp = 0 if not has_zero_point else (shape_k // zero_point.size(-1))
 
-    repacked_weight = ops.humming_repack_weight(
+    repacked_weight = ops.repack_weight(
         inputs=weight,
         zero_point=zero_point,
         weight_bits=b_dtype.num_bits,
@@ -168,7 +168,7 @@ def prepare_humming_zero_point(
     if packed:
         zero_point = zero_point.transpose(-1, -2).contiguous()
         zero_point = zero_point.squeeze().view(*zero_point.shape)
-        zero_point = ops.humming_unpack_weight(zero_point, dtype.num_bits)
+        zero_point = ops.unpack_weight(zero_point, dtype.num_bits)
         zero_point = zero_point.transpose(-1, -2).contiguous()
 
     num_zp_bits = 4 if dtype.num_bits <= 4 else 8

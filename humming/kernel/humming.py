@@ -219,7 +219,7 @@ class HummingKernel(KernelRuntime):
     def load_cubin(self, kernel_filename, kernel_name):
         from humming import ops
 
-        self.kernel_id = ops.humming_register_kernel(kernel_filename, kernel_name)
+        self.kernel_id = ops.register_kernel(kernel_filename, kernel_name)
         self.kernel_dirname = os.path.dirname(kernel_filename)
         ref_kernel_id = zlib.crc32(kernel_filename.encode()) << 30
         ref_kernel_id += zlib.crc32(kernel_name.encode())
@@ -355,6 +355,6 @@ class HummingKernel(KernelRuntime):
     def __call__(self):
         msg = (
             "you don't call HummingKernel object directly, "
-            "use humming.ops.humming_launch_kernel instead."
+            "use humming.ops.launch_kernel instead."
         )
         raise NotImplementedError(msg)

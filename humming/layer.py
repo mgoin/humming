@@ -239,7 +239,7 @@ class HummingMethod(torch.nn.Module):
             offset = (offset_n or 0) * ckpt_shape_k * meta.b_dtype.num_bits // 32
 
             if not packed:
-                weight = ops.humming_pack_weight(weight, meta.b_dtype.num_bits)
+                weight = ops.pack_weight(weight, meta.b_dtype.num_bits)
 
             if not padded:
                 target_size = meta.shape_k * meta.b_dtype.num_bits // 32
@@ -297,7 +297,7 @@ class HummingMethod(torch.nn.Module):
                 zero_point = zero_point.cuda()
                 zero_point = zero_point.transpose(-1, -2).contiguous()
                 zero_point = zero_point.squeeze().view(*zero_point.shape)
-                zero_point = ops.humming_pack_weight(zero_point, meta.b_dtype.num_bits)
+                zero_point = ops.pack_weight(zero_point, meta.b_dtype.num_bits)
                 zero_point = zero_point.transpose(-1, -2).contiguous()
                 zero_point = zero_point.squeeze().view(*zero_point.shape)
 
@@ -523,7 +523,7 @@ class HummingMethod(torch.nn.Module):
             return inputs, None
         if input_scale is not None:
             return inputs, input_scale
-        return ops.humming_quant_input(
+        return ops.quant_input(
             inputs=inputs,
             dtype=str(meta.a_dtype),
             group_size=None,
@@ -553,7 +553,7 @@ class HummingMethod(torch.nn.Module):
             configs = layer.humming_kernel_config_modules[sublayer_name]()
         else:
             configs = cls.prepare_kernel(layer, sublayer_name=sublayer_name, **kernel_config)
-        return ops.humming_launch_kernel(
+        return ops.launch_kernel(
             configs,
             inputs,
             getattr(layer, meta.weight_name),
