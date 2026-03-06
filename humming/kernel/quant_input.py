@@ -2,7 +2,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._subclasses.fake_tensor import FakeTensor
-from torch.library import custom_op, register_fake
 
 
 @triton.jit
@@ -139,7 +138,6 @@ def _quant_tensor_kernel(
             tl.store(scale_ptr + row_id * row_num_blocks + col_block_id, scale)
 
 
-@custom_op("humming::humming_quant_input", mutates_args=())
 def humming_quant_input(
     inputs: torch.Tensor,
     dtype: str,
@@ -192,44 +190,6 @@ def humming_quant_input(
             dtype,
             num_warps=num_warps,
             num_stages=1,
-        )
-
-    return outputs, scales
-
-
-@register_fake("humming::humming_quant_input")
-def humming_quant_input_fake(
-    inputs: torch.Tensor,
-    dtype: str,
-    scales: torch.Tensor | None = None,
-    group_size: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if dtype in ["int4", "float4e2m1"]:
-        outputs = torch.empty(
-            (*inputs.shape[:-1], inputs.size(-1) // 2),
-            dtype=torch.uint8,
-            device=inputs.device,
-        )
-    elif dtype == "int8":
-        outputs = torch.empty_like(inputs, dtype=torch.int8)
-    elif dtype == "float8e4m3":
-        outputs = torch.empty_like(inputs, dtype=torch.float8_e4m3fn)
-    elif dtype == "float8e5m2":
-        outputs = torch.empty_like(inputs, dtype=torch.float8_e5m2)
-    else:
-        raise ValueError("unsupported dtype: " + dtype)
-
-    is_dynamic = scales is None
-    inputs = inputs.view(-1, inputs.size(-1))
-    if group_size is None or group_size == 0:
-        group_size = inputs.size(1)
-    assert inputs.size(1) % group_size == 0
-
-    if is_dynamic:
-        scales = torch.empty(
-            (inputs.size(0), inputs.size(1) // group_size),
-            dtype=torch.float32,
-            device=inputs.device,
         )
 
     return outputs, scales

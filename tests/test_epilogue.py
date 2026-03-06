@@ -1,5 +1,5 @@
 import pytest
-from humming import dtypes
+from humming import dtypes, ops
 import torch
 from humming.utils.test import generate_random_weight, generate_random_inputs, generate_random_bias
 from humming.utils.weight import (
@@ -63,7 +63,8 @@ def test_bias(a_dtype, c_dtype):
     torch_dtype = dtypes.torch_dtype_map[c_dtype]
     outputs = torch.zeros((128, 1024), dtype=torch_dtype, device=inputs.device)
 
-    outputs = humming_kernel(
+    outputs = ops.humming_launch_kernel(
+        configs=[humming_kernel.kernel_id],
         inputs=inputs,
         weight=weight,
         outputs=outputs,
@@ -111,16 +112,20 @@ def test_activation(activation):
     weight = prepare_humming_weight(weight, b_dtype, a_dtype)
     weight_scale = prepare_humming_weight_scale(weight_scale, to_apply_on_c=True)
 
-    _, inputs_ref, inputs, input_scale = generate_random_inputs(
+    _, inputs_ref, inputs, _ = generate_random_inputs(
         m=128,
         k=1024,
         group_size=0,
         dtype=a_dtype,
     )
 
+    if activation == "silu_glu":
+        inputs_ref = inputs_ref / 32
+        inputs = inputs / 32
+
     custom_activation_func_impl = None
     if activation == "custom":
-        custom_activation_func_impl = "return tanhf(a) * 2.33 + 0.666;"
+        custom_activation_func_impl = "return tanhf(a) * 0.666 + 0.233;"
     elif activation == "custom_glu":
         custom_activation_func_impl = "return (fabsf(a.x) - fabsf(a.y)) * 0.123;"
 
@@ -146,11 +151,11 @@ def test_activation(activation):
     outputs = torch.zeros((128, 1024), dtype=torch_dtype, device=inputs.device)
 
     locks = torch.zeros((1024,), dtype=torch.int32, device=inputs.device)
-    outputs = humming_kernel(
+    outputs = ops.humming_launch_kernel(
+        configs=[humming_kernel.kernel_id],
         inputs=inputs,
         weight=weight,
         outputs=outputs,
-        input_scale=input_scale,
         weight_scale=weight_scale,
         locks=locks,
     )
@@ -171,7 +176,7 @@ def test_activation(activation):
     elif activation == "silu":
         outputs_ref = torch.nn.SiLU()(outputs_ref)
     elif activation == "custom":
-        outputs_ref = outputs_ref.tanh() * 2.33 + 0.666
+        outputs_ref = outputs_ref.tanh() * 0.666 + 0.233
     elif activation == "silu_glu":
         outputs_ref = outputs_ref[:, ::2] * torch.nn.SiLU()(outputs_ref[:, 1::2])
     elif activation == "custom_glu":

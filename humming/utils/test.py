@@ -1,7 +1,7 @@
 import torch
 
 from humming import dtypes
-from humming.kernel.dequant_weight import DequantKernel
+from humming import ops
 from humming.utils.weight import quantize_weight
 import math
 
@@ -38,10 +38,8 @@ def generate_random_inputs(
 
         inputs_ref = inputs.float()
         if dtype.is_floating_point_type:
-            kernel = DequantKernel(device_index=inputs.device.index)
-            inputs_ref = kernel(
+            inputs_ref = ops.humming_dequant_weight(
                 inputs,
-                outputs=None,
                 exponent_bits=dtype.exponent_bits,
                 mantissa_bits=dtype.mantissa_bits,
                 is_signed=True,
@@ -111,11 +109,8 @@ def generate_random_weight(
     elif dtype.is_integer_type and not has_zero_point:
         weight_ref = quanted_weight.float() - 2 ** (dtype.num_bits - 1)
     else:
-        weight_ref = torch.empty_like(quanted_weight).view(torch.float32)
-        dequant_kernel = DequantKernel()
-        dequant_kernel(
-            inputs=quanted_weight,
-            outputs=weight_ref,
+        weight_ref = ops.humming_dequant_weight(
+            quanted_weight,
             exponent_bits=dtype.exponent_bits,
             mantissa_bits=dtype.mantissa_bits,
             is_signed=dtype.is_signed,

@@ -60,6 +60,8 @@ class BaseHummingConfigClass(object):
                 value = float(value)
             elif field_type is bool:
                 assert isinstance(value, bool), msg
+            elif field_type is str:
+                assert isinstance(value, str), msg
             elif isinstance(field_type, enum.EnumMeta):
                 if isinstance(value, str):
                     value = getattr(field_type, value.upper())

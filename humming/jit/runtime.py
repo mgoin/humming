@@ -26,7 +26,16 @@ class KernelRuntime(object):
             instance = super().__new__(cls)
             instance.inited = False
             cls._instances[signature] = instance
+            instance.init_sm_version()
         return cls._instances[signature]
+
+    def init_sm_version(self):
+        device_props = torch.cuda.get_device_properties()
+        sm_version = device_props.major * 10 + device_props.minor
+        self.sm_version = sm_version
+        self.sm_version_str = str(sm_version)
+        if self.sm_version >= 90:
+            self.sm_version_str += "a"
 
     def prepare(self):
         kernel_filename = NVCCCompiler.compile(self.code, sm_version=self.sm_version_str)
@@ -42,18 +51,6 @@ class KernelRuntime(object):
         result, kernel = cbd.cuLibraryGetKernel(lib, kernel_name.encode())
         assert result == 0, repr(result)
         self.kernel = kernel
-
-    def _set_sm_version(self, sm_version=None, device_index=None):
-        if isinstance(sm_version, (tuple, list)):
-            sm_version = str(sm_version[0] * 10 + sm_version[1])
-        elif isinstance(sm_version, (str, int)):
-            sm_version = int(sm_version)
-        else:
-            device_props = torch.cuda.get_device_properties(device_index)
-            sm_version = device_props.major * 10 + device_props.minor
-
-        self.sm_version = sm_version
-        self.sm_version_str = str(sm_version) + "a" if sm_version >= 90 else str(sm_version)
 
     @functools.lru_cache
     def get_cubin_symbol_value(self, name):

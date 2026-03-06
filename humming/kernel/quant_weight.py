@@ -2,6 +2,7 @@ import ctypes
 
 import cuda.bindings.driver as cbd
 import jinja2
+from humming import dtypes
 import torch
 
 from humming.jit.runtime import KernelRuntime
@@ -31,12 +32,9 @@ class QuantWeightKernel(KernelRuntime):
         has_scale,
         use_e8m0_scale,
         has_zero_point=False,
-        sm_version=None,
-        device_index=None,
     ):
         if self.inited:
             return
-        self._set_sm_version(sm_version, device_index)
         self.group_size = group_size
         self.has_scale = has_scale
         self.use_e8m0_scale = use_e8m0_scale
@@ -55,44 +53,12 @@ class QuantWeightKernel(KernelRuntime):
     def __call__(
         self,
         inputs: torch.Tensor,
-        outputs: torch.Tensor | None = None,
-        scales: torch.Tensor | None = None,
-        zero_point: torch.Tensor | None = None,
+        outputs: torch.Tensor,
+        scales: torch.Tensor | None,
+        zero_point: torch.Tensor | None,
     ):
         group_size = self.group_size
-        if group_size <= 0:
-            group_size = inputs.size(-1)
-
-        assert inputs.is_cuda
-        assert inputs.is_contiguous()
-        if outputs is None:
-            outputs = torch.empty_like(inputs, dtype=torch.float32)
-        else:
-            assert outputs.is_contiguous()
-            assert outputs.shape == inputs.shape
-            assert outputs.device.index == inputs.device.index
-
-        if self.has_scale:
-            scale_shape = inputs.shape[:-1] + (inputs.size(-1) // group_size,)
-
-            if scales is None:
-                scales = torch.empty(scale_shape, device=inputs.device, dtype=torch.float32)
-            else:
-                assert scales.is_contiguous()
-                if self.use_e8m0_scale:
-                    assert scales.dtype == torch.float8_e8m0fnu
-                else:
-                    assert scales.dtype == torch.float32
-                assert scales.shape == scale_shape
-                assert scales.device.index == inputs.device.index
-
-            if self.has_zero_point and zero_point is None:
-                zero_point = torch.empty(scale_shape, device=inputs.device, dtype=torch.int32)
-            elif self.has_zero_point:
-                assert zero_point.is_contiguous()
-                assert zero_point.dtype == torch.int32
-                assert zero_point.shape == scale_shape
-                assert zero_point.device.index == inputs.device.index
+        group_size = inputs.size(-1) if group_size <= 0 else group_size
 
         device = inputs.device
         config = cbd.CUlaunchConfig()
@@ -112,4 +78,46 @@ class QuantWeightKernel(KernelRuntime):
         )
 
         cbd.cuLaunchKernelEx(config, self.kernel, (arg_values, self.arg_types), 0)
-        return outputs, scales, zero_point
+
+
+def humming_quant_weight(
+    inputs: torch.Tensor,
+    source_dtype_str: str,
+    target_dtype_str: str,
+    group_size: int,
+    has_scale: bool,
+    use_e8m0_scale: bool,
+    has_zero_point: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    group_size = inputs.size(-1) if group_size <= 0 else group_size
+    source_dtype = dtypes.DataType.from_str(source_dtype_str)
+    target_dtype = dtypes.DataType.from_str(target_dtype_str)
+
+    assert inputs.is_cuda
+    assert inputs.is_contiguous()
+    outputs = torch.empty_like(inputs, dtype=torch.int32)
+
+    if has_scale:
+        scale_shape = inputs.shape[:-1] + (inputs.size(-1) // group_size,)
+        scale_dtype = torch.float8_e8m0fnu if use_e8m0_scale else torch.float32
+        scales = torch.empty(scale_shape, device=inputs.device, dtype=scale_dtype)
+        zero_point = torch.empty(scale_shape, device=inputs.device, dtype=torch.int32)
+    else:
+        scales = torch.empty(0)
+
+    if has_scale and has_zero_point:
+        zero_point = torch.empty(scale_shape, device=inputs.device, dtype=torch.int32)
+    else:
+        zero_point = torch.empty(0)
+
+    kernel = QuantWeightKernel(
+        source_dtype=source_dtype,
+        target_dtype=target_dtype,
+        group_size=group_size,
+        has_scale=has_scale,
+        has_zero_point=has_zero_point,
+        use_e8m0_scale=use_e8m0_scale,
+    )
+    kernel(inputs=inputs, outputs=outputs, scales=scales, zero_point=zero_point)
+
+    return outputs, scales, zero_point

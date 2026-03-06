@@ -1,15 +1,12 @@
-import ctypes
 import dataclasses
 import math
 import os
 import zlib
 
 import jinja2
-import torch
-import torch.utils.cpp_extension
 
-import humming.dtypes as dtypes
 import humming.jit.utils as jit_utils
+from humming import dtypes
 from humming.config import (
     EpilogueConfig,
     MmaConfig,
@@ -28,6 +25,8 @@ CODE_TEMPLATE = jinja2.Template("""
 #else
 #include <humming/kernel/humming.cuh>
 #endif
+                                
+{{custom_activation_func}}
 
 class MmaOpClass {
 public:
@@ -127,25 +126,6 @@ extern "C" __constant__ uint32_t IS_GLU_ACTIVATION = {{is_glu_activation}};
 """)
 
 
-def init_humming_launcher():
-    dirname = os.path.dirname(__file__)
-    filename = os.path.join(dirname, "../csrc/launcher/launcher.cpp")
-    filename = os.path.abspath(filename)
-
-    torch.utils.cpp_extension.load(
-        name="humming_extension",
-        sources=[filename],
-        extra_include_paths=["/usr/local/cuda/include"],
-        extra_ldflags=[
-            "-lcuda",
-            "-L/usr/local/cuda/lib64",
-            "-lc10_cuda",
-            "-ltorch_cuda",
-        ],
-        extra_cflags=["-O3"],
-    )
-
-
 class HummingKernel(KernelRuntime):
     name = "humming"
 
@@ -163,9 +143,6 @@ class HummingKernel(KernelRuntime):
         if self.inited:
             return
         self.check_kwarg_keys(list(kwargs))
-        sm_version = kwargs.get("sm_version", None)
-        device_index = kwargs.get("device_index", None)
-        self._set_sm_version(sm_version, device_index)
         self.problem_shape = (0,) + tuple(problem_shape)[1:]
         self.block_shape = tuple(block_shape)
         self.warp_shape = tuple(warp_shape)
@@ -222,20 +199,7 @@ class HummingKernel(KernelRuntime):
             custom_activation_func=custom_activation_func,
         )
 
-        init_humming_launcher()
-        self.arg_types = (
-            None if self.pipeline_config.use_tma_a else ctypes.c_void_p,
-            None if self.pipeline_config.use_tma_b else ctypes.c_void_p,
-            None if self.pipeline_config.use_tma_c else ctypes.c_void_p,
-            ctypes.c_void_p,
-            None if self.pipeline_config.use_tma_bs else ctypes.c_void_p,
-            None if self.pipeline_config.use_tma_bzp else ctypes.c_void_p,
-            None if self.pipeline_config.use_tma_bias else ctypes.c_void_p,
-        )
-        self.arg_types += (ctypes.c_void_p,) * 6 + (ctypes.c_uint32,)
-        self.torch_dtype = dtypes.torch_dtype_map[self.c_dtype]
         self.prepare()
-        self.smem_size = self.get_cubin_symbol_value("SMEM_SIZE")
 
     def check_kwarg_keys(self, keys):
         def get_field_names(c):
@@ -253,7 +217,9 @@ class HummingKernel(KernelRuntime):
         assert not invalid_keys, f"{invalid_keys}"
 
     def load_cubin(self, kernel_filename, kernel_name):
-        self.kernel_id = torch.ops.humming.register_kernel(kernel_filename, kernel_name)
+        from humming import ops
+
+        self.kernel_id = ops.humming_register_kernel(kernel_filename, kernel_name)
         self.kernel_dirname = os.path.dirname(kernel_filename)
         ref_kernel_id = zlib.crc32(kernel_filename.encode()) << 30
         ref_kernel_id += zlib.crc32(kernel_name.encode())
@@ -386,39 +352,9 @@ class HummingKernel(KernelRuntime):
         if not self.epilogue_config.has_bias:
             self.pipeline_config.use_tma_bias = False
 
-    def __call__(
-        self,
-        inputs: torch.Tensor,
-        weight: torch.Tensor,
-        outputs: torch.Tensor | None = None,
-        input_scale: torch.Tensor | None = None,
-        weight_scale: torch.Tensor | None = None,
-        zero_point: torch.Tensor | None = None,
-        bias: torch.Tensor | None = None,
-        global_scale: torch.Tensor | None = None,
-        topk_weights: torch.Tensor | None = None,
-        sorted_token_ids: torch.Tensor | None = None,
-        expert_ids: torch.Tensor | None = None,
-        num_tokens_padded: torch.Tensor | None = None,
-        locks: torch.Tensor | None = None,
-        num_sms: int = 0,
-    ):
-        # We need to integrate the module containing the kernel_id
-        # into the forward path. This ensures that when the kernel changes,
-        # torch.compile can recognize it and update the cache accordingly.
-        return torch.ops.humming.launch_humming(
-            [self.get_kernel_id(), num_sms],
-            inputs,
-            weight,
-            outputs,
-            input_scale,
-            weight_scale,
-            zero_point,
-            bias,
-            global_scale,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_padded,
-            locks,
+    def __call__(self):
+        msg = (
+            "you don't call HummingKernel object directly, "
+            "use humming.ops.humming_launch_kernel instead."
         )
+        raise NotImplementedError(msg)

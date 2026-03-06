@@ -16,33 +16,15 @@ auto ptr = reinterpret_cast<void*>(&unpack_weight_kernel<{{num_bits}}>);
 class UnpackWeightKernel(KernelRuntime):
     name = "unpack_weight"
 
-    def __init__(self, num_bits, sm_version=None, device_index=None):
+    def __init__(self, num_bits):
         if self.inited:
             return
-        self._set_sm_version(sm_version, device_index)
         self.num_bits = num_bits
         self.code = CODE_TEMPLATE.render(num_bits=num_bits)
         self.arg_types = (ctypes.c_void_p, ctypes.c_void_p)
         self.prepare()
 
-    def __call__(self, inputs: torch.Tensor, outputs: torch.Tensor | None = None):
-        assert inputs.is_cuda
-        assert inputs.is_contiguous()
-        assert inputs.size(-1) % self.num_bits == 0
-        assert inputs.dtype == torch.int32
-
-        shape_k = inputs.size(-1) // self.num_bits * 32
-        output_shape = inputs.shape[:-1] + (shape_k,)
-
-        if outputs is None:
-            outputs = torch.empty(output_shape, dtype=torch.int32, device=inputs.device)
-        else:
-            assert outputs.is_contiguous()
-            assert outputs.shape == output_shape
-            assert outputs.device.index == inputs.device.index
-
-        assert outputs.nelement() % (32 * 32) == 0
-
+    def __call__(self, inputs: torch.Tensor, outputs: torch.Tensor):
         device = inputs.device
         config = cbd.CUlaunchConfig()
         config.gridDimX = outputs.nelement() // (32 * 32)
@@ -57,3 +39,18 @@ class UnpackWeightKernel(KernelRuntime):
 
         cbd.cuLaunchKernelEx(config, self.kernel, (arg_values, self.arg_types), 0)
         return outputs
+
+
+def humming_unpack_weight(inputs: torch.Tensor, num_bits: int) -> torch.Tensor:
+    assert inputs.is_cuda
+    assert inputs.is_contiguous()
+    assert inputs.size(-1) % num_bits == 0
+    assert inputs.dtype == torch.int32
+
+    shape_k = inputs.size(-1) // num_bits * 32
+    output_shape = inputs.shape[:-1] + (shape_k,)
+    outputs = torch.empty(output_shape, dtype=torch.int32, device=inputs.device)
+
+    kernel = UnpackWeightKernel(inputs=inputs)
+    kernel(inputs=inputs, outputs=outputs)
+    return outputs

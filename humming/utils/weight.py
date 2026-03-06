@@ -1,9 +1,7 @@
 import torch
 
 from humming import dtypes
-from humming.kernel.repack_weight import WeightRepackKernel
-from humming.kernel.quant_weight import QuantWeightKernel
-from humming.kernel.unpack_weight import UnpackWeightKernel
+from humming import ops
 
 
 def quantize_weight(
@@ -20,46 +18,26 @@ def quantize_weight(
 
     origin_ndim = weight.ndim
     weight = weight.unsqueeze(0) if weight.ndim == 2 else weight
-
     origin_dtype = dtypes.DataType.from_torch_dtype(weight.dtype)
     e, n, k = weight.shape
     group_size = group_size if group_size > 0 else k
-    device = weight.device
-
-    quanted_weight = torch.empty_like(weight, dtype=torch.int32)
-    scale_shape = (e, n, k // group_size)
-    if scale_dtype == dtypes.float8e8m0 and not has_global_scale:
-        weight_scale = torch.empty(scale_shape, dtype=torch.float8_e8m0fnu, device=device)
-    elif scale_dtype is not None:
-        weight_scale = torch.empty(scale_shape, dtype=torch.float32, device=device)
-    elif has_global_scale:
-        weight_scale = torch.empty((e, 1, 1), dtype=torch.float32, device=device)
-    else:
-        weight_scale = None
-
-    if has_zero_point:
-        assert scale_dtype is not None
-        zero_point = torch.empty(scale_shape, dtype=torch.int32, device=device)
-    else:
-        zero_point = None
 
     quant_group_size = 0
-    if weight_scale is not None:
-        quant_group_size = weight.nelement() // weight_scale.nelement()
-
-    quant_kernel = QuantWeightKernel(
-        source_dtype=origin_dtype,
-        target_dtype=dtype,
+    if scale_dtype is not None:
+        quant_group_size = group_size
+    elif has_global_scale:
+        quant_group_size = weight.nelement() // e
+    flatten_weight = weight.view(e, 1, -1)
+    use_flatten_weight = scale_dtype is None and has_global_scale
+    quanted_weight, weight_scale, zero_point = ops.humming_quant_weight(
+        flatten_weight if use_flatten_weight else weight,
+        source_dtype_str=str(origin_dtype),
+        target_dtype_str=str(dtype),
         group_size=quant_group_size,
-        use_e8m0_scale=weight_scale.dtype == torch.float8_e8m0fnu,
-        has_scale=weight_scale is not None,
+        use_e8m0_scale=scale_dtype == dtypes.float8e8m0,
+        has_scale=scale_dtype is not None or has_global_scale,
         has_zero_point=has_zero_point,
     )
-
-    if scale_dtype is None and has_global_scale:
-        quant_kernel(weight.view(e, 1, -1), quanted_weight.view(e, 1, -1), weight_scale, zero_point)
-    else:
-        quant_kernel(weight, quanted_weight, weight_scale, zero_point)
 
     global_scale = None
     if scale_dtype is None and has_global_scale:
@@ -90,11 +68,11 @@ def quantize_weight(
 
     if origin_ndim == 2:
         quanted_weight = quanted_weight.squeeze(0)
-        if weight_scale is not None:
+        if weight_scale is not None and weight_scale.nelement() > 0:
             weight_scale = weight_scale.squeeze(0)
-        if zero_point is not None:
+        if zero_point is not None and zero_point.nelement() > 0:
             zero_point = zero_point.squeeze(0)
-        if global_scale is not None:
+        if global_scale is not None and global_scale.nelement() > 0:
             global_scale = global_scale.squeeze(0)
 
     return quanted_weight, weight_scale, zero_point, global_scale
@@ -113,7 +91,6 @@ def prepare_humming_weight(
     weight = weight.unsqueeze(0) if not is_moe else weight
     if zero_point is not None:
         zero_point = zero_point.unsqueeze(0) if zero_point.ndim == 2 else zero_point
-    num_experts = 1 if not is_moe else weight.size(0)
     shape_n = weight.size(-2)
     if packed:
         assert weight.size(-1) * 32 % b_dtype.num_bits == 0
@@ -142,28 +119,16 @@ def prepare_humming_weight(
         has_zero_point = False
 
     group_size_zp = 0 if not has_zero_point else (shape_k // zero_point.size(-1))
-    kernel = WeightRepackKernel(
+
+    repacked_weight = ops.humming_repack_weight(
+        inputs=weight,
+        zero_point=zero_point,
         weight_bits=b_dtype.num_bits,
         activation_bits=a_dtype.num_bits,
         is_weight_pakced=packed,
         should_preprocess_for_int2fp=should_preprocess_for_int2fp,
         should_preprocess_with_zp=has_zero_point,
         group_size_zp=group_size_zp,
-        sm_version=None,
-    )
-
-    shape_k_new = padded_shape_k // packed_block_size_k
-    shape_n_new = padded_shape_n * packed_block_size_k * b_dtype.num_bits // 32
-
-    repacked_weight = torch.empty(
-        (num_experts, shape_k_new, shape_n_new), dtype=torch.int32, device=weight.device
-    )
-    kernel(
-        inputs=weight,
-        outputs=repacked_weight,
-        zero_point=zero_point,
-        padded_shape_n=padded_shape_n,
-        padded_shape_k=padded_shape_k,
     )
 
     return repacked_weight if is_moe else repacked_weight.squeeze(0)
@@ -203,8 +168,7 @@ def prepare_humming_zero_point(
     if packed:
         zero_point = zero_point.transpose(-1, -2).contiguous()
         zero_point = zero_point.squeeze().view(*zero_point.shape)
-        kernel = UnpackWeightKernel(dtype.num_bits)
-        zero_point = kernel(zero_point)
+        zero_point = ops.humming_unpack_weight(zero_point, dtype.num_bits)
         zero_point = zero_point.transpose(-1, -2).contiguous()
 
     num_zp_bits = 4 if dtype.num_bits <= 4 else 8

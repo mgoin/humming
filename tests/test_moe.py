@@ -1,5 +1,5 @@
 import pytest
-from humming import dtypes
+from humming import dtypes, ops
 import torch
 from humming.utils.test import (
     generate_random_weight,
@@ -77,7 +77,8 @@ def test_moe(m, num_experts, top_k, is_moe_down):
     torch_dtype = dtypes.torch_dtype_map[c_dtype]
     outputs = torch.empty((m, top_k, 1024), dtype=torch_dtype, device=inputs.device)
 
-    outputs = humming_kernel(
+    outputs = ops.humming_launch_kernel(
+        configs=[humming_kernel.kernel_id],
         inputs=inputs,
         weight=weight,
         outputs=outputs,

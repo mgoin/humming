@@ -16,10 +16,9 @@ auto ptr = reinterpret_cast<void*>(&dequant_unpacked_fp_type);
 class DequantKernel(KernelRuntime):
     name = "dequant_unpacked_fp_type"
 
-    def __init__(self, sm_version=None, device_index=None):
+    def __init__(self):
         if self.inited:
             return
-        self._set_sm_version(sm_version, device_index)
         self.code = CODE_TEMPLATE
         self.arg_types = (
             ctypes.c_void_p,
@@ -35,21 +34,11 @@ class DequantKernel(KernelRuntime):
     def __call__(
         self,
         inputs: torch.Tensor,
-        outputs: torch.Tensor | None,
+        outputs: torch.Tensor,
         exponent_bits: int,
         mantissa_bits: int,
         is_signed: bool,
     ):
-        assert inputs.dtype == torch.int32
-        assert inputs.is_cuda
-        assert inputs.is_contiguous()
-        if outputs is None:
-            outputs = torch.empty_like(inputs, dtype=torch.float32)
-        else:
-            assert outputs.is_contiguous()
-            assert outputs.shape == inputs.shape
-            assert outputs.device.index == inputs.device.index
-
         device = inputs.device
         total_size = inputs.nelement()
         config = cbd.CUlaunchConfig()
@@ -72,3 +61,26 @@ class DequantKernel(KernelRuntime):
 
         cbd.cuLaunchKernelEx(config, self.kernel, (arg_values, self.arg_types), 0)
         return outputs
+
+
+def humming_dequant_weight(
+    inputs: torch.Tensor,
+    exponent_bits: int,
+    mantissa_bits: int,
+    is_signed: bool,
+) -> torch.Tensor:
+    assert inputs.dtype == torch.int32
+    assert inputs.is_cuda
+    assert inputs.is_contiguous()
+    outputs = torch.empty_like(inputs, dtype=torch.float32)
+
+    kernel = DequantKernel()
+    kernel(
+        inputs=inputs,
+        outputs=outputs,
+        exponent_bits=exponent_bits,
+        mantissa_bits=mantissa_bits,
+        is_signed=is_signed,
+    )
+
+    return outputs

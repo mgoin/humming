@@ -57,7 +57,7 @@ inline int64_t get_num_sms(int64_t num_sms, int64_t dev) {
   return static_cast<int64_t>(dev_sms);
 }
 
-Tensor launch_humming(
+Tensor launch_kernel(
     IntArrayRef configs,
     Tensor a,
     Tensor b,
@@ -219,7 +219,7 @@ int64_t register_kernel(const std::string &cubin_path, const std::string &func_n
 
 COMMON_TORCH_LIBRARY(humming, m) {
   m.def(
-      "launch_humming(int[] configs, Tensor a, Tensor b, Tensor(c!)? c, "
+      "launch_kernel(int[] configs, Tensor a, Tensor b, Tensor(c!)? c, "
       "Tensor? as_, Tensor? bs, Tensor? bzp, Tensor? bias, Tensor? gs, "
       "Tensor? topk_weights, Tensor? sorted_ids, Tensor? expert_ids, Tensor? num_tokens_padded, "
       "Tensor(locks!)? locks, bool should_check_tensor = True) -> Tensor");
@@ -227,11 +227,11 @@ COMMON_TORCH_LIBRARY(humming, m) {
 };
 
 COMMON_TORCH_LIBRARY_IMPL(humming, CUDA, m) {
-  m.impl("launch_humming", COMMON_TORCH_BOX(&launch_humming));
+  m.impl("launch_kernel", COMMON_TORCH_BOX(&launch_kernel));
 };
 
 COMMON_TORCH_LIBRARY_IMPL(humming, Meta, m) {
-  m.impl("launch_humming", COMMON_TORCH_BOX(&launch_humming));
+  m.impl("launch_kernel", COMMON_TORCH_BOX(&launch_kernel));
 };
 
 COMMON_TORCH_LIBRARY_IMPL(humming, Undefined, m) {
