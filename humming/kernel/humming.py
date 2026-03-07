@@ -354,7 +354,7 @@ class HummingKernel(KernelRuntime):
 
     def __call__(self):
         msg = (
-            "you don't call HummingKernel object directly, "
-            "use humming.ops.launch_kernel instead."
+            "don't call HummingKernel object directly, "
+            "please use humming.ops.launch_kernel([kernel.kernel_id], ...) instead."
         )
         raise NotImplementedError(msg)
