@@ -4,8 +4,8 @@ from typing import Any, Literal
 import torch
 
 from humming import dtypes
-from humming.schema.base import BaseWeightSchema
-from humming.schema.humming import HummingWeightSchema
+from humming.schema.base import BaseWeightSchema, BaseInputSchema
+from humming.schema.humming import HummingWeightSchema, HummingInputSchema
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -248,3 +248,77 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
         )
 
         return schema, output_tensors
+
+
+@dataclasses.dataclass(kw_only=True)
+class CompressedTensorsInputSchema(BaseInputSchema):
+    quant_method: str = "compressed-tensors"
+
+    format: str
+    type: str
+    num_bits: int
+    dynamic: bool | str
+    group_size: int
+
+    TENSOR_NAMES = Literal["input_scale", "input_global_scale"]
+
+    def __post_init__(self):
+        assert self.format in [
+            "int-quantized",
+            "float-quantized",
+            "naive-quantized",
+            "nvfp4-pack-quantized",
+            "mxfp4-pack-quantized",
+        ]
+        self.input_scale_key = "input_global_scale" if "nvfp4" in self.format else "input_scale"
+
+    def get_activation_bits(self):
+        return self.num_bits
+
+    def get_tensors_attrs(
+        self,
+        shape_k: int,
+        param_dtype: torch.dtype,
+        num_experts: int | None = None,
+        stack_size: int = 1,
+    ) -> dict[str, dict[str, Any]]:
+        if self.dynamic is False or self.dynamic == "local":
+            # print(self._get_input_scale_attrs(num_experts, stack_size, self.input_scale_key))
+            return self._get_input_scale_attrs(num_experts, stack_size, self.input_scale_key)
+        return {}
+
+    def convert_humming(
+        self,
+        tensors: dict[str, torch.Tensor],
+        shape_n_stacks: list[int],
+        shape_k_stacks: list[int],
+        param_dtype: torch.dtype,
+        num_experts: int | None = None,
+        sm_version: int | tuple[int, int] | None = None,
+    ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
+        if sm_version is None:
+            sm_version = torch.cuda.get_device_capability()
+        if isinstance(sm_version, tuple):
+            sm_version = sm_version[0] * 10 + sm_version[1]
+        assert isinstance(sm_version, int)
+        if self.type == "float" and self.num_bits == 8:
+            a_dtype = dtypes.float8e4m3 if sm_version >= 89 else None
+        elif self.type == "float" and self.num_bits == 4:
+            a_dtype = dtypes.float4e2m1 if sm_version >= 120 else None
+        elif self.type == "int" and self.num_bits == 8:
+            a_dtype = dtypes.int8
+        elif self.type == "int" and self.num_bits == 4:
+            a_dtype = dtypes.int4 if sm_version >= 80 else None
+        else:
+            raise ValueError(f"unsupported type and num_bits: {self.type}{self.num_bits}")
+
+        group_size = self.group_size or 0
+        if a_dtype is None:
+            group_size = 0
+
+        schema = HummingInputSchema(
+            a_dtype=a_dtype,
+            input_scale_group_size=group_size,
+        )
+
+        return schema, {}

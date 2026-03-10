@@ -128,10 +128,8 @@ class Fp8InputSchema(BaseInputSchema):
         num_experts: int | None = None,
         stack_size: int = 1,
     ) -> dict[str, dict[str, Any]]:
-
         if self.activation_scheme == "static":
             return self._get_input_scale_attrs(num_experts, stack_size)
-
         return {}
 
     def convert_humming(
@@ -143,8 +141,8 @@ class Fp8InputSchema(BaseInputSchema):
         num_experts: int | None = None,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
         schema = HummingInputSchema(
-            b_dtype=dtypes.float8e4m3,
-            weight_scale_group_size=0,
+            a_dtype=dtypes.float8e4m3,
+            input_scale_group_size=0,
         )
 
         return schema, {}

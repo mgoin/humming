@@ -183,7 +183,7 @@ class BaseWeightSchema:
                 schema_cls = WEIGHT_SCHEMA_MAP[quant_method]
                 return schema_cls.from_config(config)
             else:
-                raise ValueError(f"unsupported quant_method: {quant_method}")
+                raise ValueError(f"unsupported weight quant_method: {quant_method}")
 
         kwargs = {}
         for field in dataclasses.fields(cls):
@@ -249,7 +249,7 @@ class BaseInputSchema:
                 schema_cls = INPUT_SCHEMA_MAP[quant_method]
                 return schema_cls.from_config(config)
             else:
-                raise ValueError(f"unsupported quant_method: {quant_method}")
+                raise ValueError(f"unsupported input quant_method: {quant_method}")
 
         kwargs = {}
         for field in dataclasses.fields(cls):
