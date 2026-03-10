@@ -155,7 +155,7 @@ CUDA_INLINE float warp_reduce_min(float val) {
 template <
     class SourceType, class TargetType,
     uint32_t kQuantGroupSize, bool kHasScale,
-    bool kUseUE8M0Scale, bool kHasZeroPoint>
+    bool kUseUE8M0Scale, bool kHasZeroPoint, bool kIsFpZeroPoint>
 __global__ void quant_weight(uint4 *in_ptr, uint4 *out_ptr, uint32_t *out_scale_ptr, uint32_t *zero_point_ptr) {
 
   static_assert(std::is_same<SourceType, Float16>::value ||
@@ -174,6 +174,7 @@ __global__ void quant_weight(uint4 *in_ptr, uint4 *out_ptr, uint32_t *out_scale_
   float scale_val;
   float max_abs_val;
   int32_t zero_point;
+  float zero_point_float;
 
   if constexpr (kHasScale) {
     PRAGMA_UNROLL_COUNT(4)
@@ -214,8 +215,11 @@ __global__ void quant_weight(uint4 *in_ptr, uint4 *out_ptr, uint32_t *out_scale_
       if (max_val > fabsf(min_val)) scale_val = -scale_val;
     } else {
       scale_val = (max_val - min_val) / (get_data_type_max_num<TargetType>() * 2 + 1);
-      zero_point = __float2int_rn((-min_val) / scale_val);
-      min_val = (float)zero_point * -scale_val;
+      zero_point_float = (-min_val) / scale_val;
+      if constexpr (!kIsFpZeroPoint) {
+        zero_point = __float2int_rn(zero_point_float);
+        min_val = (float)zero_point * -scale_val;
+      }
     }
 
     if constexpr (kUseUE8M0Scale) {
@@ -235,8 +239,10 @@ __global__ void quant_weight(uint4 *in_ptr, uint4 *out_ptr, uint32_t *out_scale_
         out_scale_ptr_float[blockIdx.x] = scale_val;
       }
 
-      if constexpr (kHasZeroPoint) {
+      if constexpr (kHasZeroPoint && !kIsFpZeroPoint) {
         zero_point_ptr[blockIdx.x] = static_cast<uint32_t>(zero_point);
+      } else {
+        zero_point_ptr[blockIdx.x] = *reinterpret_cast<uint32_t*>(&zero_point_float);
       }
     }
   } else {

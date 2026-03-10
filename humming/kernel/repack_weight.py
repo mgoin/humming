@@ -74,6 +74,10 @@ class RepackWeightKernel(KernelRuntime):
         num_experts = 1 if inputs.ndim == 2 else inputs.size(0)
         shape_n = inputs.size(-2)
         shape_k = inputs.size(-1)
+        if self.is_weight_pakced:
+            assert shape_k * 32 % self.weight_bits == 0
+            shape_k = shape_k * 32 // self.weight_bits
+
         device = inputs.device
 
         config = cbd.CUlaunchConfig()

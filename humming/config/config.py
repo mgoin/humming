@@ -79,6 +79,10 @@ class QuantParamConfig(BaseHummingConfigClass):
     weight_scale_group_size: int = 0
     has_global_scale: bool = False
     has_zero_point: bool = False
+    is_fp_zero_point: bool = False
+
+    def __post_init__(self):
+        return super().__post_init__()
 
 
 @dataclasses.dataclass

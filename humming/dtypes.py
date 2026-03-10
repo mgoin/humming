@@ -1,12 +1,18 @@
 import re
 
 import torch
+import dataclasses
 
 
-class DataType(object):
-    def __init__(self):
-        self.is_integer_type = False
-        self.is_floating_point_type = False
+@dataclasses.dataclass(kw_only=True, repr=False)
+class DataType:
+    num_bits: int
+    is_integer_type: bool = False
+    is_floating_point_type: bool = False
+
+    def __post_init__(self):
+        assert self.__class__ is not DataType
+        assert self.is_integer_type or self.is_floating_point_type
 
     @classmethod
     def from_str(cls, s):
@@ -44,12 +50,12 @@ class DataType(object):
         raise NotImplementedError
 
 
+@dataclasses.dataclass(kw_only=True, repr=False)
 class InergerType(DataType):
-    def __init__(self, is_signed, num_bits):
-        super().__init__()
-        self.is_integer_type = True
-        self.is_signed = is_signed
-        self.num_bits = num_bits
+    is_signed: bool
+    is_integer_type: bool = True
+
+    __hash__ = DataType.__hash__
 
     @classmethod
     def from_str(cls, s):
@@ -87,16 +93,18 @@ class InergerType(DataType):
         return int(dtype_id)
 
 
+@dataclasses.dataclass(kw_only=True, repr=False)
 class FloatingPointType(DataType):
-    def __init__(self, num_bits, exponent_bits, mantissa_bits):
-        super().__init__()
-        self.is_floating_point_type = True
-        self.num_bits = num_bits
-        self.sign_bits = num_bits - exponent_bits - mantissa_bits
+    exponent_bits: int
+    mantissa_bits: int
+    is_floating_point_type: bool = True
+
+    __hash__ = DataType.__hash__
+
+    def __post_init__(self):
+        self.sign_bits = self.num_bits - self.exponent_bits - self.mantissa_bits
         assert self.sign_bits in (0, 1)
         self.is_signed = self.sign_bits != 0
-        self.exponent_bits = exponent_bits
-        self.mantissa_bits = mantissa_bits
 
     @classmethod
     def from_str(cls, s):
@@ -104,11 +112,11 @@ class FloatingPointType(DataType):
             return s
         s = s.lower()
         if s in ("float16", "half"):
-            return cls(16, 5, 10)
+            return cls(num_bits=16, exponent_bits=5, mantissa_bits=10)
         elif s == "bfloat16":
-            return cls(16, 8, 7)
+            return cls(num_bits=16, exponent_bits=8, mantissa_bits=7)
         elif s == "float32":
-            return cls(32, 8, 23)
+            return cls(num_bits=32, exponent_bits=8, mantissa_bits=23)
 
         re_res = re.findall("^float(\\d+)_*e(\\d+)m(\\d+)$", s)
         if not re_res:
@@ -190,4 +198,5 @@ torch_dtype_map = {
     float8e5m2: torch.float8_e5m2,
     float16: torch.float16,
     bfloat16: torch.bfloat16,
+    float32: torch.float32,
 }

@@ -16,12 +16,13 @@ private:
   static constexpr uint32_t kNumLoadThreads = PipelineConfig::kNumLoadThreads;
   static constexpr uint32_t kLoadThreadOffset = PipelineConfig::kNumThreads - kNumLoadThreads;
 
+  static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
   static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
   static constexpr bool kIsChannelScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
   static constexpr bool kIsGroupScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
   static constexpr uint32_t kGroupSize = kIsGroupScale ? QuantParamConfig::kWeightScaleGroupSize : ProblemShape::K;
 
-  static constexpr uint32_t kNumZPBits = MAX(4, static_next_power_of_2(ElementB::kBits));
+  static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementB::kBits));
   static constexpr uint32_t kSmemStride = BlockShape::N * kNumZPBits / 32 / 4;
   static constexpr uint32_t kGmemStride = ProblemShape::N * kNumZPBits / 32 / 4;
   static constexpr uint32_t kProblemNumGroups = CEIL_DIV(ProblemShape::K, kGroupSize);

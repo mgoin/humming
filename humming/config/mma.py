@@ -36,7 +36,7 @@ def calc_reg_count(rows, cols, ptx_dtype):
     return reg_count
 
 
-class MmaOpClassImpl(object):
+class MmaOpClassImpl:
     def __init__(self, m, n, k, a_dtype, b_dtype, cd_dtype):
         self.shape = (m, n, k)
         self.a_dtype = a_dtype if isinstance(a_dtype, str) else DTYPE_MAP[a_dtype]
@@ -143,7 +143,7 @@ class MmaOpClassImpl(object):
         return asm_code
 
 
-class WgmmaOpClassImpl(object):
+class WgmmaOpClassImpl:
     def __init__(self, m, n, k, a_dtype, b_dtype, cd_dtype):
         self.shape = (m, n, k)
         self.a_dtype = a_dtype if isinstance(a_dtype, str) else DTYPE_MAP[a_dtype]
@@ -276,7 +276,7 @@ class WgmmaOpClassImpl(object):
         return asm_code
 
 
-class MmaOpClass(object):
+class MmaOpClass:
     @classmethod
     def from_config(cls, mma_type, m, n, k, a_dtype, b_dtype, cd_dtype):
         mma_type = mma_type if isinstance(mma_type, MmaType) else getattr(MmaType, mma_type.upper())

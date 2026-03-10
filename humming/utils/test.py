@@ -13,7 +13,11 @@ def generate_random_inputs(
     dtype: dtypes.DataType = dtypes.float32,
 ):
     group_size = group_size if group_size > 0 else k
-    input_scale = torch.randn((m, k // group_size), dtype=torch.float32, device="cuda:0")
+    input_scale: torch.Tensor | None = torch.randn(
+        (m, k // group_size),
+        dtype=torch.float32,
+        device="cuda:0",
+    )
     assert k % group_size == 0
 
     inputs_orig = torch.randn((m, k), dtype=torch.float32, device="cuda:0")
@@ -37,7 +41,7 @@ def generate_random_inputs(
         )
 
         inputs_ref = inputs.float()
-        if dtype.is_floating_point_type:
+        if isinstance(dtype, dtypes.FloatingPointType):
             inputs_ref = ops.dequant_weight(
                 inputs,
                 exponent_bits=dtype.exponent_bits,
@@ -59,6 +63,7 @@ def generate_random_inputs(
         elif dtype == dtypes.float8e5m2:
             inputs = inputs.to(torch.uint8).view(torch.float8_e5m2)
 
+        assert input_scale is not None
         inputs_ref = inputs_ref * input_scale.repeat_interleave(group_size, 1)
 
     return inputs_orig, inputs_ref, inputs, input_scale
@@ -73,6 +78,7 @@ def generate_random_weight(
     num_experts=None,
     has_global_scale=False,
     has_zero_point=False,
+    is_fp_zero_point=False,
 ):
     e = 1 if num_experts is None else num_experts
     dtype_orig = dtype
@@ -83,7 +89,7 @@ def generate_random_weight(
         )
 
     if dtype.is_integer_type and dtype.is_signed:
-        dtype = dtypes.InergerType(False, dtype.num_bits)
+        dtype = dtypes.InergerType(is_signed=False, num_bits=dtype.num_bits)
 
     weight_orig = torch.randn((e, n, k), dtype=torch.float32, device="cuda:0")
     init_weight_scale = torch.rand((e, n, k // group_size), dtype=torch.float32, device="cuda:0")
@@ -102,10 +108,13 @@ def generate_random_weight(
         group_size=group_size,
         has_zero_point=has_zero_point,
         has_global_scale=has_global_scale,
+        is_fp_zero_point=is_fp_zero_point,
     )
 
     if dtype.is_integer_type and has_zero_point:
-        weight_ref = quanted_weight.float() - zero_point.repeat_interleave(group_size, -1)
+        weight_ref = quanted_weight.to(zero_point.dtype)
+        weight_ref = weight_ref - zero_point.repeat_interleave(group_size, -1)
+        weight_ref = weight_ref.float()
     elif dtype.is_integer_type and not has_zero_point:
         weight_ref = quanted_weight.float() - 2 ** (dtype.num_bits - 1)
     else:

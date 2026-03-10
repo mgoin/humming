@@ -151,8 +151,15 @@ inline void check_tensor_bzp(std::optional<Tensor> &tensor, KernelData &kernel_d
   std::vector<int64_t> expected_shape = {};
   if (kernel_data.is_moe) expected_shape.push_back(num_experts);
   expected_shape.push_back(num_groups);
-  expected_shape.push_back(kernel_data.problem_shape_n * num_bits / 32);
-  check_tensor_common(tensor.value(), "bzp", dev, ScalarType::Int, expected_shape);
+  ScalarType expected_dtype;
+  if (kernel_data.is_fp_zero_point) {
+    expected_shape.push_back(kernel_data.problem_shape_n);
+    expected_dtype = dtype_id_to_tensor_dtype(kernel_data.c_dtype_id);
+  } else {
+    expected_shape.push_back(kernel_data.problem_shape_n * num_bits / 32);
+    expected_dtype = ScalarType::Int;
+  }
+  check_tensor_common(tensor.value(), "bzp", dev, expected_dtype, expected_shape);
 };
 
 inline void check_tensor_bias(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t num_experts) {

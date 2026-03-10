@@ -60,6 +60,7 @@ def quant_weight(
     has_scale: bool,
     use_e8m0_scale: bool,
     has_zero_point: bool,
+    is_fp_zero_point: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     group_size = inputs.size(-1) if group_size <= 0 else group_size
     source_dtype = dtypes.DataType.from_str(source_dtype_str)
@@ -78,7 +79,8 @@ def quant_weight(
         scales = torch.empty(0)
 
     if has_scale and has_zero_point:
-        zero_point = torch.empty(scale_shape, device=inputs.device, dtype=torch.int32)
+        dtype = torch.float32 if is_fp_zero_point else torch.int32
+        zero_point = torch.empty(scale_shape, device=inputs.device, dtype=dtype)
     else:
         zero_point = torch.empty(0)
 
@@ -90,6 +92,7 @@ def quant_weight(
             has_scale=has_scale,
             has_zero_point=has_zero_point,
             use_e8m0_scale=use_e8m0_scale,
+            is_fp_zero_point=is_fp_zero_point,
         )
         kernel(inputs=inputs, outputs=outputs, scales=scales, zero_point=zero_point)
 
@@ -121,7 +124,7 @@ def repack_weight(
         shape_k = shape_k * 32 // weight_bits
 
     if should_preprocess_with_zp:
-        assert zero_point is not None
+        assert zero_point is not None and zero_point.dtype == torch.int32
         group_size_zp = shape_k if group_size_zp == 0 else group_size_zp
         zero_point_shape = inputs.shape[:-1] + (math.ceil(shape_k / group_size_zp),)
 
@@ -133,7 +136,7 @@ def repack_weight(
         assert zero_point.shape == zero_point_shape
 
     pack_size_k = 256 // activation_bits
-    output_shape = (
+    output_shape: tuple[int, ...] = (
         shape_k // pack_size_k,
         shape_n * pack_size_k * weight_bits // 32,
     )
@@ -174,7 +177,7 @@ def unpack_weight(inputs: torch.Tensor, num_bits: int) -> torch.Tensor:
     outputs = torch.empty(output_shape, dtype=torch.int32, device=inputs.device)
 
     if not isinstance(inputs, FakeTensor):
-        kernel = UnpackWeightKernel(inputs=inputs)
+        kernel = UnpackWeightKernel(num_bits)
         kernel(inputs=inputs, outputs=outputs)
 
     return outputs

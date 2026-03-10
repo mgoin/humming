@@ -8,8 +8,8 @@ from humming import dtypes
 from humming.jit.compiler import NVCCCompiler
 
 
-class KernelRuntime(object):
-    _instances = {}
+class KernelRuntime:
+    _instances: dict[tuple[str, str], "KernelRuntime"] = {}
 
     def __new__(cls, *args, **kwargs):
         def get_value(value):

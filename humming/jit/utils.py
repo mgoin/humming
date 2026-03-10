@@ -131,5 +131,4 @@ def make_humming_module(func_name, result):
     try:
         return importlib.import_module(module_name)
     except ModuleNotFoundError:
-        print(sys.path)
         raise

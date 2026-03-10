@@ -9,6 +9,7 @@ template <
     class PipelineConfig, class QuantParamConfig>
 class S2RMemoryLoaderBZP {
 private:
+  static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
   static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
   static constexpr bool kIsChannelScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
   static constexpr bool kIsGroupScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
@@ -20,7 +21,7 @@ private:
   static constexpr uint32_t N_WARPS = BlockShape::N / WarpShape::N;
   static constexpr uint32_t K_WARPS = BlockShape::K / WarpShape::K;
 
-  static constexpr uint32_t kNumZPBits = MAX(4, static_next_power_of_2(ElementB::kBits));
+  static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementB::kBits));
   static constexpr uint32_t kLoadBytes = WarpShape::N / 8 * kNumZPBits / 8;
   using LoadType = typename LoadTypeChooser<kLoadBytes>::Type;
   static constexpr uint32_t kSmemStride = BlockShape::N * kNumZPBits / 32 / 4;
@@ -33,21 +34,35 @@ public:
     constexpr uint32_t kNumLoadBlockEvery64Rows = (64 * kNumZPBits) / kLoadBytes;
     constexpr uint32_t kNumWarpsEvery64Rows = 64 / WarpShape::N;
     uint32_t warp_id = threadIdx.x / 32;
-    uint32_t zp_sh_rd = warp_id % N_WARPS / kNumWarpsEvery64Rows * (8 * kNumWarpsEvery64Rows);
-    zp_sh_rd += (threadIdx.x % 32) / 4 * kNumWarpsEvery64Rows + warp_id % kNumWarpsEvery64Rows;
 
-    if constexpr (kGroupSize < BlockShape::K) {
-      uint32_t k_index = (warp_id / (M_WARPS * N_WARPS)) * WarpShape::K + iter_id * kPartMmaShapeK;
-      uint32_t group_index = k_index / kGroupSize;
-      zp_sh_rd += group_index * kSmemStrideLoadType;
-    };
+    if constexpr (!kIsFpZeroPoint) {
+      uint32_t zp_sh_rd = warp_id % N_WARPS / kNumWarpsEvery64Rows * (8 * kNumWarpsEvery64Rows);
+      zp_sh_rd += (threadIdx.x % 32) / 4 * kNumWarpsEvery64Rows + warp_id % kNumWarpsEvery64Rows;
 
-    LoadType *reg_ptr_load = reinterpret_cast<LoadType *>(regs_ptr);
-    const LoadType *smem_ptr_load = reinterpret_cast<const LoadType *>(smem_ptr);
+      if constexpr (kGroupSize < BlockShape::K) {
+        uint32_t k_index = (warp_id / (M_WARPS * N_WARPS)) * WarpShape::K + iter_id * kPartMmaShapeK;
+        uint32_t group_index = k_index / kGroupSize;
+        zp_sh_rd += group_index * kSmemStrideLoadType;
+      };
 
-    PRAGMA_UNROLL
-    for (uint32_t i = 0; i < kNumGroups; i++) {
-      reg_ptr_load[i] = smem_ptr_load[kSmemStrideLoadType * i + zp_sh_rd];
-    };
+      LoadType *reg_ptr_load = reinterpret_cast<LoadType *>(regs_ptr);
+      const LoadType *smem_ptr_load = reinterpret_cast<const LoadType *>(smem_ptr);
+
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < kNumGroups; i++) {
+        reg_ptr_load[i] = smem_ptr_load[kSmemStrideLoadType * i + zp_sh_rd];
+      };
+    } else {
+      static_assert(ElementA::kBits == 16);
+      uint32_t zp_sh_rd = (threadIdx.x % 32) / 4 + (warp_id % N_WARPS) * 8;
+      if constexpr (kGroupSize < BlockShape::K) {
+        uint32_t k_index = (warp_id / (M_WARPS * N_WARPS)) * WarpShape::K + iter_id * kPartMmaShapeK;
+        uint32_t group_index = k_index / kGroupSize;
+        zp_sh_rd += group_index * kSmemStrideLoadType;
+      };
+      LoadType *reg_ptr_load = reinterpret_cast<LoadType *>(regs_ptr);
+      const LoadType *smem_ptr_load = reinterpret_cast<const LoadType *>(smem_ptr);
+      reg_ptr_load[0] = smem_ptr_load[zp_sh_rd];
+    }
   }
 };

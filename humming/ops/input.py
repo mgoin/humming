@@ -192,4 +192,7 @@ def quant_input(
             num_stages=1,
         )
 
+    if scales is None:
+        scales = torch.empty(0)
+
     return outputs, scales

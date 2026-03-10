@@ -1,5 +1,5 @@
 import re
-from typing import Any
+from typing import Any, ClassVar
 import dataclasses
 import enum
 
@@ -37,9 +37,9 @@ def name_value_to_extern_const_style(name: str, value: Any) -> str:
 
 
 @dataclasses.dataclass
-class BaseHummingConfigClass(object):
-    _name_map = {}
-    _cpp_ignore_names = set()
+class BaseHummingConfigClass:
+    _name_map: ClassVar[dict[str, str]] = {}
+    _cpp_ignore_names: ClassVar[set[str]] = set()
 
     def __post_init__(self):
         for field in dataclasses.fields(self):

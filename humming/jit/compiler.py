@@ -9,9 +9,9 @@ import filelock
 import humming.jit.utils as jit_utils
 
 
-class Compiler(object):
+class Compiler:
     @classmethod
-    def signature():
+    def signature(self):
         raise NotImplementedError
 
     @staticmethod

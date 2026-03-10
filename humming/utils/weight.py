@@ -11,6 +11,7 @@ def quantize_weight(
     group_size: int,
     has_zero_point: bool = False,
     has_global_scale: bool = False,
+    is_fp_zero_point: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert weight.dtype in [torch.float16, torch.bfloat16, torch.float32]
     assert weight.ndim in [2, 3]
@@ -37,7 +38,12 @@ def quantize_weight(
         use_e8m0_scale=scale_dtype == dtypes.float8e8m0,
         has_scale=scale_dtype is not None or has_global_scale,
         has_zero_point=has_zero_point,
+        is_fp_zero_point=is_fp_zero_point,
     )
+
+    if zero_point.dtype == torch.float32:
+        torch_dtype = torch.float16 if scale_dtype == dtypes.float16 else torch.bfloat16
+        zero_point = zero_point.to(torch_dtype)
 
     global_scale = None
     if scale_dtype is None and has_global_scale:
@@ -106,7 +112,7 @@ def prepare_humming_weight(
     assert padded_shape_k % (2 * packed_block_size_k) == 0
 
     should_preprocess_for_int2fp = False
-    has_zero_point = zero_point is not None and zero_point.nelement()
+    has_zero_point = zero_point is not None and zero_point.nelement() > 0
     if b_dtype.is_integer_type and a_dtype.is_floating_point_type:
         if a_dtype.num_bits < 16:
             should_preprocess_for_int2fp = True
@@ -118,7 +124,16 @@ def prepare_humming_weight(
     if not should_preprocess_for_int2fp and has_zero_point:
         has_zero_point = False
 
-    group_size_zp = 0 if not has_zero_point else (shape_k // zero_point.size(-1))
+    should_preprocess_with_zp = has_zero_point
+    if zero_point is not None and zero_point.dtype.is_floating_point:
+        should_preprocess_with_zp = False
+        should_preprocess_for_int2fp = False
+
+    if not has_zero_point:
+        group_size_zp = 0
+    else:
+        assert zero_point is not None
+        group_size_zp = shape_k // zero_point.size(-1)
 
     repacked_weight = ops.repack_weight(
         inputs=weight,
@@ -127,7 +142,7 @@ def prepare_humming_weight(
         activation_bits=a_dtype.num_bits,
         is_weight_pakced=packed,
         should_preprocess_for_int2fp=should_preprocess_for_int2fp,
-        should_preprocess_with_zp=has_zero_point,
+        should_preprocess_with_zp=should_preprocess_with_zp,
         group_size_zp=group_size_zp,
     )
 
@@ -135,9 +150,12 @@ def prepare_humming_weight(
 
 
 def prepare_humming_weight_scale(
-    weight_scale: torch.Tensor,
+    weight_scale: torch.Tensor | None,
     to_apply_on_c: bool = False,
-) -> torch.Tensor:
+) -> torch.Tensor | None:
+    if weight_scale is None:
+        return None
+
     if to_apply_on_c:
         perm = [0, 1, 8, 9, 16, 17, 24, 25]
     else:
@@ -148,10 +166,10 @@ def prepare_humming_weight_scale(
     for i in range(8 // count):
         perm_new += [x + count * i for x in perm]
 
-    perm_new = torch.tensor(perm_new, dtype=torch.int32, device=weight_scale.device)
+    perm_tensor = torch.tensor(perm_new, dtype=torch.int32, device=weight_scale.device)
     weight_scale = weight_scale.transpose(-1, -2).contiguous()
     orig_shape = weight_scale.shape
-    weight_scale = weight_scale.view(-1, len(perm_new))[:, perm_new]
+    weight_scale = weight_scale.view(-1, len(perm_tensor))[:, perm_tensor]
     weight_scale = weight_scale.contiguous().view(orig_shape)
 
     return weight_scale
@@ -165,15 +183,21 @@ def prepare_humming_zero_point(
     if zero_point is None:
         return zero_point
 
+    if zero_point.dtype.is_floating_point:
+        return prepare_humming_weight_scale(zero_point, False)
+
     if packed:
         zero_point = zero_point.transpose(-1, -2).contiguous()
         zero_point = zero_point.squeeze().view(*zero_point.shape)
         zero_point = ops.unpack_weight(zero_point, dtype.num_bits)
         zero_point = zero_point.transpose(-1, -2).contiguous()
 
+    assert zero_point is not None
     num_zp_bits = 4 if dtype.num_bits <= 4 else 8
     shape_n = zero_point.size(-2)
-    zero_point = prepare_humming_weight_scale(zero_point).to(torch.uint8)
+    zero_point = prepare_humming_weight_scale(zero_point)
+    assert zero_point is not None
+    zero_point = zero_point.to(torch.uint8)
     zero_point = zero_point.view(-1)
     if num_zp_bits == 4:
         zero_point = zero_point[..., 1::2] * 16 + zero_point[..., ::2]
@@ -182,8 +206,10 @@ def prepare_humming_zero_point(
 
 def prepare_humming_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
     if bias is None:
-        return
-    return prepare_humming_weight_scale(bias.unsqueeze(-1), True).squeeze(0)
+        return None
+    bias = prepare_humming_weight_scale(bias.unsqueeze(-1), True)
+    assert bias is not None
+    return bias.squeeze(-2)
 
 
 def prepare_humming_tensor_for_glu(

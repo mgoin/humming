@@ -201,6 +201,7 @@ int64_t register_kernel(const std::string &cubin_path, const std::string &func_n
         reader.getBool("IS_MOE"),
         reader.getBool("IS_MOE_DOWN"),
         reader.getBool("IS_GLU_ACTIVATION"),
+        reader.getBool("IS_FP_ZERO_POINT"),
         reader.getBool("HAS_INPUT_SCALE"),
         reader.getBool("HAS_WEIGHT_SCALE"),
         reader.getBool("HAS_ZERO_POINT"),
@@ -219,10 +220,10 @@ int64_t register_kernel(const std::string &cubin_path, const std::string &func_n
 
 COMMON_TORCH_LIBRARY(humming, m) {
   m.def(
-      "launch_kernel(int[] configs, Tensor a, Tensor b, Tensor(c!)? c, "
+      "launch_kernel(int[] configs, Tensor a, Tensor b, Tensor? c, "
       "Tensor? as_, Tensor? bs, Tensor? bzp, Tensor? bias, Tensor? gs, "
       "Tensor? topk_weights, Tensor? sorted_ids, Tensor? expert_ids, Tensor? num_tokens_padded, "
-      "Tensor(locks!)? locks, bool should_check_tensor = True) -> Tensor");
+      "Tensor? locks, bool should_check_tensor = True) -> Tensor");
   m.def("register_kernel(str cubin_path, str func_name) -> int");
 };
 

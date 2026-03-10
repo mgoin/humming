@@ -1,24 +1,42 @@
 import dataclasses
-from typing import Any
+import json
+import math
+import os
+import re
+from typing import Any, Callable
 
 import torch
 
-from humming import ops
-from humming import dtypes
+from humming import dtypes, ops
 from humming.jit.utils import make_humming_module
 from humming.kernel.humming import HummingKernel
+from humming.schema import (
+    BaseInputSchema,
+    BaseWeightSchema,
+    HummingInputSchema,
+    HummingWeightSchema,
+)
 from humming.utils.weight import (
     prepare_humming_bias,
     prepare_humming_tensor_for_glu,
     prepare_humming_weight,
     prepare_humming_weight_scale,
     prepare_humming_zero_point,
-    quantize_weight,
 )
 
 
-@dataclasses.dataclass
-class HummingLayerMeta(object):
+def get_default_f16_torch_dtype() -> torch.dtype:
+    torch_dtype = torch.get_default_dtype()
+    if torch_dtype not in [torch.float16, torch.bfloat16]:
+        if torch.cuda.get_device_capability()[0] >= 8:
+            torch_dtype = torch.bfloat16
+        else:
+            torch_dtype = torch.float16
+    return torch_dtype
+
+
+@dataclasses.dataclass(kw_only=True)
+class HummingLayerMeta:
     a_dtype: dtypes.DataType
     b_dtype: dtypes.DataType
     c_dtype: dtypes.DataType
@@ -35,7 +53,8 @@ class HummingLayerMeta(object):
     has_zero_point: bool = False
     has_bias: bool = False
     has_global_scale: bool = False
-    mma_type: str | None = "mma"
+    is_fp_zero_point: bool = False
+    mma_type: str | None = None
     top_k: int = 0
     is_moe: bool = False
     is_moe_down: bool = False
@@ -65,303 +84,196 @@ class HummingLayerMeta(object):
     def bias_name(self):
         return self.name_prefix + "bias"
 
+    @property
+    def param_dtype(self):
+        if self.c_dtype == dtypes.float16:
+            return torch.float16
+        elif self.c_dtype == dtypes.bfloat16:
+            return torch.bfloat16
+        else:
+            raise ValueError(f"unsupported c_dtype: {self.c_dtype}")
+
+    @property
+    def should_apply_bs_on_c(self):
+        if self.mma_type == "mma":
+            return self.weight_scale_group_size == 0 or self.a_dtype.num_bits != 16
+        elif self.mma_type == "wgmma":
+            return self.weight_scale_group_size == 0
+        else:
+            raise ValueError(f"unsupported mma_type: {self.mma_type}")
+
     def __post_init__(self):
+        assert self.is_fp_zero_point or not self.has_zero_point
         if self.a_dtype.num_bits != 16 and self.has_input_scale is None:
             self.has_input_scale = True
         self.is_moe = self.num_experts is not None
         if self.is_moe:
             assert self.top_k > 0
+        if self.mma_type is None:
+            sm_version = torch.cuda.get_device_capability()[0]
+            self.mma_type = "wgmma" if sm_version == (9, 0) else "mma"
 
 
-class HummingMethod(torch.nn.Module):
+class HummingModule(torch.nn.Module):
+    humming_block_size_configs: dict[str, list[int]]
+    humming_kernel_config_modules: dict[str, Callable]
+    humming_metas: dict[str, HummingLayerMeta]
+    locks: torch.Tensor | None
+
+
+class HummingMethod:
     @classmethod
-    def set_param(cls, layer: torch.nn.Module, name: str, data: torch.Tensor):
-        setattr(layer, name, torch.nn.Parameter(data, requires_grad=False))
-
-    @classmethod
-    def set_param_data(
-        cls,
-        layer: torch.nn.Module,
-        name: str,
-        data: torch.Tensor,
-        offset: int | None = None,
-        expert_id: int | None = None,
-    ):
-        param = getattr(layer, name, None)
-        if name.endswith("bias"):
-            is_moe = param.ndim == 2
-        elif name.endswith("global_scale"):
-            is_moe = param.nelement() > 1
-        else:
-            is_moe = param.ndim == 3
-
-        if param is None:
+    def may_set_param(cls, layer: torch.nn.Module, name: str, tensor: torch.Tensor | None):
+        if tensor is None:
             return
-
-        assert data.dtype == param.dtype
-
-        if is_moe and expert_id is None and data.nelement() != param.nelement():
-            for expert_id in range(data.size(0)):
-                data_tmp = data[expert_id].to(param.device).view(-1)
-                part_tensor = param.data[expert_id]
-                part_tensor = part_tensor.view(-1)[offset or 0 :]
-                part_tensor[: data_tmp.size(0)] = data_tmp
-        else:
-            data = data.to(param.device).view(-1)
-            part_tensor = param.data if expert_id is None else param.data[expert_id]
-            part_tensor = part_tensor.view(-1)[offset or 0 :]
-            part_tensor[: data.size(0)] = data
+        param = torch.nn.Parameter(tensor, requires_grad=False)
+        setattr(layer, name, param)
 
     @classmethod
-    def create_weights(cls, layer: torch.nn.Module, meta: HummingLayerMeta):
-        packed_size_k = 256 // meta.a_dtype.num_bits
+    def prepare_layer_meta(
+        cls,
+        layer: HummingModule | torch.nn.Module,
+        shape_n: int,
+        shape_k: int,
+        weight_schema: HummingWeightSchema,
+        input_schema: HummingInputSchema | None = None,
+        num_experts: int | None = None,
+        pad_n_to_multiple: int = 1,
+        pad_k_to_multiple: int = 1,
+        has_bias: bool = False,
+        top_k: int = 0,
+        is_moe_down: bool = False,
+        has_stack: bool = False,
+        torch_dtype: torch.dtype | None = None,
+        sublayer_name: str = "",
+    ):
+        if torch_dtype is None:
+            torch_dtype = get_default_f16_torch_dtype()
+        f16_dtype = dtypes.DataType.from_torch_dtype(torch_dtype)
+        pad_shape_n = math.ceil(shape_n / pad_n_to_multiple) * pad_n_to_multiple - shape_n
+        pad_shape_k = math.ceil(shape_k / pad_k_to_multiple) * pad_k_to_multiple - shape_k
 
-        repacked_shape_k = meta.shape_k // packed_size_k
-        repacked_shape_n = meta.shape_n * packed_size_k * meta.b_dtype.num_bits // 32
-        weight_shape = (repacked_shape_k, repacked_shape_n)
-        group_size = meta.weight_scale_group_size or meta.shape_k
+        if input_schema is None:
+            input_schema = HummingInputSchema(a_dtype=f16_dtype)
 
-        num_groups = meta.shape_k // group_size
-        weight_scale_shape = (num_groups, meta.shape_n)
-        num_zp_bits = 4 if meta.b_dtype.num_bits <= 4 else 8
-        zero_point_shape = (num_groups, meta.shape_n * num_zp_bits // 32)
-        bias_shape = (meta.shape_n,)
-        global_scale_shape = (1,)
+        assert isinstance(input_schema, HummingInputSchema)
+        assert isinstance(weight_schema, HummingWeightSchema)
 
-        if meta.num_experts is not None:
-            weight_shape = (meta.num_experts,) + weight_shape
-            weight_scale_shape = (meta.num_experts,) + weight_scale_shape
-            zero_point_shape = (meta.num_experts,) + zero_point_shape
-            bias_shape = (meta.num_experts,) + bias_shape
-            global_scale_shape = (meta.num_experts,) + global_scale_shape
+        meta = HummingLayerMeta(
+            a_dtype=input_schema.a_dtype or f16_dtype,
+            b_dtype=weight_schema.b_dtype,
+            bs_dtype=weight_schema.bs_dtype or f16_dtype,
+            c_dtype=f16_dtype,
+            shape_n=shape_n,
+            shape_k=shape_k,
+            pad_shape_n=pad_shape_n,
+            pad_shape_k=pad_shape_k,
+            num_experts=num_experts,
+            has_bias=has_bias,
+            top_k=top_k,
+            is_moe_down=is_moe_down,
+            input_scale_group_size=input_schema.input_scale_group_size,
+            weight_scale_group_size=weight_schema.weight_scale_group_size,
+            has_zero_point=weight_schema.has_zero_point,
+            is_fp_zero_point=weight_schema.is_fp_zero_point,
+            has_global_scale=weight_schema.has_global_scale,
+            sublayer_name=sublayer_name,
+        )
 
-        weight = torch.empty(weight_shape, dtype=torch.int32)
-        cls.set_param(layer, meta.weight_name, weight)
-
-        if meta.has_weight_scale:
-            torch_dtype = dtypes.torch_dtype_map[meta.bs_dtype]
-            weight_scale = torch.empty(weight_scale_shape, dtype=torch_dtype)
-            cls.set_param(layer, meta.weight_scale_name, weight_scale)
-
-            if meta.has_zero_point:
-                zero_point = torch.empty(zero_point_shape, dtype=torch.int32)
-                cls.set_param(layer, meta.zero_point_name, zero_point)
-
-        if meta.has_global_scale:
-            global_scale = torch.empty(global_scale_shape, dtype=torch.float32)
-            cls.set_param(layer, meta.global_scale_name, global_scale)
-
-        if meta.has_bias:
-            torch_dtype = dtypes.torch_dtype_map[meta.c_dtype]
-            bias = torch.empty(bias_shape, dtype=torch_dtype)
-            cls.set_param(layer, meta.bias_name, bias)
-
-        layer.locks = torch.nn.Buffer(torch.zeros(1024, dtype=torch.int32))
         if not hasattr(layer, "humming_metas"):
             layer.humming_metas = {}
+        assert isinstance(layer.humming_metas, dict)
+        layer.humming_metas[sublayer_name] = meta
 
+        return meta
+
+    @classmethod
+    def add_sublayer_meta(
+        cls,
+        layer: HummingModule | torch.nn.Module,
+        meta: HummingLayerMeta,
+    ):
+        if not hasattr(layer, "humming_metas"):
+            layer.humming_metas = {}
+        assert isinstance(layer.humming_metas, dict)
         layer.humming_metas[meta.sublayer_name] = meta
 
     @classmethod
-    def pad_tensor(cls, tensor: torch.Tensor, target_size: int) -> torch.Tensor:
-        pad_value = 0 if tensor.dtype != torch.float8_e8m0fnu else 127
-        return torch.nn.functional.pad(
-            tensor,
-            pad=(0, target_size - tensor.size(-1)),
-            value=pad_value,
+    def check_and_pad_tensors(cls, tensors: dict[str, torch.Tensor], meta: HummingLayerMeta):
+        tensors = tensors.copy()
+        schema = HummingWeightSchema(
+            b_dtype=meta.b_dtype,
+            bs_dtype=meta.bs_dtype,
+            weight_scale_group_size=meta.weight_scale_group_size,
+            has_global_scale=meta.has_global_scale,
+            has_zero_point=meta.has_zero_point,
+            is_fp_zero_point=meta.is_fp_zero_point,
         )
 
-    @classmethod
-    def load_weight(
-        cls,
-        layer: torch.nn.Module,
-        weight: torch.Tensor | None = None,
-        weight_scale: torch.Tensor | None = None,
-        zero_point: torch.Tensor | None = None,
-        global_scale: torch.Tensor | None = None,
-        bias: torch.Tensor | None = None,
-        offset_n: int | None = None,
-        expert_id: int | None = None,
-        sublayer_name: str = "",
-        packed: bool = False,
-        padded: bool = False,
-    ):
-        meta = layer.humming_metas[sublayer_name]
-        ckpt_shape_n = meta.shape_n if padded else (meta.shape_n - meta.pad_shape_n)
-        ckpt_shape_k = meta.shape_k if padded else (meta.shape_k - meta.pad_shape_k)
+        schema.validate_tensors(
+            tensors,
+            shape_n=meta.shape_n,
+            shape_k=meta.shape_k,
+            num_experts=meta.num_experts,
+            param_dtype=meta.param_dtype,
+            has_bias=meta.has_bias,
+        )
 
-        float_dtypes = [torch.float16, torch.bfloat16, torch.float32]
-        if weight is not None and weight.dtype in float_dtypes:
-            assert weight_scale is None
-            assert zero_point is None
+        tensors_attrs = schema.get_tensors_attrs(
+            shape_n=meta.shape_n + meta.pad_shape_n,
+            shape_k=meta.shape_k + meta.pad_shape_k,
+            num_experts=meta.num_experts,
+            param_dtype=meta.param_dtype,
+            has_bias=meta.has_bias,
+        )
 
-            weight_shape = (ckpt_shape_n, ckpt_shape_k)
-            if meta.num_layers is not None and expert_id is None:
-                weight_shape = (meta.num_layers,) + weight_shape
+        for key, attrs in tensors_attrs.items():
+            shape = attrs["shape"]
+            tensor = tensors[key]
+            padding: list[int] = []
+            value = 0 if tensor.dtype != torch.float8_e8m0fnu else 1
+            for i in range(1, len(shape) + 1):
+                padding += (0, shape[-i] - tensor.shape[-i])
 
-            assert weight.shape == weight_shape
-            if not padded:
-                weight = cls.pad_tensor(weight, meta.shape_k)
-            quanted_weight, weight_scale, zero_point, global_scale = quantize_weight(
-                weight,
-                dtype=meta.b_dtype,
-                scale_dtype=meta.bs_dtype,
-                group_size=meta.weight_scale_group_size,
-                has_zero_point=meta.has_zero_point,
-                has_global_scale=meta.has_global_scale,
-            )
+            tensors[key] = torch.nn.functional.pad(tensor, pad=padding, value=value)
 
-            return cls.load_weight(
-                layer=layer,
-                weight=quanted_weight,
-                weight_scale=weight_scale,
-                zero_point=zero_point,
-                global_scale=global_scale,
-                bias=bias,
-                offset_n=offset_n,
-                expert_id=expert_id,
-                sublayer_name=sublayer_name,
-            )
-
-        if weight is not None:
-            weight_param = getattr(layer, meta.weight_name)
-            weight = weight.to(weight_param.device)
-            assert weight.dtype == torch.int32
-
-            expected_shape_n = ckpt_shape_n if offset_n is None else weight.size(-2)
-            shape = (expected_shape_n, ckpt_shape_k)
-            if meta.num_experts is not None and expert_id is None:
-                shape = (meta.num_experts,) + shape
-            packed_shape = shape[:-1] + (ckpt_shape_k * meta.b_dtype.num_bits // 32,)
-
-            assert weight.shape == (packed_shape if packed else shape)
-
-            offset = (offset_n or 0) * ckpt_shape_k * meta.b_dtype.num_bits // 32
-
-            if not packed:
-                weight = ops.pack_weight(weight, meta.b_dtype.num_bits)
-
-            if not padded:
-                target_size = meta.shape_k * meta.b_dtype.num_bits // 32
-                weight = cls.pad_tensor(weight, target_size)
-
-            cls.set_param_data(layer, meta.weight_name, weight, offset, expert_id)
-
-        if weight_scale is not None:
-            weight_scale_param = getattr(layer, meta.weight_scale_name)
-            num_groups = weight_scale_param.size(-2)
-            if not padded and num_groups != 1:
-                num_groups = num_groups * ckpt_shape_k // meta.shape_k
-            expected_shape_n = ckpt_shape_n if offset_n is None else weight_scale.size(-2)
-            shape = (expected_shape_n, num_groups)
-            if meta.num_experts is not None and expert_id is None:
-                shape = (meta.num_experts,) + shape
-            assert weight_scale.shape == shape
-            weight_scale = weight_scale.to(device=weight_scale_param.device)
-            if weight_scale.element_size() == 1 or weight_scale_param.element_size() == 1:
-                assert weight_scale.dtype == weight_scale_param.dtype
-            else:
-                assert weight_scale.dtype in float_dtypes
-                assert weight_scale_param.dtype in float_dtypes
-                weight_scale = weight_scale.to(dtype=weight_scale_param.dtype)
-
-            if not padded and meta.shape_k != ckpt_shape_k:
-                target_size = weight_scale_param.size(-2)
-                weight_scale = cls.pad_tensor(weight_scale, target_size)
-
-            offset = (offset_n or 0) * num_groups
-            cls.set_param_data(layer, meta.weight_scale_name, weight_scale, offset, expert_id)
-
-        if zero_point is not None:
-            zero_point_param = getattr(layer, meta.zero_point_name)
-            zero_point = zero_point.to(device=zero_point_param.device)
-
-            if packed:
-                expected_shape_n = zero_point.size(-2) * 32 // meta.b_dtype.num_bits
-            else:
-                expected_shape_n = zero_point.size(-2)
-            expected_shape_n = ckpt_shape_n if offset_n is None else expected_shape_n
-
-            num_groups = zero_point_param.size(-2)
-            if not padded and num_groups != 1:
-                num_groups = num_groups * ckpt_shape_k // meta.shape_k
-
-            shape = (expected_shape_n, num_groups)
-            packed_shape = (expected_shape_n * meta.b_dtype.num_bits // 32, num_groups)
-            if meta.num_experts is not None and expert_id is None:
-                shape = (meta.num_experts,) + shape
-                packed_shape = (meta.num_experts,) + packed_shape
-
-            assert zero_point.shape == (packed_shape if packed else shape)
-            if not packed:
-                zero_point = zero_point.cuda()
-                zero_point = zero_point.transpose(-1, -2).contiguous()
-                zero_point = zero_point.squeeze().view(*zero_point.shape)
-                zero_point = ops.pack_weight(zero_point, meta.b_dtype.num_bits)
-                zero_point = zero_point.transpose(-1, -2).contiguous()
-                zero_point = zero_point.squeeze().view(*zero_point.shape)
-
-            if not padded and meta.shape_k != ckpt_shape_k:
-                target_size = weight_scale_param.size(-2)
-                zero_point = cls.pad_tensor(zero_point, target_size)
-
-            assert zero_point.dtype == torch.int32
-            offset = (offset_n or 0) * meta.b_dtype.num_bits // 32 * num_groups
-            cls.set_param_data(layer, meta.zero_point_name, zero_point, offset, expert_id)
-
-        if global_scale is not None:
-            global_scale_param = getattr(layer, meta.global_scale_name)
-            global_scale = global_scale.to(
-                device=global_scale_param.device,
-                dtype=global_scale_param.dtype,
-            )
-            cls.set_param_data(layer, meta.global_scale_name, global_scale, expert_id)
-
-        if bias is not None:
-            bias_param = getattr(layer, meta.bias_name, None)
-            expected_shape_n = ckpt_shape_n if offset_n is None else bias.size(-1)
-            shape = (expected_shape_n,)
-            if meta.num_experts is not None and expert_id is None:
-                shape = (meta.num_experts,) + shape
-            assert bias.shape == shape
-            assert bias.dtype in [torch.float16, torch.bfloat16, torch.float32]
-            bias = bias.to(device=bias_param.device, dtype=bias_param.dtype)
-            cls.set_param_data(layer, meta.bias_name, bias, offset_n, expert_id)
+        return tensors
 
     @classmethod
-    def finish_load(
+    def transform_humming_layer(
         cls,
-        layer: torch.nn.Module,
-        should_preprocess_for_glu: bool = False,
+        layer: HummingModule | torch.nn.Module,
         sublayer_name: str = "",
+        should_prepare_for_glu: bool = False,
+        already_padded: bool = False,
     ):
+        assert isinstance(layer.humming_metas, dict)
         meta = layer.humming_metas[sublayer_name]
-        weight = getattr(layer, meta.weight_name)
-        weight_scale = getattr(layer, meta.weight_scale_name, None)
-        zero_point = getattr(layer, meta.zero_point_name, None)
-        bias = getattr(layer, meta.bias_name, None)
+        prefix = meta.name_prefix
+        tensors = dict(
+            (key.removeprefix(prefix), value)
+            for key, value in layer.state_dict().items()
+            if key.startswith(prefix)
+        )
 
-        num_experts = meta.num_experts or 1
-        weight = weight.view(num_experts, meta.shape_n, -1)
-        if zero_point is not None and zero_point.size(0):
-            num_groups = zero_point.size(-2)
-            padded_bits = 4 if meta.b_dtype.num_bits <= 4 else 8
-            zero_point = zero_point.view(num_experts, padded_bits, -1)
-            zero_point = zero_point[:, : meta.b_dtype.num_bits].contiguous()
-            zero_point = zero_point.view(num_experts, -1, num_groups)
-        if weight_scale is not None:
-            weight_scale = weight_scale.view(num_experts, meta.shape_n, -1)
+        if not already_padded:
+            tensors = cls.check_and_pad_tensors(tensors, meta)
 
-        if should_preprocess_for_glu:
-            for tensor in [weight, weight_scale, zero_point, bias]:
-                tensor_new = prepare_humming_tensor_for_glu(
-                    tensor=tensor,
-                    is_moe=weight.ndim == 3,
-                    shape_n=meta.shape_n,
-                    pad_shape_n=meta.pad_shape_n,
-                )
-                if tensor is not None:
-                    tensor.copy_(tensor_new)
+        for key in ["weight", "weight_scale", "zero_point", "bias"]:
+            if not should_prepare_for_glu or key not in tensors:
+                continue
+            tensors[key] = prepare_humming_tensor_for_glu(
+                tensor=tensors[key],
+                is_moe=meta.is_moe,
+                shape_n=meta.shape_n,
+                pad_shape_n=meta.pad_shape_n,
+            )
+
+        weight = tensors["weight"]
+        zero_point = tensors["zero_point"] if meta.has_zero_point else None
+        weight_scale = tensors["weight_scale"] if meta.has_weight_scale else None
+        bias = tensors["bias"] if meta.has_bias else None
+        global_scale = tensors["global_scale"] if meta.has_global_scale else None
 
         weight = prepare_humming_weight(
             weight=weight,
@@ -371,45 +283,24 @@ class HummingMethod(torch.nn.Module):
             packed=True,
         )
 
-        cls.set_param_data(layer, meta.weight_name, weight)
+        weight_scale = prepare_humming_weight_scale(weight_scale, meta.should_apply_bs_on_c)
+        zero_point = prepare_humming_zero_point(zero_point, meta.b_dtype, packed=True)
+        bias = prepare_humming_bias(bias)
 
-        if weight_scale is not None and weight_scale.size(0):
-            weight_scale_group_size = meta.weight_scale_group_size
-
-            if meta.mma_type == "mma":
-                to_apply_on_c = weight_scale_group_size == 0 or meta.a_dtype.num_bits != 16
-            elif meta.mma_type == "wgmma":
-                to_apply_on_c = weight_scale_group_size == 0
-
-            weight_scale = prepare_humming_weight_scale(
-                weight_scale=weight_scale,
-                to_apply_on_c=to_apply_on_c,
-            )
-
-            cls.set_param_data(layer, meta.weight_scale_name, weight_scale)
-
-        if zero_point is not None and zero_point.size(0):
-            b_dtype = meta.b_dtype
-            zero_point = prepare_humming_zero_point(
-                zero_point,
-                dtype=b_dtype,
-                packed=True,
-            )
-            cls.set_param_data(layer, meta.zero_point_name, zero_point)
-
-        if bias is not None and bias.size(0):
-            if bias.ndim == 1 and bias.size(0) == meta.shape_n - meta.pad_shape_n:
-                bias = torch.nn.functional.pad(bias, pad=(0, meta.pad_shape_n))
-            bias = prepare_humming_bias(bias)
-            cls.set_param_data(layer, meta.bias_name, bias)
+        cls.may_set_param(layer, meta.weight_name, weight)
+        cls.may_set_param(layer, meta.weight_scale_name, weight_scale)
+        cls.may_set_param(layer, meta.zero_point_name, zero_point)
+        cls.may_set_param(layer, meta.global_scale_name, global_scale)
+        cls.may_set_param(layer, meta.bias_name, bias)
 
     @classmethod
     def prepare_default_kernel_configs(
         cls,
-        layer: torch.nn.Module,
+        layer: HummingModule | torch.nn.Module,
         sublayer_name: str = "",
         **kwargs,
     ):
+        assert isinstance(layer.humming_metas, dict)
         meta = layer.humming_metas[sublayer_name]
         warp_shape_nk = (64, 32)
         block_shape_nk1 = (128, 128)
@@ -421,7 +312,7 @@ class HummingMethod(torch.nn.Module):
             block_shape_nk1 = (128, 256)
             block_shape_nk2 = (256, 128)
 
-        kernel_configs = [
+        kernel_configs: list[Any] = [
             [0, 16, (16, *block_shape_nk1), (16, *warp_shape_nk)],
             [16, 32, (32, *block_shape_nk2), (32, *warp_shape_nk)],
             [32, 48, (48, *block_shape_nk2), (48, *warp_shape_nk)],
@@ -429,9 +320,6 @@ class HummingMethod(torch.nn.Module):
             [64, 96, (48, *block_shape_nk2), (48, *warp_shape_nk)],
             [96, None, (64, *block_shape_nk2), (64, *warp_shape_nk)],
         ]
-
-        if "num_stages" not in kwargs:
-            kwargs["num_stages"] = 4
 
         for min_shape_m, max_shape_m, block_shape, warp_shape in kernel_configs:
             if max_shape_m is None:
@@ -450,29 +338,32 @@ class HummingMethod(torch.nn.Module):
                 block_shape=block_shape,
                 warp_shape=warp_shape,
                 sublayer_name=sublayer_name,
+                num_stages=4,
                 **kwargs,
             )
 
     @classmethod
     def prepare_kernel(
         cls,
-        layer: torch.nn.Module,
-        block_shape: tuple[int],
-        warp_shape: tuple[int],
+        layer: HummingModule | torch.nn.Module,
+        block_shape: tuple[int, int, int],
+        warp_shape: tuple[int, int, int],
         sublayer_name: str = "",
         **kwargs,
     ):
-        meta: HummingLayerMeta = layer.humming_metas[sublayer_name]
+        assert isinstance(layer.humming_metas, dict)
+        meta = layer.humming_metas[sublayer_name]
         layer_kwargs = dict(
             (key, value)
-            for key, value in dataclasses.asdict(meta).items()
+            for key, value in vars(meta).items()
             if "shape" not in key and "name" not in key and key != "num_experts"
         )
         conflict_keys = set(kwargs) & set(layer_kwargs)
         msg = f"the following keys are derived from layers, {conflict_keys}"
         assert not conflict_keys, msg
+        problem_shape = (0, meta.shape_n + meta.pad_shape_n, meta.shape_k + meta.pad_shape_k)
         kernel = HummingKernel(
-            problem_shape=(0, meta.shape_n, meta.shape_k),
+            problem_shape=problem_shape,
             block_shape=block_shape,
             warp_shape=warp_shape,
             pad_shape=(0, meta.pad_shape_n, meta.pad_shape_k),
@@ -485,14 +376,15 @@ class HummingMethod(torch.nn.Module):
     @classmethod
     def add_kernel_config(
         cls,
-        layer: torch.nn.Module,
+        layer: HummingModule | torch.nn.Module,
         min_shape_m: int,
         max_shape_m: int,
-        block_shape: tuple[int],
-        warp_shape: tuple[int],
+        block_shape: tuple[int, int, int],
+        warp_shape: tuple[int, int, int],
         sublayer_name: str = "",
         **kwargs,
     ):
+        assert isinstance(layer.humming_metas, dict)
         kernel_config = cls.prepare_kernel(layer, block_shape, warp_shape, sublayer_name, **kwargs)
         if not hasattr(layer, "humming_kernel_config_modules"):
             layer.humming_kernel_config_modules = {}
@@ -517,22 +409,23 @@ class HummingMethod(torch.nn.Module):
         meta: HummingLayerMeta,
         inputs: torch.Tensor,
         input_scale: torch.Tensor | None = None,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert meta.a_dtype.num_bits
         if meta.a_dtype.num_bits == 16:
             return inputs, None
         if input_scale is not None:
             return inputs, input_scale
-        return ops.quant_input(
+        inputs, input_scale = ops.quant_input(
             inputs=inputs,
             dtype=str(meta.a_dtype),
             group_size=None,
         )
+        return inputs, (input_scale if input_scale.size() else None)
 
     @classmethod
     def forward_layer(
         cls,
-        layer: torch.nn.Module,
+        layer: HummingModule | torch.nn.Module,
         inputs: torch.Tensor,
         outputs: torch.Tensor | None = None,
         input_scale: torch.Tensor | None = None,
@@ -543,6 +436,7 @@ class HummingMethod(torch.nn.Module):
         sublayer_name: str = "",
         kernel_config: dict[str, Any] | None = None,
     ):
+        assert isinstance(layer.humming_metas, dict)
         meta = layer.humming_metas[sublayer_name]
         inputs, input_scale = cls.may_quant_input(meta, inputs, input_scale)
         if kernel_config is None:
@@ -553,6 +447,7 @@ class HummingMethod(torch.nn.Module):
             configs = layer.humming_kernel_config_modules[sublayer_name]()
         else:
             configs = cls.prepare_kernel(layer, sublayer_name=sublayer_name, **kernel_config)
+
         return ops.launch_kernel(
             configs,
             inputs,
@@ -571,23 +466,257 @@ class HummingMethod(torch.nn.Module):
         )
 
 
+@dataclasses.dataclass(repr=False, eq=False)
 class HummingLayer(torch.nn.Module):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.meta = HummingLayerMeta(**kwargs)
-        HummingMethod.create_weights(self, self.meta)
+    shape_n: int
+    shape_k: int
+    weight_config: BaseWeightSchema | dict[str, Any]
+    input_config: BaseInputSchema | dict[str, Any] | None = None
+    pad_n_to_multiple: int = 1
+    pad_k_to_multiple: int = 1
+    num_experts: int | None = None
+    has_bias: bool = False
+    top_k: int = 0
+    is_moe_down: bool = False
+    torch_dtype: torch.dtype | None = None
 
-    def load_weight(self, **kwargs):
-        HummingMethod.load_weight(self, **kwargs)
+    def __post_init__(self):
+        super().__init__()
+
+        if self.torch_dtype is None:
+            self.torch_dtype = get_default_f16_torch_dtype()
+        assert self.torch_dtype in [torch.float16, torch.bfloat16], self.torch_dtype
+
+        if self.input_config is None:
+            self.input_config = {"quant_method": "humming"}
+            self.input_config["a_dtype"] = dtypes.DataType.from_torch_dtype(self.torch_dtype)
+
+        self.input_schema: BaseInputSchema = (
+            self.input_config
+            if isinstance(self.input_config, BaseInputSchema)
+            else BaseInputSchema.from_config(self.input_config)
+        )
+
+        self.weight_schema: BaseWeightSchema = (
+            self.weight_config
+            if isinstance(self.weight_config, BaseWeightSchema)
+            else BaseWeightSchema.from_config(self.weight_config)
+        )
+
+        tensors_attrs = self.weight_schema.get_tensors_attrs(
+            shape_n=self.shape_n,
+            shape_k=self.shape_k,
+            param_dtype=self.torch_dtype,
+            num_experts=self.num_experts,
+            has_bias=self.has_bias,
+        )
+
+        for name, attrs in tensors_attrs.items():
+            tensor = torch.empty(attrs["shape"], dtype=attrs["dtype"])
+            param = torch.nn.Parameter(tensor, requires_grad=False)
+            for key, value in attrs.items():
+                if key not in ["shape", "dtype"]:
+                    setattr(param, key, value)
+            setattr(self, name, param)
+
+        locks = torch.zeros((1024), dtype=torch.int32, device="cuda:0")
+        self.register_buffer("locks", locks)
+
+    @staticmethod
+    def filter_tensors(
+        tensors: dict[str, torch.Tensor], prefix: str = ""
+    ) -> dict[str, torch.Tensor]:
+        tensors_new = {}
+        for key in tensors:
+            if key.startswith(prefix):
+                key_new = key.removeprefix(prefix).lstrip(".")
+                tensors_new[key_new] = tensors[key]
+        return tensors_new
+
+    def load_from_tensors(self, tensors: dict[str, torch.Tensor], prefix: str = ""):
+        tensors = self.filter_tensors(tensors, prefix)
+        self.load_state_dict(tensors, strict=False)
+
+    def load_from_safetensors(self, name: str, prefix: str = ""):
+        assert os.path.exists(name)
+        import safetensors.torch
+
+        if os.path.isfile(name):
+            tensors = safetensors.torch.load_file(name)
+            return self.load_from_tensors(tensors, prefix)
+
+        filename = os.path.join(name, "model.safetensors")
+        index_filename = os.path.join(name, "model.safetensors.index.json")
+        if os.path.exists(filename):
+            return self.load_from_safetensors(filename, prefix)
+
+        assert os.path.exists(index_filename)
+        with open(index_filename, "r") as f:
+            index_data = json.load(f)
+        loaded_filenames = set()
+        for key, filename in index_data["weight_map"].items():
+            filename = os.path.join(name, filename)
+            if filename in loaded_filenames:
+                continue
+            if key.startswith(prefix):
+                self.load_from_safetensors(filename, prefix)
+                loaded_filenames.add(filename)
+
+    @classmethod
+    def from_safetensors(
+        cls,
+        name: str,
+        prefix: str = "",
+        pad_n_to_multiple: int = 1,
+        pad_k_to_multiple: int = 1,
+        top_k: int = 0,
+        is_moe_down: bool = False,
+        torch_dtype: torch.dtype | None = None,
+    ):
+        assert os.path.isdir(name)
+        import safetensors.torch
+
+        config_filename = os.path.join(name, "config.json")
+        with open(config_filename, "r") as f:
+            config = json.load(f)
+            if torch_dtype is None and config.get("torch_dtype", "") == "float16":
+                torch_dtype = torch.float16
+
+            assert "quantization_config" in config, "not a quantization model"
+            config = config["quantization_config"]
+
+        keys = ["ignored_layers", "ignore", "modules_to_not_convert"]
+        for key in keys:
+            ignore_layers = config.get(key, []) or []
+            assert not any(x in prefix for x in ignore_layers), f"layer {prefix} is unquantized"
+
+        layer_config = config.copy()
+        for regex in config.get("dynamic", {}):
+            if regex[:1] != "-":
+                assert not re.match(regex[2:], prefix), f"layer {prefix} is unquantized"
+            elif re.match(regex[2:], prefix):
+                layer_config.update(config["dynamic"][regex])
+                break
+
+        if config["quant_method"] in ["compressed-tensors", "modelopt"]:
+            target_group_config = None
+            for group_config in config["config_groups"].values():
+                if "Linear" in group_config["targets"]:
+                    target_group_config = group_config["weights"].copy()
+                    break
+            assert target_group_config is not None, f"layer {prefix} is unquantized"
+            target_group_config["quant_method"] = config["quant_method"]
+            if "format" in config:
+                target_group_config["format"] = config["format"]
+            if "quant_algo" in config:
+                target_group_config["quant_algo"] = config["quant_algo"]
+            layer_config = target_group_config
+
+        schema = BaseWeightSchema.from_config(layer_config)
+
+        filename = os.path.join(name, "model.safetensors")
+        index_filename = os.path.join(name, "model.safetensors.index.json")
+        if os.path.exists(filename):
+            tensors = safetensors.torch.load_file(filename)
+            tensors = cls.filter_tensors(tensors, prefix)
+        else:
+            assert os.path.exists(index_filename)
+            with open(index_filename, "r") as f:
+                index_data = json.load(f)
+            loaded_filenames = set()
+            tensors = {}
+            for key, filename in index_data["weight_map"].items():
+                filename = os.path.join(name, filename)
+                if filename in loaded_filenames:
+                    continue
+                if key.startswith(prefix):
+                    tensors2 = safetensors.torch.load_file(filename)
+                    tensors.update(cls.filter_tensors(tensors2, prefix))
+                    loaded_filenames.add(filename)
+
+        shape_n, shape_k, num_experts, has_bias = schema.infer_shape(tensors)
+
+        layer = cls(
+            shape_n=shape_n,
+            shape_k=shape_k,
+            weight_config=schema,
+            num_experts=num_experts,
+            pad_n_to_multiple=pad_n_to_multiple,
+            pad_k_to_multiple=pad_k_to_multiple,
+            has_bias=has_bias,
+            top_k=top_k,
+            is_moe_down=is_moe_down,
+            torch_dtype=torch_dtype,
+        )
+
+        layer.load_from_tensors(tensors)
+        return layer
+
+    def transform(self):
+        if not isinstance(self.weight_schema, HummingWeightSchema):
+            self.weight_schema, tensors = self.weight_schema.convert_humming(
+                tensors=self.state_dict(),
+                shape_n_stacks=[self.shape_n],
+                shape_k_stacks=[self.shape_k],
+                param_dtype=self.torch_dtype,
+            )
+
+            self.input_schema, _ = self.input_schema.convert_humming(
+                tensors=self.state_dict(),
+                shape_n_stacks=[self.shape_n],
+                shape_k_stacks=[self.shape_k],
+                param_dtype=self.torch_dtype,
+            )
+
+            for name, _ in list(self.named_parameters()):
+                delattr(self, name)
+
+            for name, tensor in tensors.items():
+                param = torch.nn.Parameter(tensor, requires_grad=False)
+                setattr(self, name, param)
+
+        HummingMethod.prepare_layer_meta(
+            layer=self,
+            shape_n=self.shape_n,
+            shape_k=self.shape_k,
+            weight_schema=self.weight_schema,
+            input_schema=self.input_schema,
+            num_experts=self.num_experts,
+            pad_n_to_multiple=self.pad_n_to_multiple,
+            pad_k_to_multiple=self.pad_k_to_multiple,
+            torch_dtype=self.torch_dtype,
+            has_bias=self.has_bias,
+            top_k=self.top_k,
+            is_moe_down=self.is_moe_down,
+        )
+
+        HummingMethod.transform_humming_layer(self)
 
     def add_kernel_config(self, **kwargs):
         HummingMethod.add_kernel_config(self, **kwargs)
 
-    def finish_load(self):
-        HummingMethod.finish_load(self)
-
     def prepare_default_kernel_configs(self):
         HummingMethod.prepare_default_kernel_configs(self)
 
-    def forward(self, **kwargs):
-        return HummingMethod.forward_layer(self, **kwargs)
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        outputs: torch.Tensor | None = None,
+        input_scale: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
+        sorted_token_ids: torch.Tensor | None = None,
+        expert_ids: torch.Tensor | None = None,
+        num_tokens_padded: torch.Tensor | None = None,
+        kernel_config: dict[str, Any] | None = None,
+    ) -> torch.Tensor:
+        return HummingMethod.forward_layer(
+            layer=self,
+            inputs=inputs,
+            outputs=outputs,
+            input_scale=input_scale,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_padded=num_tokens_padded,
+            kernel_config=kernel_config,
+        )

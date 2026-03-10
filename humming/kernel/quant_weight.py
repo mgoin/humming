@@ -15,7 +15,8 @@ auto ptr = reinterpret_cast<void*>(&quant_weight<
     {{group_size}},
     {{has_scale}},
     {{use_e8m0_scale}},
-    {{has_zero_point}}
+    {{has_zero_point}},
+    {{is_fp_zero_point}}
   >);
 """)
 
@@ -31,6 +32,7 @@ class QuantWeightKernel(KernelRuntime):
         has_scale,
         use_e8m0_scale,
         has_zero_point=False,
+        is_fp_zero_point=False,
     ):
         if self.inited:
             return
@@ -45,6 +47,7 @@ class QuantWeightKernel(KernelRuntime):
             has_scale=int(has_scale),
             use_e8m0_scale=int(use_e8m0_scale),
             has_zero_point=int(has_zero_point),
+            is_fp_zero_point=int(is_fp_zero_point),
         )
         self.arg_types = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
         self.prepare()

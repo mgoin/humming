@@ -83,6 +83,7 @@ struct KernelData {
   bool is_moe;
   bool is_moe_down;
   bool is_glu_activation;
+  bool is_fp_zero_point;
   bool has_input_scale;
   bool has_weight_scale;
   bool has_zero_point;

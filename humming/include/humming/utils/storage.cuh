@@ -18,6 +18,7 @@ private:
   static constexpr bool kHasChannelWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
   static constexpr bool kHasGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
   static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
+  static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
 
 public:
   static constexpr uint32_t kNumStages = PipelineConfig::kNumStages;
@@ -27,11 +28,12 @@ public:
   static constexpr uint32_t M_WARPS = (BlockShape::M / WarpShape::M);
   static constexpr uint32_t kWarpReduceSize = M_WARPS * 16 * BlockShape::N * kMmaCTypeBits / 128 * (kNumWarpsDimK / 2);
   static constexpr uint32_t kBlockOutputSize = BlockShape::M * BlockShape::N / 2 / 4;
+  static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementB::kBits));
 
   static constexpr uint32_t kSmemStrideA = BlockShape::K * ElementA::kBits / 32 / 4;
   static constexpr uint32_t kSmemStrideB = BlockShape::N * kPartMmaShapeK * ElementB::kBits / 32 / 4;
   static constexpr uint32_t kSmemStrideBS = BlockShape::N * ElementBS::kBits / 32 / 4;
-  static constexpr uint32_t kSmemStrideBZP = BlockShape::N * MAX(4, static_next_power_of_2(ElementB::kBits)) / 32 / 4;
+  static constexpr uint32_t kSmemStrideBZP = BlockShape::N * kNumZPBits / 32 / 4;
   static constexpr uint32_t kSmemStrideBias = BlockShape::N * 16 / 32 / 4;
 
   static constexpr uint32_t kGroupSzieA = QuantParamConfig::kInputScaleGroupSize;
