@@ -4,8 +4,8 @@ from typing import Any, Literal
 import torch
 
 from humming import dtypes
-from humming.schema.base import BaseWeightSchema, BaseInputSchema
-from humming.schema.humming import HummingWeightSchema, HummingInputSchema
+from humming.schema.base import BaseInputSchema, BaseWeightSchema
+from humming.schema.humming import HummingInputSchema, HummingWeightSchema
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -14,9 +14,10 @@ class ModeloptWeightSchema(BaseWeightSchema):
     quant_algo: str
 
     @classmethod
-    def from_config(cls, config) -> "ModeloptWeightSchema":
+    def from_config(cls, config: dict[str, Any]) -> "ModeloptWeightSchema":
         if cls is ModeloptWeightSchema:
             quant_algo = config["quant_algo"].lower()
+            algo_cls: type[ModeloptWeightSchema]
             if quant_algo == "nvfp4":
                 algo_cls = ModeloptNvfp4WeightSchema
             elif quant_algo == "mxfp8":
@@ -199,7 +200,7 @@ class ModeloptInputSchema(BaseInputSchema):
     quant_algo: str
 
     @classmethod
-    def from_config(cls, config) -> "ModeloptInputSchema":
+    def from_config(cls, config: dict[str, Any]) -> "ModeloptInputSchema":
         if cls is ModeloptInputSchema:
             quant_algo = config["quant_algo"].lower()
             if quant_algo == "nvfp4":
@@ -244,10 +245,9 @@ class ModeloptNvfp4InputSchema(ModeloptInputSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        sm_version: int | tuple[int, int] | None = None,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
-        # schema = HummingInputSchema(
-        #     b_dtype=dtypes.float4e2m1,
-        #     weight_scale_group_size=16,
-        # )
-
-        return HummingInputSchema(), {}
+        a_dtype = self.get_fallback_input_dtype(dtypes.float8e4m3, sm_version)
+        group_size = 16 if a_dtype == dtypes.float4e2m1 else 0
+        schema = HummingInputSchema(a_dtype=a_dtype, input_scale_group_size=group_size)
+        return schema, {}

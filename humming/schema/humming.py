@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Any, Literal
+from typing import Any, Literal, ClassVar
 
 import torch
 
@@ -12,10 +12,16 @@ class HummingWeightSchema(BaseWeightSchema):
     quant_method: str = "humming"
     b_dtype: dtypes.DataType
     bs_dtype: dtypes.DataType | None = None
-    weight_scale_group_size: int
+    weight_scale_group_size: int = 0
     has_global_scale: bool = False
     has_zero_point: bool = False
     is_fp_zero_point: bool = False
+
+    KWARGS_ALIAS: ClassVar[dict[str, list[str]]] = {
+        "b_dtype": ["weight_dtype", "dtype"],
+        "weight_scale_group_size": ["group_size"],
+        "bs_dtype": ["weight_scale_dtype", "scale_dtype"],
+    }
 
     TENSOR_NAMES = Literal["weight", "weight_scale", "zero_point", "global_scale", "bias"]
 
@@ -47,7 +53,7 @@ class HummingWeightSchema(BaseWeightSchema):
         elif self.bs_dtype == dtypes.float8e5m2:
             scale_torch_dtype = torch.float8_e5m2
 
-        tensor_meta = {
+        tensor_meta: dict[str, Any] = {
             "weight": {
                 "shape": (shape_n, shape_k * num_bits // 32),
                 "dtype": torch.int32,
@@ -56,9 +62,12 @@ class HummingWeightSchema(BaseWeightSchema):
             "weight_scale": {
                 "shape": (shape_n, shape_k // group_size),
                 "dtype": scale_torch_dtype,
-                "extra_attrs": {"input_dim": 1, "output_dim": 0, "scale_type": scale_type},
+                "extra_attrs": {"output_dim": 0, "scale_type": scale_type},
             },
         }
+
+        if scale_type == "group":
+            tensor_meta["weight_scale"]["extra_attrs"]["input_dim"] = 1
 
         if self.has_zero_point and not self.is_fp_zero_point:
             tensor_meta["zero_point"] = {
@@ -115,6 +124,11 @@ class HummingInputSchema(BaseInputSchema):
     a_dtype: dtypes.DataType | None = None
     input_scale_group_size: int = 0
 
+    KWARGS_ALIAS: ClassVar[dict[str, list[str]]] = {
+        "a_dtype": ["input_dtype"],
+        "input_scale_group_size": ["group_size"],
+    }
+
     def __post_init__(self):
         if isinstance(self.a_dtype, str):
             self.a_dtype = dtypes.DataType.from_str(str(self.a_dtype))
@@ -140,5 +154,6 @@ class HummingInputSchema(BaseInputSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        sm_version: int | tuple[int, int] | None = None,
     ) -> tuple["HummingInputSchema", dict[str, torch.Tensor]]:
         return self, {}

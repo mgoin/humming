@@ -1,39 +1,41 @@
 import dataclasses
 import math
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, ClassVar
 
 import torch
 
+from humming import dtypes
+
 if TYPE_CHECKING:
     from humming.schema.humming import HummingInputSchema, HummingWeightSchema
-
-
-@staticmethod
-def may_add_expert_dim(
-    tensors_attrs: dict[str, dict[str, Any]],
-    num_experts: int | None = None,
-) -> dict[str, dict[str, Any]]:
-    if num_experts is None:
-        return tensors_attrs
-    for _, attr in tensors_attrs.items():
-        if attr["shape"] == (1,):
-            attr["shape"] = (num_experts,)
-        else:
-            attr["shape"] = (num_experts,) + attr["shape"]
-        for key, value in attr.get("extra_attrs", {}).items():
-            if not key.endswith("dim"):
-                continue
-            attr["extra_attrs"][key] = value + 1
-    return tensors_attrs
 
 
 @dataclasses.dataclass(kw_only=True)
 class BaseWeightSchema:
     quant_method: str
 
+    WEIGHT_SCHEMA_MAP: ClassVar[dict[str, type["BaseWeightSchema"]]]
+    KWARGS_ALIAS: ClassVar[dict[str, list[str]]] = {}
+
     TENSOR_NAMES = Literal["bias"]
 
-    may_add_expert_dim = may_add_expert_dim
+    @staticmethod
+    def may_add_expert_dim(
+        tensors_attrs: dict[str, dict[str, Any]],
+        num_experts: int | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        if num_experts is None:
+            return tensors_attrs
+        for _, attr in tensors_attrs.items():
+            if attr["shape"] == (1,):
+                attr["shape"] = (num_experts,)
+            else:
+                attr["shape"] = (num_experts,) + attr["shape"]
+            for key, value in attr.get("extra_attrs", {}).items():
+                if not key.endswith("dim"):
+                    continue
+                attr["extra_attrs"][key] = value + 1
+        return tensors_attrs
 
     def infer_shape(self, tensors: dict[str, torch.Tensor]) -> tuple[int, int, int | None, bool]:
         raise NotImplementedError
@@ -115,8 +117,8 @@ class BaseWeightSchema:
         has_bias: bool = False,
     ):
         tensors_attrs = self.get_tensors_attrs(
-            shape_n_stacks=[shape_n],
-            shape_k_stacks=[shape_k],
+            shape_n=shape_n,
+            shape_k=shape_k,
             param_dtype=param_dtype,
             num_experts=num_experts,
             has_bias=has_bias,
@@ -173,7 +175,7 @@ class BaseWeightSchema:
         return scale.squeeze(0) if num_experts is None else scale
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]):
+    def from_config(cls, config: dict[str, Any]) -> "BaseWeightSchema":
         from humming.schema import WEIGHT_SCHEMA_MAP
 
         quant_method = config["quant_method"]
@@ -190,6 +192,11 @@ class BaseWeightSchema:
             name = field.name
             if name in config:
                 kwargs[name] = config[name]
+            elif name in cls.KWARGS_ALIAS:
+                for alias_name in cls.KWARGS_ALIAS[name]:
+                    if alias_name in config:
+                        kwargs[name] = config[alias_name]
+                        break
 
         return cls(**kwargs)
 
@@ -198,10 +205,55 @@ class BaseWeightSchema:
 class BaseInputSchema:
     quant_method: str
 
-    may_add_expert_dim = may_add_expert_dim
+    INPUT_SCHEMA_MAP: ClassVar[dict[str, type["BaseInputSchema"]]]
+    KWARGS_ALIAS: ClassVar[dict[str, list[str]]] = {}
+
+    may_add_expert_dim = BaseWeightSchema.may_add_expert_dim
 
     def get_activation_bits(self):
         raise NotImplementedError
+
+    def get_fallback_input_dtype(
+        self,
+        a_dtype: dtypes.DataType | None,
+        sm_version: int | tuple[int, int] | None = None,
+    ) -> dtypes.DataType | None:
+        if sm_version is None:
+            sm_version = torch.cuda.get_device_capability()
+        if isinstance(sm_version, tuple):
+            sm_version = sm_version[0] * 10 + sm_version[1]
+        assert isinstance(sm_version, int)
+
+        a_dtype_order = []
+        if a_dtype is None or a_dtype in [dtypes.float16, dtypes.bfloat16]:
+            return a_dtype
+        elif a_dtype == dtypes.float8e4m3:
+            a_dtype_order = [dtypes.float8e4m3]
+        elif a_dtype == dtypes.float8e5m2:
+            a_dtype_order = [dtypes.float8e5m2]
+        elif a_dtype == dtypes.float4e2m1:
+            # NOTE: float4e2m1 isn't fully tested now, so disable it
+            a_dtype_order = [dtypes.float8e4m3]
+        elif a_dtype == dtypes.int8:
+            a_dtype_order = [dtypes.int8]
+        elif a_dtype == dtypes.int4:
+            a_dtype_order = [dtypes.int4, dtypes.float8e4m3, dtypes.int8]
+        else:
+            raise ValueError(f"unsupported a_dtype: {a_dtype}")
+
+        for dtype in a_dtype_order:
+            if dtype == dtypes.float8e4m3 and sm_version >= 89:
+                return dtype
+            elif dtype == dtypes.float8e5m2 and sm_version >= 89:
+                return dtype
+            elif dtype == dtypes.float4e2m1 and sm_version >= 120:
+                return dtype
+            elif dtype == dtypes.int8:
+                return dtype
+            elif dtype == dtypes.int4 and sm_version >= 80:
+                return dtype
+
+        return None
 
     def _get_input_scale_attrs(
         self,
@@ -232,6 +284,7 @@ class BaseInputSchema:
     def convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
+        shape_n_stacks: list[int],
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
@@ -239,7 +292,7 @@ class BaseInputSchema:
         raise NotImplementedError
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]):
+    def from_config(cls, config: dict[str, Any]) -> "BaseInputSchema":
         from humming.schema import INPUT_SCHEMA_MAP
 
         quant_method = config["quant_method"]
@@ -256,5 +309,10 @@ class BaseInputSchema:
             name = field.name
             if name in config:
                 kwargs[name] = config[name]
+            elif name in cls.KWARGS_ALIAS:
+                for alias_name in cls.KWARGS_ALIAS[name]:
+                    if alias_name in config:
+                        kwargs[name] = config[alias_name]
+                        break
 
         return cls(**kwargs)

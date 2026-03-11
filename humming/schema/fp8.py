@@ -4,8 +4,8 @@ from typing import Any, Literal
 import torch
 
 from humming import dtypes
-from humming.schema.base import BaseWeightSchema, BaseInputSchema
-from humming.schema.humming import HummingWeightSchema, HummingInputSchema
+from humming.schema.base import BaseInputSchema, BaseWeightSchema
+from humming.schema.humming import HummingInputSchema, HummingWeightSchema
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -139,10 +139,8 @@ class Fp8InputSchema(BaseInputSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        sm_version: int | tuple[int, int] | None = None,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
-        schema = HummingInputSchema(
-            a_dtype=dtypes.float8e4m3,
-            input_scale_group_size=0,
-        )
-
+        a_dtype = self.get_fallback_input_dtype(dtypes.float8e4m3, sm_version)
+        schema = HummingInputSchema(a_dtype=a_dtype, input_scale_group_size=0)
         return schema, {}

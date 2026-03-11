@@ -4,8 +4,8 @@ from typing import Any, Literal
 import torch
 
 from humming import dtypes
-from humming.schema.base import BaseWeightSchema, BaseInputSchema
-from humming.schema.humming import HummingWeightSchema, HummingInputSchema
+from humming.schema.base import BaseInputSchema, BaseWeightSchema
+from humming.schema.humming import HummingInputSchema, HummingWeightSchema
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -296,29 +296,18 @@ class CompressedTensorsInputSchema(BaseInputSchema):
         num_experts: int | None = None,
         sm_version: int | tuple[int, int] | None = None,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
-        if sm_version is None:
-            sm_version = torch.cuda.get_device_capability()
-        if isinstance(sm_version, tuple):
-            sm_version = sm_version[0] * 10 + sm_version[1]
-        assert isinstance(sm_version, int)
         if self.type == "float" and self.num_bits == 8:
-            a_dtype = dtypes.float8e4m3 if sm_version >= 89 else None
+            origin_a_dtype = dtypes.float8e4m3
         elif self.type == "float" and self.num_bits == 4:
-            a_dtype = dtypes.float4e2m1 if sm_version >= 120 else None
+            origin_a_dtype = dtypes.float4e2m1
         elif self.type == "int" and self.num_bits == 8:
-            a_dtype = dtypes.int8
+            origin_a_dtype = dtypes.int8
         elif self.type == "int" and self.num_bits == 4:
-            a_dtype = dtypes.int4 if sm_version >= 80 else None
+            origin_a_dtype = dtypes.int4
         else:
-            raise ValueError(f"unsupported type and num_bits: {self.type}{self.num_bits}")
+            raise ValueError(f"unsupported {self.type}{self.num_bits}")
 
-        group_size = self.group_size or 0
-        if a_dtype is None:
-            group_size = 0
-
-        schema = HummingInputSchema(
-            a_dtype=a_dtype,
-            input_scale_group_size=group_size,
-        )
-
+        a_dtype = self.get_fallback_input_dtype(origin_a_dtype, sm_version)
+        group_size = self.group_size if a_dtype == dtypes.float4e2m1 else 0
+        schema = HummingInputSchema(a_dtype=a_dtype, input_scale_group_size=group_size)
         return schema, {}

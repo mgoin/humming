@@ -338,7 +338,7 @@ class HummingMethod:
                 block_shape=block_shape,
                 warp_shape=warp_shape,
                 sublayer_name=sublayer_name,
-                num_stages=4,
+                num_stages=3,
                 **kwargs,
             )
 
@@ -480,7 +480,7 @@ class HummingLayer(torch.nn.Module):
     is_moe_down: bool = False
     torch_dtype: torch.dtype | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         super().__init__()
 
         if self.torch_dtype is None:

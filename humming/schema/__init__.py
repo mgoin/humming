@@ -28,3 +28,6 @@ INPUT_SCHEMA_MAP: dict[str, type[BaseInputSchema]] = {
     "humming": HummingInputSchema,
     "modelopt": ModeloptInputSchema,
 }
+
+BaseWeightSchema.WEIGHT_SCHEMA_MAP = WEIGHT_SCHEMA_MAP
+BaseInputSchema.INPUT_SCHEMA_MAP = INPUT_SCHEMA_MAP

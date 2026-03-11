@@ -12,11 +12,13 @@ def quantize_weight(
     has_zero_point: bool = False,
     has_global_scale: bool = False,
     is_fp_zero_point: bool = False,
+    pack: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert weight.dtype in [torch.float16, torch.bfloat16, torch.float32]
     assert weight.ndim in [2, 3]
     assert not has_zero_point or scale_dtype is not None
 
+    weight = weight.cuda()
     origin_ndim = weight.ndim
     weight = weight.unsqueeze(0) if weight.ndim == 2 else weight
     origin_dtype = dtypes.DataType.from_torch_dtype(weight.dtype)
@@ -81,7 +83,18 @@ def quantize_weight(
         if global_scale is not None and global_scale.nelement() > 0:
             global_scale = global_scale.squeeze(0)
 
-    return quanted_weight, weight_scale, zero_point, global_scale
+    if pack:
+        quanted_weight = ops.pack_weight(quanted_weight, dtype.num_bits)
+        if has_zero_point and not is_fp_zero_point:
+            zero_point = zero_point.transpose(-1, -2).contiguous()
+            zero_point = zero_point.view(*zero_point.shape)
+            zero_point = ops.pack_weight(zero_point, dtype.num_bits)
+            zero_point = zero_point.transpose(-1, -2).contiguous()
+            zero_point = zero_point.view(*zero_point.shape)
+
+    final_zero_point = zero_point if zero_point.nelement() > 0 else None
+
+    return quanted_weight, weight_scale, final_zero_point, global_scale
 
 
 def prepare_humming_weight(

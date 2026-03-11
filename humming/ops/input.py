@@ -194,5 +194,7 @@ def quant_input(
 
     if scales is None:
         scales = torch.empty(0)
+    else:
+        scales = scales.view(*outputs.shape[:-1], scales.size(-1))
 
     return outputs, scales
