@@ -3,15 +3,18 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "humming"
-version = "0.1.0"
+name = "humming-kernels"
+version = "0.1.0a1"
 description = "Quantization GEMM Kernel"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
     "torch",
+    "triton",
+    "safetensors",
+    "jinja2",
     "pyelftools",
-    "pycuda"
+    "cuda-python"
 ]
 
 [tool.setuptools]
