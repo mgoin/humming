@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Any, Literal
+from typing import Any
 
 import torch
 
@@ -38,8 +38,6 @@ class ModeloptWeightSchema(BaseWeightSchema):
 class ModeloptNvfp4WeightSchema(ModeloptWeightSchema):
     quant_method: str = "modelopt"
     quant_algo: str = "nvfp4"
-
-    TENSOR_NAMES = Literal["weight", "weight_scale", "weight_scale_2", "bias"]
 
     def get_tensors_attrs(
         self,
@@ -131,8 +129,6 @@ class ModeloptNvfp4WeightSchema(ModeloptWeightSchema):
 class ModeloptMxfp8WeightSchema(ModeloptWeightSchema):
     quant_method: str = "modelopt"
     quant_algo: str = "mvfp8"
-
-    TENSOR_NAMES = Literal["weight", "weight_scale", "bias"]
 
     def get_tensors_attrs(
         self,

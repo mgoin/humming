@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Any, Literal
+from typing import Any
 
 import torch
 
@@ -20,15 +20,6 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
     block_structure: tuple[int, int] | None = None
     group_size: int | None = None
     actorder: str | None = None
-
-    TENSOR_NAMES = Literal[
-        "weight",
-        "weight_packed",
-        "weight_scale",
-        "weight_zero_point",
-        "weight_global_scale",
-        "bias",
-    ]
 
     def __post_init__(self):
         assert self.format in [
@@ -115,7 +106,9 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
             packed_factor = weight_dtype.itemsize * 8 / self.num_bits
             tensor_meta["weight_scale"]["extra_attrs"]["packed_factor"] = packed_factor
 
-        if scale_type != "tensor":
+        if scale_type == "channel":
+            tensor_meta["weight_scale"]["extra_attrs"]["output_dim"] = 0
+        elif scale_type != "tensor":
             tensor_meta["weight_scale"]["extra_attrs"]["input_dim"] = 1
             tensor_meta["weight_scale"]["extra_attrs"]["output_dim"] = 0
 
@@ -172,7 +165,11 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
         param_dtype: torch.dtype,
         num_experts: int | None = None,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
-        weight = tensors[self.weight_key].view(torch.int32)
+        weight = tensors[self.weight_key]
+        if self.format == "int-quantized":
+            assert weight.dtype == torch.int8
+            weight = weight + 128
+        weight = weight.view(torch.int32)
         weight_scale = tensors["weight_scale"]
         if self.format.startswith("mxfp"):
             weight_scale = weight_scale.view(torch.float8_e8m0fnu)
@@ -259,8 +256,7 @@ class CompressedTensorsInputSchema(BaseInputSchema):
     num_bits: int
     dynamic: bool | str
     group_size: int
-
-    TENSOR_NAMES = Literal["input_scale", "input_global_scale"]
+    symmetric: bool = True
 
     def __post_init__(self):
         assert self.format in [
@@ -282,10 +278,24 @@ class CompressedTensorsInputSchema(BaseInputSchema):
         num_experts: int | None = None,
         stack_size: int = 1,
     ) -> dict[str, dict[str, Any]]:
+        tensors_attrs = {}
         if self.dynamic is False or self.dynamic == "local":
-            # print(self._get_input_scale_attrs(num_experts, stack_size, self.input_scale_key))
-            return self._get_input_scale_attrs(num_experts, stack_size, self.input_scale_key)
-        return {}
+            tensors_attrs |= self._get_input_scale_attrs(
+                num_experts=num_experts,
+                stack_size=stack_size,
+                dtype=torch.float32,
+                input_scale_name=self.input_scale_key,
+            )
+            if not self.symmetric:
+                assert self.type == "int" and self.num_bits == 8
+                tensors_attrs |= self._get_input_scale_attrs(
+                    num_experts=num_experts,
+                    stack_size=stack_size,
+                    dtype=torch.int8,
+                    input_scale_name="input_zero_point",
+                )
+
+        return tensors_attrs
 
     def convert_humming(
         self,

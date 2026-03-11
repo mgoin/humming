@@ -103,9 +103,17 @@ class HummingLayerMeta:
             raise ValueError(f"unsupported mma_type: {self.mma_type}")
 
     def __post_init__(self):
-        assert self.is_fp_zero_point or not self.has_zero_point
+        if self.is_fp_zero_point:
+            assert self.has_zero_point
         if self.a_dtype.num_bits != 16 and self.has_input_scale is None:
             self.has_input_scale = True
+        if isinstance(self.b_dtype, dtypes.InergerType):
+            if isinstance(self.b_dtype, dtypes.FloatingPointType):
+                self.b_dtype = dataclasses.replace(self.b_dtype, is_signed=False)
+            elif self.a_dtype.num_bits == self.b_dtype.num_bits:
+                self.b_dtype = dataclasses.replace(self.b_dtype, is_signed=True)
+            else:
+                self.b_dtype = dataclasses.replace(self.b_dtype, is_signed=False)
         self.is_moe = self.num_experts is not None
         if self.is_moe:
             assert self.top_k > 0

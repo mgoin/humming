@@ -7,7 +7,7 @@ from humming import ops
 def quantize_weight(
     weight: torch.Tensor,
     dtype: dtypes.DataType,
-    scale_dtype: dtypes.DataType,
+    scale_dtype: dtypes.DataType | None,
     group_size: int,
     has_zero_point: bool = False,
     has_global_scale: bool = False,
@@ -97,6 +97,58 @@ def quantize_weight(
     return quanted_weight, weight_scale, final_zero_point, global_scale
 
 
+def dequantize_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor | None,
+    zero_point: torch.Tensor | None,
+    global_scale: torch.Tensor | None,
+    dtype: dtypes.DataType,
+    packed: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    assert weight.dtype == torch.int32
+    weight = weight.cuda()
+
+    if packed:
+        weight = ops.unpack_weight(weight, dtype.num_bits)
+        if zero_point is not None and zero_point.dtype == torch.int32:
+            zero_point = zero_point.transpose(-1, -2).contiguous().cuda()
+            zero_point = zero_point.view(*zero_point.shape)
+            zero_point = ops.unpack_weight(zero_point, dtype.num_bits)
+            zero_point = zero_point.transpose(-1, -2).contiguous()
+            zero_point = zero_point.view(*zero_point.shape).float()
+
+    if isinstance(dtype, dtypes.FloatingPointType):
+        weight = ops.dequant_weight(weight, dtype.exponent_bits, dtype.mantissa_bits)
+    else:
+        assert isinstance(dtype, dtypes.InergerType)
+        assert not dtype.is_signed
+        weight = weight.float()
+
+    if zero_point is not None:
+        assert weight.size(-1) % zero_point.size(-1) == 0
+        group_size = weight.size(-1) // zero_point.size(-1)
+        zero_point = zero_point.repeat_interleave(group_size, -1)
+        weight = weight - zero_point
+    elif isinstance(dtype, dtypes.InergerType):
+        assert not dtype.is_signed
+        weight = weight - (1 << (dtype.num_bits - 1))
+
+    if weight_scale is not None:
+        assert weight.size(-1) % weight_scale.size(-1) == 0
+        group_size = weight.size(-1) // weight_scale.size(-1)
+        weight_scale = weight_scale.float()
+        weight_scale = weight_scale.repeat_interleave(group_size, -1)
+        weight = weight * weight_scale
+
+    if global_scale is not None:
+        global_scale = global_scale.view(-1, 1, 1)
+        if weight.ndim == 2:
+            global_scale = global_scale.squeeze(0)
+        weight = weight * global_scale
+
+    return weight
+
+
 def prepare_humming_weight(
     weight: torch.Tensor,
     b_dtype: dtypes.DataType,
@@ -133,6 +185,9 @@ def prepare_humming_weight(
             should_preprocess_for_int2fp = b_dtype.num_bits > 6
         elif a_dtype == dtypes.bfloat16 and not has_zero_point:
             should_preprocess_for_int2fp = b_dtype.num_bits > 7
+
+    if a_dtype == dtypes.int8 and b_dtype in [dtypes.int8, dtypes.uint8]:
+        weight = (weight.view(torch.int8) - 128).view(torch.int32)
 
     if not should_preprocess_for_int2fp and has_zero_point:
         has_zero_point = False

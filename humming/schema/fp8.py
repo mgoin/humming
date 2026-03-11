@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Any, Literal
+from typing import Any
 
 import torch
 
@@ -12,8 +12,6 @@ from humming.schema.humming import HummingInputSchema, HummingWeightSchema
 class Fp8WeightSchema(BaseWeightSchema):
     quant_method: str = "fp8"
     weight_block_size: tuple[int, int] | None = None
-
-    TENSOR_NAMES = Literal["weight", "weight_scale", "weight_scale_inv", "bias"]
 
     def __post_init__(self):
         if isinstance(self.weight_block_size, list):

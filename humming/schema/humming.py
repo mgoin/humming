@@ -1,10 +1,11 @@
 import dataclasses
-from typing import Any, Literal, ClassVar
+from typing import Any, ClassVar
 
 import torch
 
 from humming import dtypes
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
+from humming.utils.weight import dequantize_weight, quantize_weight
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -23,12 +24,12 @@ class HummingWeightSchema(BaseWeightSchema):
         "bs_dtype": ["weight_scale_dtype", "scale_dtype"],
     }
 
-    TENSOR_NAMES = Literal["weight", "weight_scale", "zero_point", "global_scale", "bias"]
-
     def __post_init__(self):
         assert self.quant_method == "humming"
         if isinstance(self.b_dtype, str):
             self.b_dtype = dtypes.DataType.from_str(str(self.b_dtype))
+        if isinstance(self.b_dtype, dtypes.InergerType) and self.b_dtype.is_signed:
+            self.b_dtype = dtypes.DataType.from_str("u" + str(self.b_dtype))
         if isinstance(self.bs_dtype, str):
             self.bs_dtype = dtypes.DataType.from_str(str(self.bs_dtype))
 
@@ -106,6 +107,59 @@ class HummingWeightSchema(BaseWeightSchema):
         shape_k = tensors["weight"].size(-1) * 32 // num_bits
         has_bias = "bias" in tensors
         return shape_n, shape_k, None, has_bias
+
+    @classmethod
+    def quant_tensor(
+        self,
+        tensor: torch.Tensor,
+        schema: "HummingWeightSchema",
+        param_dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor]:
+        f16_dtype = dtypes.DataType.from_torch_dtype(param_dtype)
+        shape_n = tensor.size(-2)
+        shape_k = tensor.size(-1)
+        num_experts = tensor.size(0) if tensor.ndim == 3 else None
+        tensor_list = quantize_weight(
+            weight=tensor,
+            dtype=schema.b_dtype,
+            scale_dtype=f16_dtype,
+            group_size=schema.weight_scale_group_size,
+            has_zero_point=schema.has_zero_point,
+            has_global_scale=schema.has_global_scale,
+            is_fp_zero_point=schema.is_fp_zero_point,
+            pack=True,
+        )
+
+        keys = ["weight", "weight_scale", "zero_point", "global_scale"]
+        tensors = {}
+        for key, tensor in zip(keys, tensor_list):
+            if tensor is not None and tensor.nelement() > 0:
+                tensors[key] = tensor
+
+        schema.validate_tensors(tensors, shape_n, shape_k, param_dtype, num_experts)
+
+        return tensors
+
+    def dequant_tensors(self, tensors: dict[str, torch.Tensor]) -> torch.Tensor:
+        zero_point = None if not self.has_zero_point else tensors["zero_point"]
+        global_scale = None if not self.has_global_scale else tensors["global_scale"]
+        return dequantize_weight(
+            tensors["weight"],
+            weight_scale=tensors["weight_scale"],
+            zero_point=zero_point,
+            global_scale=global_scale,
+            dtype=self.b_dtype,
+            packed=True,
+        )
+
+    def requant_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        target_weight_schema: "HummingWeightSchema",
+        param_dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor]:
+        dequanted_weight = self.dequant_tensors(tensors)
+        return self.quant_tensor(dequanted_weight, target_weight_schema, param_dtype)
 
     def convert_humming(
         self,

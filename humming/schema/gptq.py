@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Any, Literal
+from typing import Any
 
 import torch
 
@@ -15,8 +15,6 @@ class GPTQWeightSchema(BaseWeightSchema):
     group_size: int
     desc_act: bool = False
     sym: bool = True
-
-    TENSOR_NAMES = Literal["qweight", "scales", "qzeros", "g_idx", "bias"]
 
     def get_tensors_attrs(
         self,

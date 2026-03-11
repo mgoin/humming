@@ -1,6 +1,6 @@
 import dataclasses
 import math
-from typing import TYPE_CHECKING, Any, Literal, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
@@ -17,10 +17,9 @@ class BaseWeightSchema:
     WEIGHT_SCHEMA_MAP: ClassVar[dict[str, type["BaseWeightSchema"]]]
     KWARGS_ALIAS: ClassVar[dict[str, list[str]]] = {}
 
-    TENSOR_NAMES = Literal["bias"]
-
-    @staticmethod
+    @classmethod
     def may_add_expert_dim(
+        cls,
         tensors_attrs: dict[str, dict[str, Any]],
         num_experts: int | None = None,
     ) -> dict[str, dict[str, Any]]:
@@ -259,12 +258,13 @@ class BaseInputSchema:
         self,
         num_experts: int | None = None,
         stack_size: int = 1,
+        dtype: torch.dtype = torch.float32,
         input_scale_name: str = "input_scale",
     ) -> dict[str, dict[str, Any]]:
         tensor_meta = {
             input_scale_name: {
                 "shape": (stack_size,),
-                "dtype": torch.float32,
+                "dtype": dtype,
                 "extra_attrs": {"scale_type": "input_scale"},
             }
         }

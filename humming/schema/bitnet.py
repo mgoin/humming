@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Any, Literal
+from typing import Any
 
 import torch
 
@@ -11,7 +11,6 @@ from humming.schema.humming import HummingWeightSchema
 @dataclasses.dataclass(kw_only=True)
 class BitnetWeightSchema(BaseWeightSchema):
     quant_method: str = "bitnet"
-    TENSOR_NAMES = Literal["weight", "weight_scale", "bias"]
 
     def get_tensors_attrs(
         self,

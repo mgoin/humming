@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Any, Literal
+from typing import Any
 
 import torch
 
@@ -14,8 +14,6 @@ class AWQWeightSchema(BaseWeightSchema):
     bits: int
     group_size: int
     zero_point: bool = True
-
-    TENSOR_NAMES = Literal["qweight", "scales", "qzeros", "bias"]
 
     def get_tensors_attrs(
         self,
