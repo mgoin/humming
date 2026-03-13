@@ -323,9 +323,16 @@ class HummingMethod:
             config.pop("num_sms", 0)
             return cls.prepare_kernel(layer, sublayer_name=sublayer_name, **config)
 
-        executor = ThreadPoolExecutor(max_workers=8)
-        for kernel in executor.map(build_kernel, kernel_config_str_list):
-            kernel.load_cubin()
+        if os.environ.get("HUMMING_DISABLE_PARALLEL_BUILD", "0") != "1":
+            # Parallelize kernel compilation using multiple threads, 
+            # but ensure loading occurs in the main thread to prevent CUDA context issues.
+            # (KernelRuntime would skip loading when running in child thread).
+            executor = ThreadPoolExecutor(max_workers=8)
+            for kernel in executor.map(build_kernel, kernel_config_str_list):
+                kernel.load_cubin()
+            executor.shutdown(wait=False)
+        else:
+            list(build_kernel(x) for x in kernel_config_str_list)
 
         for min_shape_m, max_shape_m, kernel_config in configs:
             cls.add_kernel_config(

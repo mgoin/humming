@@ -4,7 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 
-import filelock
+from filelock import FileLock
 
 import humming.jit.utils as jit_utils
 
@@ -44,8 +44,8 @@ class Compiler:
         cache_filename = cache_dirname / "kernel.cubin"
         cache_dirname.mkdir(exist_ok=True, parents=True)
 
-        lock_filename = (cache_dirname / "lock").as_posix()
-        with filelock.FileLock(lock_filename):
+        lock_filename = jit_utils.get_humming_lock_filename(hash_hex)
+        with FileLock(lock_filename):
             if cache_filename.exists():
                 return cache_filename.as_posix()
 

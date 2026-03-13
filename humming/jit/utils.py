@@ -11,6 +11,8 @@ from pathlib import Path
 from elftools.elf.elffile import ELFFile
 from filelock import FileLock
 
+import humming.jit.utils as jit_utils
+
 
 def read_symbol_value(filename, symbol_name, default_value=None):
     with open(filename, "rb") as f:
@@ -93,19 +95,45 @@ def get_cuda_nvcc_version(nvcc_path):
 
 
 @functools.lru_cache(maxsize=1)
-def get_humming_module_cache_dir():
-    tmp_dir = os.getenv("HUMMING_MODULE_DIR")
+def get_humming_tmp_dir() -> str:
+    tmp_dir = os.getenv("HUMMING_TMP_DIR")
     if tmp_dir is not None:
         return tmp_dir
-    return os.path.join(os.path.expanduser("~"), ".humming/cache/module/")
+    dirname = os.path.join(os.path.expanduser("~"), ".humming/tmp/module/")
+    Path(dirname).mkdir(exist_ok=True, parents=True)
+    return dirname
 
 
 @functools.lru_cache(maxsize=1)
-def get_humming_cache_dir():
+def get_humming_cache_dir() -> str:
     cache_dir = os.getenv("HUMMING_CACHE_DIR")
     if cache_dir is not None:
         return cache_dir
     return os.path.join(os.path.expanduser("~"), ".humming/cache/")
+
+
+@functools.lru_cache(maxsize=1)
+def get_humming_module_dir() -> str:
+    tmp_dirname = get_humming_tmp_dir()
+    dirname = os.path.join(tmp_dirname, "module/")
+    Path(dirname).mkdir(exist_ok=True, parents=True)
+    return dirname
+
+
+@functools.lru_cache(maxsize=1)
+def get_humming_lock_dir() -> str:
+    tmp_dirname = get_humming_tmp_dir()
+    dirname = os.path.join(tmp_dirname, "lock/")
+    Path(dirname).mkdir(exist_ok=True, parents=True)
+    return dirname
+
+
+@functools.lru_cache(maxsize=1)
+def get_humming_lock_filename(name: str) -> str:
+    if name.endswith(".lock"):
+        name = name + ".lock"
+    lock_dirname = get_humming_lock_dir()
+    return os.path.join(lock_dirname, name)
 
 
 def is_power_of_two(n: int) -> bool:
@@ -113,16 +141,17 @@ def is_power_of_two(n: int) -> bool:
 
 
 def make_humming_module(func_name, result):
-    dirname = get_humming_module_cache_dir()
+    dirname = get_humming_module_dir()
     if dirname not in sys.path:
         sys.path.append(dirname)
 
     content = f"def {func_name}():\n    return {result}\n"
-    module_name = "humming_module_" + hash_to_hex(content)
-    filename = module_name + ".py"
-    Path(dirname).mkdir(exist_ok=True, parents=True)
+    hash_hex = hash_to_hex(content)
+    module_name = "humming_module_" + hash_hex
 
-    with FileLock(Path(dirname) / "lock"):
+    lock_filename = jit_utils.get_humming_lock_filename(hash_hex)
+    with FileLock(lock_filename):
+        filename = module_name + ".py"
         if not (Path(dirname) / filename).exists():
             with open(Path(dirname) / filename, "w") as f:
                 f.write(content)
