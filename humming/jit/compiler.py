@@ -59,10 +59,10 @@ class Compiler:
             compile_res = cls._compile(source_path, cache_dirname, sm_version)
             returncode, stdout, stderr = compile_res
 
-        with open(cache_dirname / "stdout.log", "w") as f:
-            f.write(stdout)
-        with open(cache_dirname / "stderr.log", "w") as f:
-            f.write(stderr)
+            with open(cache_dirname / "stdout.log", "w") as f:
+                f.write(stdout)
+            with open(cache_dirname / "stderr.log", "w") as f:
+                f.write(stderr)
 
         if returncode != 0:
             print(stderr, flush=True)

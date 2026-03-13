@@ -1,5 +1,7 @@
 import ctypes
+import dataclasses
 import math
+from typing import ClassVar
 
 import cuda.bindings.driver as cbd
 import torch
@@ -13,12 +15,11 @@ auto ptr = reinterpret_cast<void*>(&dequant_unpacked_fp_type);
 """
 
 
+@dataclasses.dataclass(kw_only=True)
 class DequantKernel(KernelRuntime):
-    name = "dequant_unpacked_fp_type"
+    name: ClassVar[str] = "dequant_unpacked_fp_type"
 
-    def __init__(self):
-        if self.inited:
-            return
+    def __post_init__(self):
         self.code = CODE_TEMPLATE
         self.arg_types = (
             ctypes.c_void_p,
@@ -29,7 +30,6 @@ class DequantKernel(KernelRuntime):
             ctypes.c_bool,
         )
         self.prepare()
-        self.inited = True
 
     def __call__(
         self,
@@ -39,6 +39,7 @@ class DequantKernel(KernelRuntime):
         mantissa_bits: int,
         is_signed: bool,
     ):
+        self.check_context()
         device = inputs.device
         total_size = inputs.nelement()
         config = cbd.CUlaunchConfig()

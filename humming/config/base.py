@@ -1,7 +1,9 @@
-import re
-from typing import Any, ClassVar
 import dataclasses
 import enum
+import re
+from typing import Any, ClassVar
+
+from typing_extensions import Self
 
 
 def name_to_google_cpp_const_style(name: str) -> str:
@@ -37,9 +39,10 @@ def name_value_to_extern_const_style(name: str, value: Any) -> str:
 
 
 @dataclasses.dataclass
-class BaseHummingConfigClass:
+class BaseHummingConfig:
     _name_map: ClassVar[dict[str, str]] = {}
-    _cpp_ignore_names: ClassVar[set[str]] = set()
+    _cpp_ignore_names: ClassVar[tuple[str, ...]] = ()
+    _cpp_extra_names: ClassVar[tuple[str, ...]] = ()
 
     def __post_init__(self):
         for field in dataclasses.fields(self):
@@ -73,8 +76,9 @@ class BaseHummingConfigClass:
 
     def to_cpp_str(self, include_class_name=False):
         str_list = []
-        for field in dataclasses.fields(self):
-            name = field.name
+        names = [x.name for x in dataclasses.fields(self)]
+        names += list(self._cpp_extra_names)
+        for name in names:
             if name in self._cpp_ignore_names:
                 continue
             value = getattr(self, name)
@@ -94,8 +98,9 @@ class BaseHummingConfigClass:
 
     def to_extern_cpp_str(self):
         str_list = []
-        for field in dataclasses.fields(self):
-            name = field.name
+        names = [x.name for x in dataclasses.fields(self)]
+        names += list(self._cpp_extra_names)
+        for name in names:
             if name in self._cpp_ignore_names:
                 continue
             value = getattr(self, name)
@@ -108,13 +113,13 @@ class BaseHummingConfigClass:
         return code
 
     @classmethod
-    def from_dict(cls, raw_config):
+    def from_dict(cls, raw_config: dict[str, Any]) -> Self:
         clean_config = cls._preprocess_dict(raw_config)
         return cls(**clean_config)
 
     @classmethod
-    def _preprocess_dict(cls, config):
-        if isinstance(config, BaseHummingConfigClass):
+    def _preprocess_dict(cls, config: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(config, BaseHummingConfig):
             config = config.__dict__
         assert isinstance(config, dict)
         field_name_list = set(x.name for x in dataclasses.fields(cls))

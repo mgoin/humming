@@ -1,4 +1,6 @@
-import functools
+import dataclasses
+import threading
+from typing import ClassVar
 
 import cuda.bindings.driver as cbd
 import torch
@@ -8,25 +10,31 @@ from humming import dtypes
 from humming.jit.compiler import NVCCCompiler
 
 
+@dataclasses.dataclass(kw_only=True)
 class KernelRuntime:
-    _instances: dict[tuple[str, str], "KernelRuntime"] = {}
+    _instances: ClassVar[dict[tuple[str, str], "KernelRuntime"]] = {}
 
     def __new__(cls, *args, **kwargs):
         def get_value(value):
             if isinstance(value, dtypes.DataType):
                 return str(value)
+            if isinstance(value, list):
+                value = tuple(value)
             return value
 
         args_items = tuple(get_value(x) for x in args)
         kwargs_items = tuple((key, get_value(kwargs[key])) for key in sorted(kwargs.keys()))
-
         signature = (cls.__name__, args_items + kwargs_items)
 
         if signature not in cls._instances or not cls._instances[signature].inited:
             instance = super().__new__(cls)
-            instance.inited = False
             cls._instances[signature] = instance
+            instance.inited = False
+            instance.cubin_loaded = False
             instance.init_sm_version()
+            instance.__init__(*args, **kwargs)
+            instance.__post_init__()
+            instance.inited = True
         return cls._instances[signature]
 
     def init_sm_version(self):
@@ -42,25 +50,32 @@ class KernelRuntime:
         kernel_name = jit_utils.find_kernel_name_in_cubin(kernel_filename, self.name)
         self.kernel_name = kernel_name
         self.kernel_filename = kernel_filename
-        self.load_cubin(self.kernel_filename, self.kernel_name)
-        self.inited = True
+        if threading.current_thread() is threading.main_thread():
+            self.load_cubin()
 
-    def load_cubin(self, kernel_filename, kernel_name):
+    def load_cubin(self):
+        if self.cubin_loaded:
+            return None
+        kernel_filename = self.kernel_filename
+        kernel_name = self.kernel_name
         result, lib = cbd.cuLibraryLoadFromFile(kernel_filename.encode(), [], [], 0, [], [], 0)
         assert result == 0, repr(result)
         result, kernel = cbd.cuLibraryGetKernel(lib, kernel_name.encode())
         assert result == 0, repr(result)
         self.kernel = kernel
+        self.cubin_loaded = True
 
-    @functools.lru_cache
+    def check_context(self):
+        assert threading.current_thread() is threading.main_thread()
+        if not self.cubin_loaded:
+            self.load_cubin()
+
     def get_cubin_symbol_value(self, name):
         return jit_utils.read_symbol_value(self.kernel_filename, name)
 
-    @functools.lru_cache(maxsize=1)
     def list_kernel_attr_name_list(self):
         return list(cbd.CUkernel_attribute)
 
-    @functools.lru_cache(maxsize=1)
     def get_kernel_attr_value(self, attr_name, device_index=0):
         device = cbd.CUdevice(device_index)
         attr_enum = getattr(cbd.CUkernel_attribute, attr_name)
@@ -68,7 +83,6 @@ class KernelRuntime:
         assert result == 0, repr(result)
         return value
 
-    @functools.lru_cache(maxsize=1)
     def list_kernel_all_attrs(self, device_index=0):
         attrs = {}
         for name in self.list_kernel_attr_name_list():

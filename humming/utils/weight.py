@@ -1,7 +1,6 @@
 import torch
 
-from humming import dtypes
-from humming import ops
+from humming import dtypes, ops
 
 
 def quantize_weight(
@@ -32,6 +31,7 @@ def quantize_weight(
         quant_group_size = weight.nelement() // e
     flatten_weight = weight.view(e, 1, -1)
     use_flatten_weight = scale_dtype is None and has_global_scale
+    weight_scale: torch.Tensor | None
     quanted_weight, weight_scale, zero_point = ops.quant_weight(
         flatten_weight if use_flatten_weight else weight,
         source_dtype_str=str(origin_dtype),
@@ -104,7 +104,7 @@ def dequantize_weight(
     global_scale: torch.Tensor | None,
     dtype: dtypes.DataType,
     packed: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+) -> torch.Tensor:
     assert weight.dtype == torch.int32
     weight = weight.cuda()
 
@@ -118,7 +118,7 @@ def dequantize_weight(
             zero_point = zero_point.view(*zero_point.shape).float()
 
     if isinstance(dtype, dtypes.FloatingPointType):
-        weight = ops.dequant_weight(weight, dtype.exponent_bits, dtype.mantissa_bits)
+        weight = ops.dequant_weight(weight, dtype.exponent_bits, dtype.mantissa_bits, True)
     else:
         assert isinstance(dtype, dtypes.InergerType)
         assert not dtype.is_signed

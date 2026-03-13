@@ -1,9 +1,12 @@
 import ctypes
+import dataclasses
+from typing import ClassVar
 
 import cuda.bindings.driver as cbd
 import jinja2
 import torch
 
+from humming import dtypes
 from humming.jit.runtime import KernelRuntime
 
 CODE_TEMPLATE = jinja2.Template("""
@@ -21,33 +24,26 @@ auto ptr = reinterpret_cast<void*>(&quant_weight<
 """)
 
 
+@dataclasses.dataclass(kw_only=True)
 class QuantWeightKernel(KernelRuntime):
-    name = "quant_weight"
+    name: ClassVar[str] = "quant_weight"
+    source_dtype: dtypes.DataType
+    target_dtype: dtypes.DataType
+    group_size: int
+    has_scale: bool
+    use_e8m0_scale: bool
+    has_zero_point: bool = False
+    is_fp_zero_point: bool = False
 
-    def __init__(
-        self,
-        source_dtype,
-        target_dtype,
-        group_size,
-        has_scale,
-        use_e8m0_scale,
-        has_zero_point=False,
-        is_fp_zero_point=False,
-    ):
-        if self.inited:
-            return
-        self.group_size = group_size
-        self.has_scale = has_scale
-        self.use_e8m0_scale = use_e8m0_scale
-        self.has_zero_point = has_zero_point
+    def __post_init__(self):
         self.code = CODE_TEMPLATE.render(
-            source_dtype=source_dtype.to_cpp_str(),
-            target_dtype=target_dtype.to_cpp_str(),
-            group_size=group_size,
-            has_scale=int(has_scale),
-            use_e8m0_scale=int(use_e8m0_scale),
-            has_zero_point=int(has_zero_point),
-            is_fp_zero_point=int(is_fp_zero_point),
+            source_dtype=self.source_dtype.to_cpp_str(),
+            target_dtype=self.target_dtype.to_cpp_str(),
+            group_size=self.group_size,
+            has_scale=int(self.has_scale),
+            use_e8m0_scale=int(self.use_e8m0_scale),
+            has_zero_point=int(self.has_zero_point),
+            is_fp_zero_point=int(self.is_fp_zero_point),
         )
         self.arg_types = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
         self.prepare()
@@ -59,6 +55,7 @@ class QuantWeightKernel(KernelRuntime):
         scales: torch.Tensor | None,
         zero_point: torch.Tensor | None,
     ):
+        self.check_context()
         group_size = self.group_size
         group_size = inputs.size(-1) if group_size <= 0 else group_size
 

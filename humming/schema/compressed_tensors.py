@@ -278,7 +278,7 @@ class CompressedTensorsInputSchema(BaseInputSchema):
         num_experts: int | None = None,
         stack_size: int = 1,
     ) -> dict[str, dict[str, Any]]:
-        tensors_attrs = {}
+        tensors_attrs: dict[str, Any] = {}
         if self.dynamic is False or self.dynamic == "local":
             tensors_attrs |= self._get_input_scale_attrs(
                 num_experts=num_experts,

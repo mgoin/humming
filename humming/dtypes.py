@@ -1,7 +1,7 @@
+import dataclasses
 import re
 
 import torch
-import dataclasses
 
 
 @dataclasses.dataclass(kw_only=True, repr=False)
@@ -34,7 +34,10 @@ class DataType:
         else:
             raise NotImplementedError
 
-    def to_str(self, lowercase=True):
+    def to_str(self):
+        raise NotImplementedError
+
+    def to_cpp_str(self):
         raise NotImplementedError
 
     def __hash__(self):
@@ -68,10 +71,10 @@ class InergerType(DataType):
         re_res = re_res[0]
         return cls(is_signed=re_res[0] == "", num_bits=int(re_res[1]))
 
-    def to_str(self, lowercase=True):
+    def to_str(self):
         s = "Int" if self.is_signed else "UInt"
         s += str(self.num_bits)
-        return s.lower() if lowercase else s
+        return s.lower()
 
     def to_cpp_str(self):
         return "IntegerType<{is_signed}, {num_bits}>".format(
@@ -129,7 +132,7 @@ class FloatingPointType(DataType):
             mantissa_bits=int(re_res[2]),
         )
 
-    def to_str(self, lowercase=True):
+    def to_str(self):
         s = f"Float{self.num_bits}E{self.exponent_bits}M{self.mantissa_bits}"
         if s == "Float16E5M10":
             s = "Float16"
@@ -138,7 +141,7 @@ class FloatingPointType(DataType):
         elif s == "Float32E8M23":
             s = "Float32"
 
-        return s.lower() if lowercase else s
+        return s.lower()
 
     def to_cpp_str(self):
         return "FloatingPointType<{num_bits}, {exponent_bits}, {mantissa_bits}>".format(

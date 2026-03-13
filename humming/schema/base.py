@@ -77,7 +77,7 @@ class BaseWeightSchema:
         for key in padded_tensors_attrs:
             shape1 = tensors_attrs[key]["shape"]
             shape2 = padded_tensors_attrs[key]["shape"]
-            pad_shape = tuple(y - x for x, y in zip(shape1, shape2))
+            pad_shape = tuple(y - x for x, y in zip(shape1, shape2, strict=True))
             padded_tensors_attrs[key]["extra_attrs"]["pad_shape"] = pad_shape
 
         return padded_tensors_attrs

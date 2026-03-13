@@ -46,7 +46,7 @@ def pack_weight(inputs: torch.Tensor, num_bits: int) -> torch.Tensor:
     outputs = torch.empty(output_shape, dtype=torch.int32, device=inputs.device)
 
     if not isinstance(inputs, FakeTensor):
-        kernel = PackWeightKernel(num_bits)
+        kernel = PackWeightKernel(num_bits=num_bits)
         kernel(inputs=inputs, outputs=outputs)
 
     return outputs
@@ -177,7 +177,7 @@ def unpack_weight(inputs: torch.Tensor, num_bits: int) -> torch.Tensor:
     outputs = torch.empty(output_shape, dtype=torch.int32, device=inputs.device)
 
     if not isinstance(inputs, FakeTensor):
-        kernel = UnpackWeightKernel(num_bits)
+        kernel = UnpackWeightKernel(num_bits=num_bits)
         kernel(inputs=inputs, outputs=outputs)
 
     return outputs

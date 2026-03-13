@@ -1,8 +1,8 @@
 import triton
+
 from humming import dtypes
 from humming.layer import HummingLayer
 from humming.utils.test import generate_random_inputs, generate_random_weight
-
 
 a_dtypes = [dtypes.float16, dtypes.float8e4m3]
 b_dtypes = [dtypes.uint3, dtypes.uint4, dtypes.uint5]

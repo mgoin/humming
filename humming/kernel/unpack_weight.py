@@ -1,4 +1,6 @@
 import ctypes
+import dataclasses
+from typing import ClassVar
 
 import cuda.bindings.driver as cbd
 import jinja2
@@ -13,18 +15,18 @@ auto ptr = reinterpret_cast<void*>(&unpack_weight_kernel<{{num_bits}}>);
 """)
 
 
+@dataclasses.dataclass(kw_only=True)
 class UnpackWeightKernel(KernelRuntime):
-    name = "unpack_weight"
+    name: ClassVar[str] = "unpack_weight"
+    num_bits: int
 
-    def __init__(self, num_bits):
-        if self.inited:
-            return
-        self.num_bits = num_bits
-        self.code = CODE_TEMPLATE.render(num_bits=num_bits)
+    def __post_init__(self):
+        self.code = CODE_TEMPLATE.render(num_bits=self.num_bits)
         self.arg_types = (ctypes.c_void_p, ctypes.c_void_p)
         self.prepare()
 
     def __call__(self, inputs: torch.Tensor, outputs: torch.Tensor):
+        self.check_context()
         device = inputs.device
         config = cbd.CUlaunchConfig()
         config.gridDimX = outputs.nelement() // (32 * 32)

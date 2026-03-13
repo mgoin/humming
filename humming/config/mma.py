@@ -1,8 +1,8 @@
 import math
 import re
+
 import humming.dtypes as dtypes
 from humming.config.enum import MmaType
-
 
 DTYPE_BIT_WIDTH_MAP = {
     "f32": 32,
@@ -62,6 +62,7 @@ class MmaOpClassImpl:
             raise ValueError(f"Invalid cd_dtype: {cd_dtype}")
 
     def to_cpp_str(self, include_class_name=False):
+        reg_cd_type = self.reg_cd_type
         lines = [
             "static constexpr MmaType kMmaType = MmaType::MMA;",
             f"using MmaShape = Shape<{self.shape[0]}, {self.shape[1]}, {self.shape[2]}>;",
@@ -80,7 +81,7 @@ class MmaOpClassImpl:
             f"using DRegisters = {self.reg_cd_type}[{self.reg_cd_count}];",
             "",
             "CUDA_INLINE",
-            f"static void fma(uint32_t *a, uint32_t *b, {self.reg_cd_type} *c, {self.reg_cd_type} *d) {{",
+            f"static void fma(uint32_t *a, uint32_t *b, {reg_cd_type} *c, {reg_cd_type} *d) {{",
             *self.generate_ptx(indent=2).strip("\n").split("\n"),
             "};",
         ]
@@ -168,6 +169,7 @@ class WgmmaOpClassImpl:
             raise ValueError(f"Invalid cd_dtype: {cd_dtype}")
 
     def to_cpp_str(self, include_class_name=False):
+        reg_cd_type = self.reg_cd_type
         lines = [
             "static constexpr MmaType kMmaType = MmaType::WGMMA;",
             f"using MmaShape = Shape<{self.shape[0]}, {self.shape[1]}, {self.shape[2]}>;",
@@ -185,7 +187,7 @@ class WgmmaOpClassImpl:
             f"using DRegisters = {self.reg_cd_type}[{self.reg_cd_count}];",
             "",
             "CUDA_INLINE",
-            f"static void fma(uint32_t *a, uint64_t &desc, {self.reg_cd_type} *d, bool pred = false) {{",
+            f"static void fma(uint32_t *a, uint64_t &desc, {reg_cd_type} *d, bool pred = false) {{",
             *self.generate_ptx(indent=2, has_scale_d=False).strip("\n").split("\n"),
             "};",
         ]

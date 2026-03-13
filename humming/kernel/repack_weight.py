@@ -1,5 +1,7 @@
 import ctypes
+import dataclasses
 import math
+from typing import ClassVar
 
 import cuda.bindings.driver as cbd
 import jinja2
@@ -21,36 +23,27 @@ auto ptr = reinterpret_cast<void*>(&weight_repack_nk<
 """)
 
 
+@dataclasses.dataclass(kw_only=True)
 class RepackWeightKernel(KernelRuntime):
-    name = "weight_repack_nk"
+    name: ClassVar[str] = "weight_repack_nk"
+    weight_bits: int
+    activation_bits: int
+    is_weight_pakced: bool
+    should_preprocess_for_int2fp: bool = False
+    should_preprocess_with_zp: bool = False
+    group_size_zp: int = 0
 
-    def __init__(
-        self,
-        weight_bits: int,
-        activation_bits: int,
-        is_weight_pakced: bool,
-        should_preprocess_for_int2fp: bool = False,
-        should_preprocess_with_zp: bool = False,
-        group_size_zp: int = 0,
-    ):
-        if self.inited:
-            return
-        self.weight_bits = weight_bits
-        self.activation_bits = activation_bits
-        self.is_weight_pakced = is_weight_pakced
-        self.should_preprocess_with_zp = should_preprocess_with_zp
-        self.group_size_zp = group_size_zp
-
+    def __post_init__(self):
         if self.should_preprocess_with_zp:
-            assert should_preprocess_for_int2fp
+            assert self.should_preprocess_for_int2fp
 
         self.code = CODE_TEMPLATE.render(
-            weight_bits=weight_bits,
-            activation_bits=activation_bits,
-            is_weight_pakced=int(is_weight_pakced),
-            should_preprocess_for_int2fp=int(should_preprocess_for_int2fp),
-            should_preprocess_with_zp=int(should_preprocess_with_zp),
-            group_size_zp=group_size_zp,
+            weight_bits=self.weight_bits,
+            activation_bits=self.activation_bits,
+            is_weight_pakced=int(self.is_weight_pakced),
+            should_preprocess_for_int2fp=int(self.should_preprocess_for_int2fp),
+            should_preprocess_with_zp=int(self.should_preprocess_with_zp),
+            group_size_zp=self.group_size_zp,
         )
         self.arg_types = (
             ctypes.c_void_p,
@@ -71,6 +64,7 @@ class RepackWeightKernel(KernelRuntime):
         padded_shape_n: int | None = None,
         padded_shape_k: int | None = None,
     ):
+        self.check_context()
         num_experts = 1 if inputs.ndim == 2 else inputs.size(0)
         shape_n = inputs.size(-2)
         shape_k = inputs.size(-1)

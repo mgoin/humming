@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 import torch
@@ -305,49 +306,34 @@ class HummingMethod:
     def prepare_default_kernel_configs(
         cls,
         layer: HummingModule | torch.nn.Module,
+        use_stream_k: bool = False,
+        use_f16_accum: bool = False,
         sublayer_name: str = "",
-        **kwargs,
     ):
+        from humming.tune import get_heuristics_class
+
         assert isinstance(layer.humming_metas, dict)
         meta = layer.humming_metas[sublayer_name]
-        warp_shape_nk = (64, 32)
-        block_shape_nk1 = (128, 128)
-        block_shape_nk2 = (256, 64)
-        if meta.a_dtype.num_bits == 8:
-            warp_shape_nk = (32, 64)
-        elif meta.a_dtype.num_bits == 4:
-            warp_shape_nk = (32, 128)
-            block_shape_nk1 = (128, 256)
-            block_shape_nk2 = (256, 128)
+        heuristics_cls = get_heuristics_class()
+        configs = heuristics_cls.get_configs(meta, use_stream_k, use_f16_accum)
+        kernel_config_str_list = set([json.dumps(x[-1]) for x in configs])
 
-        kernel_configs: list[Any] = [
-            [0, 16, (16, *block_shape_nk1), (16, *warp_shape_nk)],
-            [16, 32, (32, *block_shape_nk2), (32, *warp_shape_nk)],
-            [32, 48, (48, *block_shape_nk2), (48, *warp_shape_nk)],
-            [48, 64, (64, *block_shape_nk2), (64, *warp_shape_nk)],
-            [64, 96, (48, *block_shape_nk2), (48, *warp_shape_nk)],
-            [96, None, (64, *block_shape_nk2), (64, *warp_shape_nk)],
-        ]
+        def build_kernel(config_str):
+            config = json.loads(config_str)
+            config.pop("num_sms", 0)
+            return cls.prepare_kernel(layer, sublayer_name=sublayer_name, **config)
 
-        for min_shape_m, max_shape_m, block_shape, warp_shape in kernel_configs:
-            if max_shape_m is None:
-                max_shape_m = 1 << 31
+        executor = ThreadPoolExecutor(max_workers=8)
+        for kernel in executor.map(build_kernel, kernel_config_str_list):
+            kernel.load_cubin()
 
-            if meta.num_experts is not None:
-                min_shape_m = int(0.9 * min_shape_m * meta.num_experts / 4)
-                import math
-
-                max_shape_m = math.ceil(0.9 * max_shape_m * meta.num_experts / 4)
-
+        for min_shape_m, max_shape_m, kernel_config in configs:
             cls.add_kernel_config(
                 layer=layer,
                 min_shape_m=min_shape_m,
                 max_shape_m=max_shape_m,
-                block_shape=block_shape,
-                warp_shape=warp_shape,
                 sublayer_name=sublayer_name,
-                num_stages=3,
-                **kwargs,
+                **kernel_config,
             )
 
     @classmethod
@@ -358,7 +344,7 @@ class HummingMethod:
         warp_shape: tuple[int, int, int],
         sublayer_name: str = "",
         **kwargs,
-    ):
+    ) -> HummingKernel:
         assert isinstance(layer.humming_metas, dict)
         meta = layer.humming_metas[sublayer_name]
         layer_kwargs = dict(
@@ -370,7 +356,7 @@ class HummingMethod:
         msg = f"the following keys are derived from layers, {conflict_keys}"
         assert not conflict_keys, msg
         problem_shape = (0, meta.shape_n + meta.pad_shape_n, meta.shape_k + meta.pad_shape_k)
-        kernel = HummingKernel(
+        return HummingKernel(
             problem_shape=problem_shape,
             block_shape=block_shape,
             warp_shape=warp_shape,
@@ -378,8 +364,6 @@ class HummingMethod:
             **layer_kwargs,
             **kwargs,
         )
-
-        return [kernel.kernel_id, kwargs.get("num_sms", 0)]
 
     @classmethod
     def add_kernel_config(
@@ -392,8 +376,16 @@ class HummingMethod:
         sublayer_name: str = "",
         **kwargs,
     ):
+        num_sms = kwargs.pop("num_sms", 0)
+        kernel = cls.prepare_kernel(
+            layer=layer,
+            block_shape=block_shape,
+            warp_shape=warp_shape,
+            sublayer_name=sublayer_name,
+            **kwargs,
+        )
+        kernel_id = kernel.kernel_id
         assert isinstance(layer.humming_metas, dict)
-        kernel_config = cls.prepare_kernel(layer, block_shape, warp_shape, sublayer_name, **kwargs)
         if not hasattr(layer, "humming_kernel_config_modules"):
             layer.humming_kernel_config_modules = {}
         if not hasattr(layer, "humming_block_size_configs"):
@@ -401,7 +393,7 @@ class HummingMethod:
         old_kernel_configs = []
         if sublayer_name in layer.humming_kernel_config_modules:
             old_kernel_configs = layer.humming_kernel_config_modules[sublayer_name]()
-        old_kernel_configs = [min_shape_m, max_shape_m, *kernel_config] + old_kernel_configs
+        old_kernel_configs = [min_shape_m, max_shape_m, kernel_id, num_sms] + old_kernel_configs
 
         block_size_configs = []
         if sublayer_name in layer.humming_block_size_configs:

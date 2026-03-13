@@ -5,7 +5,6 @@ from humming.kernel.quant_weight import QuantWeightKernel
 from humming.kernel.repack_weight import RepackWeightKernel
 from humming.kernel.unpack_weight import UnpackWeightKernel
 
-
 __all__ = [
     "DequantKernel",
     "HummingKernel",

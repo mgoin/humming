@@ -1,13 +1,15 @@
-import os
 import functools
-import struct
-import re
 import hashlib
 import importlib
+import os
+import re
+import struct
+import subprocess
 import sys
 from pathlib import Path
-import subprocess
+
 from elftools.elf.elffile import ELFFile
+from filelock import FileLock
 
 
 def read_symbol_value(filename, symbol_name, default_value=None):
@@ -119,16 +121,12 @@ def make_humming_module(func_name, result):
     module_name = "humming_module_" + hash_to_hex(content)
     filename = module_name + ".py"
     Path(dirname).mkdir(exist_ok=True, parents=True)
-    if (Path(dirname) / filename).exists():
+
+    with FileLock(Path(dirname) / "lock"):
+        if not (Path(dirname) / filename).exists():
+            with open(Path(dirname) / filename, "w") as f:
+                f.write(content)
+                f.flush()
+
+        importlib.invalidate_caches()
         return importlib.import_module(module_name)
-
-    with open(Path(dirname) / filename, "w") as f:
-        f.write(content)
-        f.flush()
-
-    importlib.invalidate_caches()
-
-    try:
-        return importlib.import_module(module_name)
-    except ModuleNotFoundError:
-        raise

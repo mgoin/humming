@@ -2,13 +2,13 @@ from humming.schema.awq import AWQWeightSchema
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
 from humming.schema.bitnet import BitnetWeightSchema
 from humming.schema.compressed_tensors import (
-    CompressedTensorsWeightSchema,
     CompressedTensorsInputSchema,
+    CompressedTensorsWeightSchema,
 )
-from humming.schema.fp8 import Fp8WeightSchema, Fp8InputSchema
+from humming.schema.fp8 import Fp8InputSchema, Fp8WeightSchema
 from humming.schema.gptq import GPTQWeightSchema
 from humming.schema.humming import HummingInputSchema, HummingWeightSchema
-from humming.schema.modelopt import ModeloptWeightSchema, ModeloptInputSchema
+from humming.schema.modelopt import ModeloptInputSchema, ModeloptWeightSchema
 from humming.schema.mxfp4 import Mxfp4WeightSchema
 
 WEIGHT_SCHEMA_MAP: dict[str, type[BaseWeightSchema]] = {

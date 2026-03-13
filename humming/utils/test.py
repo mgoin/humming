@@ -1,9 +1,9 @@
+import math
+
 import torch
 
-from humming import dtypes
-from humming import ops
+from humming import dtypes, ops
 from humming.utils.weight import quantize_weight
-import math
 
 
 def generate_random_inputs(

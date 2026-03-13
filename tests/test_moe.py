@@ -1,16 +1,17 @@
 import pytest
-from humming import dtypes, ops
 import torch
+
+from humming import dtypes, ops
+from humming.kernel.humming import HummingKernel
 from humming.utils.test import (
-    generate_random_weight,
     generate_random_inputs,
     generate_random_moe_tensors,
+    generate_random_weight,
 )
 from humming.utils.weight import (
     prepare_humming_weight,
     prepare_humming_weight_scale,
 )
-from humming.kernel.humming import HummingKernel
 
 
 @pytest.mark.parametrize("m", [1, 18, 512])

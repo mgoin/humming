@@ -132,9 +132,9 @@ class HummingWeightSchema(BaseWeightSchema):
 
         keys = ["weight", "weight_scale", "zero_point", "global_scale"]
         tensors = {}
-        for key, tensor in zip(keys, tensor_list):
-            if tensor is not None and tensor.nelement() > 0:
-                tensors[key] = tensor
+        for key, output_tensor in zip(keys, tensor_list, strict=True):
+            if output_tensor is not None and output_tensor.nelement() > 0:
+                tensors[key] = output_tensor
 
         schema.validate_tensors(tensors, shape_n, shape_k, param_dtype, num_experts)
 

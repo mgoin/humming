@@ -1,7 +1,7 @@
 import dataclasses
-import math
 import os
 import zlib
+from typing import Any, ClassVar
 
 import jinja2
 
@@ -126,54 +126,53 @@ extern "C" __constant__ uint32_t IS_GLU_ACTIVATION = {{is_glu_activation}};
 """)
 
 
-class HummingKernel(KernelRuntime):
-    name = "humming"
+@dataclasses.dataclass(kw_only=True)
+class HummingKernel(
+    KernelRuntime,
+    SchedulerConfig,
+    PipelineConfig,
+    EpilogueConfig,
+    QuantParamConfig,
+    MoEConfig,
+    MmaConfig,
+):
+    name: ClassVar[str] = "humming"
+    problem_shape: tuple[int, int, int]
+    block_shape: tuple[int, int, int]
+    warp_shape: tuple[int, int, int]
+    pad_shape: tuple[int, int, int] = (0, 0, 0)
+    a_dtype: dtypes.DataType
+    b_dtype: dtypes.DataType
+    c_dtype: dtypes.DataType
+    bs_dtype: dtypes.DataType
 
-    def __init__(
-        self,
-        problem_shape: tuple[int, int, int],
-        block_shape: tuple[int, int, int],
-        warp_shape: tuple[int, int, int],
-        a_dtype: dtypes.DataType | str,
-        b_dtype: dtypes.DataType | str,
-        c_dtype: dtypes.DataType | str,
-        bs_dtype: dtypes.DataType | str,
-        **kwargs,
-    ):
-        if self.inited:
-            return
-        self.check_kwarg_keys(list(kwargs))
-        self.problem_shape = (0,) + tuple(problem_shape)[1:]
-        self.block_shape = tuple(block_shape)
-        self.warp_shape = tuple(warp_shape)
-        self.pad_shape = kwargs.get("pad_shape", (0, 0, 0))
-        self.num_warps = math.prod(block_shape) // math.prod(warp_shape)
-        self.num_math_threads = self.num_warps * 32
+    def __post_init__(self) -> None:
+        for key in ["a_dtype", "b_dtype", "c_dtype", "bs_dtype"]:
+            dtype = getattr(self, key)
+            if isinstance(dtype, str):
+                setattr(self, key, dtypes.DataType.from_str(dtype))
 
-        self.a_dtype = dtypes.DataType.from_str(a_dtype)
-        self.b_dtype = dtypes.DataType.from_str(b_dtype)
-        self.c_dtype = dtypes.DataType.from_str(c_dtype)
-        self.bs_dtype = dtypes.DataType.from_str(bs_dtype)
-
-        config_dict = kwargs.copy()
-        config_dict.update(self.__dict__)
-
-        self.scheduler_config = SchedulerConfig.from_dict(config_dict)
-        self.pipeline_config = PipelineConfig.from_dict(config_dict)
-        self.epilogue_config = EpilogueConfig.from_dict(config_dict)
-        self.quant_param_config = QuantParamConfig.from_dict(config_dict)
-        self.moe_config = MoEConfig.from_dict(config_dict)
-        self.mma_config = MmaConfig.from_dict(config_dict)
-        self.num_threads = self.pipeline_config.num_threads
+        self.scheduler_config = SchedulerConfig.from_dict(vars(self))
+        self.pipeline_config = PipelineConfig.from_dict(vars(self))
+        self.epilogue_config = EpilogueConfig.from_dict(vars(self))
+        self.quant_param_config = QuantParamConfig.from_dict(vars(self))
+        self.moe_config = MoEConfig.from_dict(vars(self))
+        self.mma_config = MmaConfig.from_dict(vars(self))
+        name_list = ["scheduler", "pipeline", "epilogue", "quant_param", "moe", "mma"]
+        for name in name_list:
+            config = getattr(self, name + "_config")
+            for key, value in vars(config).items():
+                setattr(self, key, value)
 
         self.check_shape()
         self.check_dtype()
         self.check_config()
         self.mma_op_class = self.select_mma_op_class()
 
-        epilogue_config = self.epilogue_config
-        custom_activation_func = epilogue_config.prepare_custom_activation_func()
+        custom_activation_func = self.epilogue_config.prepare_custom_activation_func()
         is_glu_activation = "_glu" in str(self.epilogue_config.activation_type).lower()
+        assert isinstance(self.pipeline_config.use_warp_spec, bool)
+
         self.code = CODE_TEMPLATE.render(
             use_warp_spec=int(self.pipeline_config.use_warp_spec),
             mma_op_class=self.mma_op_class.to_cpp_str(),
@@ -201,6 +200,10 @@ class HummingKernel(KernelRuntime):
 
         self.prepare()
 
+    @classmethod
+    def from_config(cls, config: dict[str, Any]):
+        raise NotImplementedError
+
     def check_kwarg_keys(self, keys):
         def get_field_names(c):
             return [x.name for x in dataclasses.fields(c)]
@@ -216,9 +219,13 @@ class HummingKernel(KernelRuntime):
         invalid_keys = set(keys) - set(valid_keys)
         assert not invalid_keys, f"{invalid_keys}"
 
-    def load_cubin(self, kernel_filename, kernel_name):
+    def load_cubin(self):
         from humming import ops
 
+        if self.cubin_loaded:
+            return None
+        kernel_filename = self.kernel_filename
+        kernel_name = self.kernel_name
         self.kernel_id = ops.register_kernel(kernel_filename, kernel_name)
         self.kernel_dirname = os.path.dirname(kernel_filename)
         ref_kernel_id = zlib.crc32(kernel_filename.encode()) << 30
@@ -325,15 +332,13 @@ class HummingKernel(KernelRuntime):
             assert self.b_dtype.exponent_bits >= 1
         elif self.b_dtype.is_floating_point_type and not self.a_dtype.is_integer_type:
             # not implemented yet
-            assert False
+            raise NotImplementedError
 
         if self.mma_config.use_f16_accum:
             if self.a_dtype == dtypes.float8e4m3:
                 assert self.b_dtype.is_integer_type or self.b_dtype.exponent_bits <= 4
-            elif self.a_dtype == dtypes.float16:
-                pass
             else:
-                assert False
+                assert self.a_dtype == dtypes.float16
 
     def check_config(self):
         # 16-bit activation don't support input scale
