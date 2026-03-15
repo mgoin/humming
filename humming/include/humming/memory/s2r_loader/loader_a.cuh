@@ -3,9 +3,10 @@
 #include <humming/utils/all.cuh>
 
 
-template <class BlockShape, class WarpShape, class ElementA, class PipelineConfig>
+template <class MmaOpClass, class BlockShape, class WarpShape, class ElementA, class PipelineConfig>
 class S2RMemoryLoaderA {
 private:
+  using MmaShape = class MmaOpClass::MmaShape;
   static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
@@ -24,8 +25,17 @@ public:
 
     PRAGMA_UNROLL
     for (uint32_t load_iter_id = 0; load_iter_id < WarpShape::M / 16; load_iter_id++) {
-      uint32_t row = m_iter_id * (BlockShape::M / M_WARPS) + load_iter_id * 16 + lane_id % 16;
-      uint32_t col = lane_id / 16 + 2 * kWarpItersK * (threadIdx.x / (kNumThreads / K_WARPS)) + iter_id * 2;
+
+      uint32_t row = m_iter_id * (BlockShape::M / M_WARPS) + load_iter_id * 16;
+      uint32_t col = 2 * kWarpItersK * (threadIdx.x / (kNumThreads / K_WARPS)) + iter_id * 2;
+
+      if constexpr (MmaShape::M == 8) {
+        row += (lane_id / 16) * 8;
+        col += (lane_id / 8) % 2;
+      } else {
+        row += lane_id % 16;
+        col += lane_id / 16;
+      }
 
       if constexpr (BlockShape::K * ElementA::kBits > 1024) {
         row = BlockShape::M * (col / 8) + row;

@@ -247,6 +247,8 @@ class HummingKernel(
         mma_shape_k = 256 // self.a_dtype.num_bits
         if self.sm_version == 75:
             mma_shape_k = mma_shape_k // 2
+            if self.a_dtype == dtypes.int8:
+                mma_shape_m = 8
 
         input_group_size = self.problem_shape[2]
         weight_group_size = self.problem_shape[2]
