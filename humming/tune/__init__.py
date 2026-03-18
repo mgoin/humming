@@ -1,7 +1,16 @@
 import torch
 
 from humming.tune.base import DeviceHeuristics
-from humming.tune.sm89 import Sm89Heuristics
+from humming.tune.sm8x import Sm80Heuristics, Sm86Heuristics, Sm87Heuristics, Sm89Heuristics
+from humming.tune.sm75 import Sm75Heuristics
+
+heuristics_map: dict[int, type[DeviceHeuristics]] = {
+    80: Sm80Heuristics,
+    86: Sm86Heuristics,
+    87: Sm87Heuristics,
+    89: Sm89Heuristics,
+    75: Sm75Heuristics,
+}
 
 
 def get_heuristics_class(
@@ -14,7 +23,4 @@ def get_heuristics_class(
         sm_version = sm_version[0] * 10 + sm_version[1]
     assert isinstance(sm_version, int)
 
-    if sm_version == 89:
-        return Sm89Heuristics
-
-    return Sm89Heuristics
+    return heuristics_map[sm_version]
