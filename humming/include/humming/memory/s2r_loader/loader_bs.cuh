@@ -67,13 +67,14 @@ public:
 
     LoadType *reg_ptr_load = reinterpret_cast<LoadType *>(regs_ptr);
     const LoadType *smem_ptr_load = reinterpret_cast<const LoadType *>(smem_ptr);
+    constexpr uint32_t kRegsGroupStride = kLoadItersPerGroup * (8 / MIN(kNumScales, 8)); 
 
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < kNumGroups; i++) {
       PRAGMA_UNROLL
       for (uint32_t j = 0; j < kLoadItersPerGroup; j++) {
         uint32_t smem_idx = kSmemStrideLoadType * i + warp_load_delta * j + s_sh_rd;
-        reg_ptr_load[i * kLoadItersPerGroup + j] = smem_ptr_load[smem_idx];
+        reg_ptr_load[i * kRegsGroupStride + j] = smem_ptr_load[smem_idx];
       }
     }
   };

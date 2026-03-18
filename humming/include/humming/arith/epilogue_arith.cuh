@@ -106,6 +106,34 @@ public:
   };
 
   CUDA_INLINE
+  void may_process_f32_on_smem_write(uint32_t row, uint32_t col) {
+    if (kHasGlobalScale && row == 0 && col == 0) {
+      float &gs_f32 = *reinterpret_cast<float *>(&gs);
+      if constexpr (kExpOffset.x) gs_f32 *= prepare_exp_scale_factor<float, kExpOffset.x>();
+      float *as_f32_ptr = reinterpret_cast<float *>(as);
+
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < kSizeAS; i++) {
+        as_f32_ptr[i] = as_f32_ptr[i] * gs_f32;
+      }
+    }
+  }
+
+  CUDA_INLINE
+  void may_apply_f32_on_smem_write(float2 &regs, uint32_t row, uint32_t col) {
+    may_process_f32_on_smem_write(row, col);
+    if constexpr (kIsChannelInputScale && !kIsF16Accum) {
+      float *as_f32_ptr = reinterpret_cast<float *>(as);
+      regs.x = regs.x * as_f32_ptr[row];
+      regs.y = regs.y * as_f32_ptr[row];
+    } else if constexpr (kHasGlobalScale) {
+      float &gs_f32 = *reinterpret_cast<float *>(&gs);
+      regs.x = regs.x * gs_f32;
+      regs.y = regs.y * gs_f32;
+    }
+  };
+
+  CUDA_INLINE
   void may_process_on_smem_write(uint32_t row, uint32_t col) {
     if constexpr (kIsChannelInputScale && kIsF16Accum) {
       if (row == 0 && col == 0) {
@@ -149,27 +177,6 @@ public:
         }
       };
     };
-
-    if constexpr (kHasGlobalScale) {
-      if (row == 0 && col == 0) {
-        scalar_t2 &gs_f16 = *reinterpret_cast<scalar_t2 *>(&gs);
-        float &gs_f32 = *reinterpret_cast<float *>(&gs);
-        gs_f16 = this->float2num2(gs_f32);
-        if constexpr (kExpOffset.x && !(kIsChannelWeightScale && ElementBS::kBits == 8)) {
-          const scalar_t2 scale_factor = prepare_exp_scale_factor<scalar_t2, kExpOffset.x>();
-          gs_f16 = __hmul2(gs_f16, scale_factor);
-        }
-      }
-    }
-  };
-
-  CUDA_INLINE
-  void may_apply_f32_as_on_smem_write(float2 &regs, uint32_t row) {
-    float *as_f32_ptr = reinterpret_cast<float *>(as);
-    if constexpr (kIsChannelInputScale && !kIsF16Accum) {
-      regs.x = regs.x * as_f32_ptr[row];
-      regs.y = regs.y * as_f32_ptr[row];
-    };
   };
 
   CUDA_INLINE
@@ -177,11 +184,7 @@ public:
     may_process_on_smem_write(row, col);
 
     auto apply_gs_or_exp_offset = [&]() {
-      if constexpr (kHasGlobalScale) {
-        scalar_t2 &gs_f16 = *reinterpret_cast<scalar_t2 *>(&gs);
-        scalar_t2 *b_f16_ptr = reinterpret_cast<scalar_t2 *>(&regs);
-        b_f16_ptr[0] = __hmul2(b_f16_ptr[0], gs_f16);
-      } else if constexpr (kExpOffset.x && !kHasGlobalScale) {
+      if constexpr (kExpOffset.x && !kHasGlobalScale) {
         const scalar_t2 scale_factor = prepare_exp_scale_factor<scalar_t2, kExpOffset.x>();
         scalar_t2 *b_f16_ptr = reinterpret_cast<scalar_t2 *>(&regs);
         b_f16_ptr[0] = __hmul2(b_f16_ptr[0], scale_factor);

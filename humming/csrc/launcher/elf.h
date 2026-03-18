@@ -6,11 +6,13 @@
 #include <string>
 #include <vector>
 
+#define SHT_NOBITS 8
 typedef uint64_t Elf64_Addr;
 typedef uint64_t Elf64_Off;
 typedef uint16_t Elf64_Half;
 typedef uint32_t Elf64_Word;
 
+#pragma pack(push, 1)
 struct Elf64_Ehdr {
   unsigned char e_ident[16];
   Elf64_Half e_type;
@@ -49,6 +51,7 @@ struct Elf64_Sym {
   Elf64_Addr st_value;
   uint64_t st_size;
 };
+#pragma pack(pop)
 
 class CubinReader {
 private:
@@ -75,7 +78,9 @@ public:
   }
 
   uint32_t getUint32(const std::string &name) {
-    if (symbolOffsets.find(name) == symbolOffsets.end()) return 0;
+    auto it = symbolOffsets.find(name);
+    if (it == symbolOffsets.end()) return 0;
+    if (it->second == 0ULL) return 0;
 
     std::ifstream fs(cubinPath, std::ios::binary);
     uint32_t val = 0;
@@ -105,8 +110,11 @@ public:
       if (sym.st_name == 0) continue;
       std::string sName = &names[sym.st_name];
 
-      if (sym.st_shndx < shdrs.size()) {
-        uint64_t absOffset = shdrs[sym.st_shndx].sh_offset + sym.st_value;
+      const auto& shdr = shdrs[sym.st_shndx];
+      if (shdr.sh_type == SHT_NOBITS) {
+        symbolOffsets[sName] = 0;
+      } else {
+        uint64_t absOffset = shdr.sh_offset + sym.st_value;
         symbolOffsets[sName] = absOffset;
       }
     }

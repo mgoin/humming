@@ -91,6 +91,7 @@ class QuantParamConfig(BaseHummingConfig):
     has_weight_scale: bool = True
     input_scale_group_size: int = 0
     weight_scale_group_size: int = 0
+    use_int_weight_scale: bool = False
     has_global_scale: bool = False
     has_zero_point: bool = False
     is_fp_zero_point: bool = False

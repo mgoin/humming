@@ -31,6 +31,7 @@ private:
   static constexpr bool kIsChannelWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
   static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
+  static constexpr bool kUseIntWeightScale = QuantParamConfig::kUseIntWeightScale;
 
   static constexpr uint32_t kInputScaleGroupSize = kIsGroupInputScale ? QuantParamConfig::kInputScaleGroupSize : 1;
   static constexpr uint32_t kWeightScaleGroupSize = kIsGroupWeightScale ? QuantParamConfig::kWeightScaleGroupSize : 1;
@@ -227,7 +228,13 @@ public:
 
     bool is_new_bs_group = kIsGroupWeightScale && k_index % kWeightScaleGroupSize == 0;
     if (m == 0 && n == 0 && is_new_bs_group) {
-      if constexpr (kIsF16Accum && ElementBS::kBits == 16) {
+      if constexpr (kUseIntWeightScale) {
+        int16_t *bs_vals = reinterpret_cast<int16_t *>(bs[buffer_id][k]);
+        int32_t *dq_bs_vals = reinterpret_cast<int32_t *>(dq_bs);
+        PRAGMA_UNROLL
+        for (uint32_t i = 0; i < kNumBSPerGroup; i++)
+          dq_bs_vals[i] = (int32_t)bs_vals[i];
+      } else if constexpr (kIsF16Accum && ElementBS::kBits == 16) {
         scalar_t2 *dq_bs_scalar2_ptr = reinterpret_cast<scalar_t2 *>(dq_bs);
         scalar_t2 *bs_scalar2_ptr = reinterpret_cast<scalar_t2 *>(bs[buffer_id][k]);
 
@@ -332,31 +339,46 @@ public:
 
       } else {
         int2 &part_int_regs_c0 = reinterpret_cast<int2 *>(regs_c[0][m][n])[index];
+        int2 &part_int_regs_c1 = reinterpret_cast<int2 *>(regs_c[1][m][n])[index];
         float2 &part_regs_c0 = reinterpret_cast<float2 *>(regs_c[0][m][n])[index];
         float2 &part_regs_c1 = reinterpret_cast<float2 *>(regs_c[1][m][n])[index];
+        if constexpr (kUseIntWeightScale) {
+          static_assert(std::is_same<ValTypeC, int32_t>::value);
+          static_assert(!kIsGroupInputScale);
+          static_assert(kIsGroupWeightScale);
 
-        if constexpr (std::is_same<ValTypeC, int32_t>::value) {
-          part_regs_c0.x = __int2float_rn(part_int_regs_c0.x);
-          part_regs_c0.y = __int2float_rn(part_int_regs_c0.y);
+          uint32_t group_id = kPartMmaShapeK > kInputScaleGroupSize ? k : 0;
+          int2 &bs_vals = reinterpret_cast<int2 *>(dq_bs)[n * MmaShape::N / 8 + inner_n];
+
+          part_int_regs_c1.x += bs_vals.x * part_int_regs_c0.x;
+          part_int_regs_c1.y += bs_vals.y * part_int_regs_c0.y;
+
+          part_int_regs_c0.x = 0;
+          part_int_regs_c0.y = 0;
+        } else {
+          if constexpr (std::is_same<ValTypeC, int32_t>::value) {
+            part_regs_c0.x = __int2float_rn(part_int_regs_c0.x);
+            part_regs_c0.y = __int2float_rn(part_int_regs_c0.y);
+          }
+
+          uint32_t group_id = kPartMmaShapeK > kInputScaleGroupSize ? k : 0;
+          float &as_val = reinterpret_cast<float *>(as[buffer_id][m * MmaShape::M / 8 + inner_m])[group_id];
+          float2 &bs_vals = reinterpret_cast<float2 *>(dq_bs)[n * MmaShape::N / 8 + inner_n];
+
+          if constexpr (kIsGroupInputScale && kIsGroupWeightScale) {
+            part_regs_c1.x += as_val * bs_vals.x * part_regs_c0.x;
+            part_regs_c1.y += as_val * bs_vals.y * part_regs_c0.y;
+          } else if constexpr (kIsGroupInputScale) {
+            part_regs_c1.x += as_val * part_regs_c0.x;
+            part_regs_c1.y += as_val * part_regs_c0.y;
+          } else if constexpr (kIsGroupWeightScale) {
+            part_regs_c1.x += bs_vals.x * part_regs_c0.x;
+            part_regs_c1.y += bs_vals.y * part_regs_c0.y;
+          }
+
+          part_regs_c0.x = 0;
+          part_regs_c0.y = 0;
         }
-
-        uint32_t group_id = kPartMmaShapeK > kInputScaleGroupSize ? k : 0;
-        float &as_val = reinterpret_cast<float *>(as[buffer_id][m * MmaShape::M / 8 + inner_m])[group_id];
-        float2 &bs_vals = reinterpret_cast<float2 *>(dq_bs)[n * MmaShape::N / 8 + inner_n];
-
-        if constexpr (kIsGroupInputScale && kIsGroupWeightScale) {
-          part_regs_c1.x += as_val * bs_vals.x * part_regs_c0.x;
-          part_regs_c1.y += as_val * bs_vals.y * part_regs_c0.y;
-        } else if constexpr (kIsGroupInputScale) {
-          part_regs_c1.x += as_val * part_regs_c0.x;
-          part_regs_c1.y += as_val * part_regs_c0.y;
-        } else if constexpr (kIsGroupWeightScale) {
-          part_regs_c1.x += bs_vals.x * part_regs_c0.x;
-          part_regs_c1.y += bs_vals.y * part_regs_c0.y;
-        }
-
-        part_regs_c0.x = 0;
-        part_regs_c0.y = 0;
       }
     }
   }

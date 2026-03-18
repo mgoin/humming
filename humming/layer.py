@@ -49,6 +49,7 @@ class HummingLayerMeta:
     num_experts: int | None = None
     has_input_scale: bool | None = None
     has_weight_scale: bool = True
+    use_int_weight_scale: bool | None = None
     input_scale_group_size: int = 0
     weight_scale_group_size: int = 0
     has_zero_point: bool = False
@@ -121,6 +122,22 @@ class HummingLayerMeta:
         if self.mma_type is None:
             sm_version = torch.cuda.get_device_capability()[0]
             self.mma_type = "wgmma" if sm_version == (9, 0) else "mma"
+
+        if self.mma_type is None:
+            self.has_global_scale = 1
+
+        msg = "don't set use_int_weight_scale to True directly"
+        assert self.use_int_weight_scale is not True, msg
+        if self.use_int_weight_scale is None:
+            self.use_int_weight_scale = (
+                self.a_dtype == dtypes.int8
+                and self.input_scale_group_size == 0
+                and self.weight_scale_group_size > 0
+            )
+
+        if self.use_int_weight_scale:
+            self.has_global_scale = True
+            self.bs_dtype = self.c_dtype
 
 
 class HummingModule(torch.nn.Module):
@@ -219,6 +236,16 @@ class HummingMethod:
             is_fp_zero_point=meta.is_fp_zero_point,
         )
 
+        if meta.use_int_weight_scale:
+            dtype = dtypes.torch_dtype_map[meta.bs_dtype]
+            tensors["weight_scale"] = tensors["weight_scale"].to(dtype)
+            if "has_global_scale" not in tensors:
+                tensors["global_scale"] = torch.ones(
+                    (meta.num_experts or 1),
+                    device=tensors["weight_scale"].device,
+                    dtype=torch.float32,
+                )
+
         schema.validate_tensors(
             tensors,
             shape_n=meta.shape_n,
@@ -247,6 +274,38 @@ class HummingMethod:
             tensors[key] = torch.nn.functional.pad(tensor, pad=padding, value=value)
 
         return tensors
+
+    @classmethod
+    def may_process_int_weight_scale(
+        cls,
+        meta: HummingLayerMeta,
+        weight_scale: torch.Tensor,
+        global_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if meta.bs_dtype.num_bits == 8:
+            assert weight_scale is not None
+            torch_dtype = dtypes.torch_dtype_map[meta.c_dtype]
+            weight_scale = weight_scale.to(torch_dtype)
+
+        assert weight_scale is not None
+        dtype = weight_scale.dtype
+        assert dtype in [torch.float16, torch.bfloat16]
+        scale_factor = weight_scale.float().abs().max() / 1024
+        weight_scale = (weight_scale.float() / scale_factor).round().to(torch.int16)
+        weight_scale = weight_scale.view(dtype)
+
+        if global_scale is not None:
+            assert global_scale is not None
+            out_global_scale = global_scale * scale_factor
+        else:
+            meta.has_global_scale = True
+            out_global_scale = torch.full(
+                (meta.num_experts or 1,),
+                fill_value=scale_factor.item(),
+                device=weight_scale.device,
+            )
+
+        return weight_scale, out_global_scale
 
     @classmethod
     def transform_humming_layer(
@@ -282,7 +341,7 @@ class HummingMethod:
         zero_point = tensors["zero_point"] if meta.has_zero_point else None
         weight_scale = tensors["weight_scale"] if meta.has_weight_scale else None
         bias = tensors["bias"] if meta.has_bias else None
-        global_scale = tensors["global_scale"] if meta.has_global_scale else None
+        global_scale = tensors.get("global_scale", None) if meta.has_global_scale else None
 
         weight = prepare_humming_weight(
             weight=weight,
@@ -296,6 +355,12 @@ class HummingMethod:
         zero_point = prepare_humming_zero_point(zero_point, meta.b_dtype, packed=True)
         bias = prepare_humming_bias(bias)
 
+        if meta.use_int_weight_scale:
+            assert weight_scale is not None
+            weight_scale, global_scale = cls.may_process_int_weight_scale(
+                meta, weight_scale=weight_scale, global_scale=global_scale
+            )
+
         cls.may_set_param(layer, meta.weight_name, weight)
         cls.may_set_param(layer, meta.weight_scale_name, weight_scale)
         cls.may_set_param(layer, meta.zero_point_name, zero_point)
@@ -306,7 +371,7 @@ class HummingMethod:
     def prepare_default_kernel_configs(
         cls,
         layer: HummingModule | torch.nn.Module,
-        use_stream_k: bool = False,
+        use_stream_k: bool = True,
         use_f16_accum: bool = False,
         sublayer_name: str = "",
     ):
@@ -324,7 +389,7 @@ class HummingMethod:
             return cls.prepare_kernel(layer, sublayer_name=sublayer_name, **config)
 
         if os.environ.get("HUMMING_DISABLE_PARALLEL_BUILD", "0") != "1":
-            # Parallelize kernel compilation using multiple threads, 
+            # Parallelize kernel compilation using multiple threads,
             # but ensure loading occurs in the main thread to prevent CUDA context issues.
             # (KernelRuntime would skip loading when running in child thread).
             executor = ThreadPoolExecutor(max_workers=8)

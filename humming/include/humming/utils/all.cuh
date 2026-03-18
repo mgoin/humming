@@ -4,7 +4,7 @@
 #include <humming/utils/enum.cuh>
 #include <humming/utils/ptx/barrier.cuh>
 #include <humming/utils/ptx/legacy_load.cuh>
-#include <humming/utils/ptx/logic.cuh>
+#include <humming/utils/ptx/math.cuh>
 #include <humming/utils/ptx/shared.cuh>
 #include <humming/utils/ptx/tma.cuh>
 #include <humming/utils/ptx/wgmma.cuh>

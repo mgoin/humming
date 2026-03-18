@@ -94,6 +94,7 @@ class NVCCCompiler(Compiler):
         return [
             "-std=c++17",
             "--ptxas-options=--register-usage-level=10",
+            "--use_fast_math",
             "--diag-suppress=39,161,174,177,940,177",
             *[f"-I{d}" for d in cls.include_dirs()],
             f"-gencode=arch=compute_{sm_version},code=sm_{sm_version}",

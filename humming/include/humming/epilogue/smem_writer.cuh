@@ -91,7 +91,9 @@ private:
   static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
   static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
   static constexpr bool kIsGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
-  static constexpr bool kIsIntAccum = std::is_same<ValTypeC, int32_t>::value && (!kIsGroupInputScale && !kIsGroupWeightScale);
+  static constexpr bool kUseIntWeightScale = QuantParamConfig::kUseIntWeightScale;
+  static constexpr bool kHasGroupScale = kIsGroupInputScale || kIsGroupWeightScale;
+  static constexpr bool kIsIntAccum = std::is_same<ValTypeC, int32_t>::value && (!kHasGroupScale || kUseIntWeightScale);
 
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
   static constexpr uint32_t N_WARPS = BlockShape::N / WarpShape::N;
@@ -132,16 +134,16 @@ public:
       } else if constexpr (kIsIntAccum) {
         float2 val_float2 = {__int2float_rn(val.x), __int2float_rn(val.y)};
         if constexpr (kUseWgmma) {
-          arith.may_apply_f32_as_on_smem_write(val_float2, col_8x8block);
+          arith.may_apply_f32_on_smem_write(val_float2, col_8x8block, row_8x8block);
         } else {
-          arith.may_apply_f32_as_on_smem_write(val_float2, row_8x8block);
+          arith.may_apply_f32_on_smem_write(val_float2, row_8x8block, col_8x8block);
         }
         val_half2 = this->float22num2(val_float2);
       } else {
         if constexpr (kUseWgmma) {
-          arith.may_apply_f32_as_on_smem_write(val, col_8x8block);
+          arith.may_apply_f32_on_smem_write(val, col_8x8block, row_8x8block);
         } else {
-          arith.may_apply_f32_as_on_smem_write(val, row_8x8block);
+          arith.may_apply_f32_on_smem_write(val, row_8x8block, col_8x8block);
         }
         val_half2 = this->float22num2(val);
       };
