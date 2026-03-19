@@ -20,6 +20,7 @@ class DeviceHeuristics:
         cls,
         meta: HummingLayerMeta,
         max_num_ctas_per_sm: int,
+        num_warps_m: int,
         num_warps_n: int,
         warp_shape_k: int,
         block_shape_m: int,
@@ -28,7 +29,13 @@ class DeviceHeuristics:
     ):
         assert max_num_ctas_per_sm in [1, 2]
         max_num_warps = 8
-        block_shape_k = max_num_warps // max_num_ctas_per_sm // num_warps_n * warp_shape_k
+        while max_num_ctas_per_sm * num_warps_n * num_warps_m > max_num_warps:
+            max_num_ctas_per_sm -= 1
+
+        assert max_num_ctas_per_sm > 0
+
+        num_warps_k = max_num_warps // max_num_ctas_per_sm // num_warps_n // num_warps_m
+        block_shape_k = num_warps_k * warp_shape_k
         while meta.shape_k % block_shape_k:
             block_shape_k = block_shape_k // 2
             assert block_shape_k % block_shape_k == 0
@@ -112,37 +119,58 @@ class DeviceHeuristics:
         else:
             raise AssertionError(f"unsupported a_dtype {meta.a_dtype} on sm{cls.sm_version}")
 
+        # 1. determine block_shape_m, init warp_shape_m
+        max_block_shape_m = 64
+        has_group_scale = (meta.input_scale_group_size or meta.weight_scale_group_size) > 0
+        if meta.a_dtype.num_bits in [4, 8] and not has_group_scale:
+            max_block_shape_m = 128
+            if meta.b_dtype.num_bits <= 4 and cls.sm_version == 75:
+                max_block_shape_m = 64
         block_shape_m = cls.get_block_shape_m(
-            max_block_shape_m=64,
+            max_block_shape_m=max_block_shape_m,
             shape_m=shape_m,
             num_experts=meta.num_experts,
             top_k=meta.top_k,
         )
         warp_shape_m = block_shape_m
+        num_write_splits = 1
+        if cls.sm_version == 75 and block_shape_m == 64:
+            # shared memory of sm75 of quiet small,
+            # we use 2 splits for epilogue, so we need less shared memory
+            warp_shape_m = block_shape_m
+            num_write_splits = 2
 
+        # 2. init block_shape_n, warp_shape_n, warp_shape_k
         block_shape_n = 256
         while meta.shape_n % block_shape_n != 0:
             block_shape_n = block_shape_n // 2
         assert block_shape_n >= 64
         warp_shape_n = 64
         warp_shape_k = 512 // meta.a_dtype.num_bits
-        if meta.a_dtype.num_bits != 16:
-            if meta.input_scale_group_size > 0 or meta.weight_scale_group_size > 0:
-                warp_shape_n = 32
-                block_shape_n = min(block_shape_n, 128)
+        if meta.a_dtype.num_bits in [4, 8] and not has_group_scale and block_shape_m > 64:
+            warp_shape_n = 32
+        if meta.a_dtype.num_bits != 16 and has_group_scale and block_shape_m > 32:
+            warp_shape_n = 32
+            block_shape_n = min(block_shape_n, 128)
 
+        # 3. init num_ctas_per_sm, reduce num_ctas_per_sm and block_shape_n / warp_shape_n 
+        #    for small m (to avoid too many ctas processing the same mn_block)
         num_blocks_n = meta.shape_n // block_shape_n
         num_blocks_m = cls.estimate_num_blocks_m(meta, shape_m, block_shape_m)
         num_sms = cls.get_num_sms()
-        num_ctas_per_sm = 2
+        num_warps_mn = block_shape_m * block_shape_n // (warp_shape_m * warp_shape_n)
+        if num_warps_mn >= 8:
+            num_ctas_per_sm = 1
+        else:
+            num_ctas_per_sm = 2
         num_ctas_per_mn_block = num_sms * num_ctas_per_sm / (num_blocks_m * num_blocks_n)
         while num_ctas_per_mn_block > 2:
             if num_blocks_m > 1 or num_ctas_per_mn_block < 3:
+                # for compute-bound, allow the same mn_block to be processe by at most 3 ctas
                 if meta.a_dtype.num_bits == 8 and warp_shape_n == 64:
                     warp_shape_n = 32
                     block_shape_n = block_shape_n // 2
                     num_ctas_per_mn_block = num_ctas_per_mn_block / 2
-
                 break
 
             if num_ctas_per_sm > 1 and (meta.a_dtype.num_bits == 16 or warp_shape_n == 32):
@@ -159,6 +187,7 @@ class DeviceHeuristics:
             if meta.a_dtype.num_bits == 8 and warp_shape_n == 64:
                 warp_shape_n = 32
 
+        # 4. special case for b8 activation + groupsize 128: force the warp_shape_k to be 128
         if num_ctas_per_sm < 3:
             block_shape_k = warp_shape_k
             config = cls.get_special_config_b8_g128(
@@ -170,13 +199,13 @@ class DeviceHeuristics:
             if config is not None:
                 return config
 
-        num_sms = min(num_blocks_m * num_blocks_n * 4, num_sms)
+        # 5. determine block_shape_k and num_ctas_per_sm based on shared memory size
         num_warps_n = block_shape_n // warp_shape_n
-
         num_stages = 2 if cls.sm_version < 80 else 3
         block_shape_k, num_ctas_per_sm = cls.get_block_shape_k_and_num_ctas_per_sm(
             meta=meta,
             max_num_ctas_per_sm=num_ctas_per_sm,
+            num_warps_m=block_shape_m // warp_shape_m,
             num_warps_n=num_warps_n,
             warp_shape_k=warp_shape_k,
             block_shape_m=block_shape_m,
@@ -184,18 +213,37 @@ class DeviceHeuristics:
             num_stages=num_stages,
         )
 
+        # 6. reduce warp_shape if possible, to ensure we have enough warps per sm
         num_warps = num_warps_n * (block_shape_k // warp_shape_k)
         if num_warps == 2 and warp_shape_m in [32, 64]:
             warp_shape_m = warp_shape_m // 2
+            num_warps = 4
+        if meta.a_dtype.num_bits != 16 and num_warps * num_ctas_per_sm < 8 and warp_shape_n == 64:
+            warp_shape_n = 32
+            num_warps = num_warps * 2
+
+        # 7. increase warp_shape_k and num_stages if shared memory is enough
+        block_shape = (block_shape_m, block_shape_n, block_shape_k)
+        if warp_shape_k == 512 // meta.a_dtype.num_bits:
+            block_shape_new = (block_shape_m, block_shape_n, block_shape_k * 2)
+            smem_size = estimate_smem_size_layer(meta, block_shape, num_stages)
+            if smem_size < cls.max_smem_size:
+                block_shape_k = block_shape_k * 2
+                warp_shape_k = warp_shape_k * 2
+                block_shape = block_shape_new            
+        smem_size = estimate_smem_size_layer(meta, block_shape, num_stages + 1)
+        if smem_size < cls.max_smem_size:
+            num_stages = num_stages + 1
 
         return {
             "block_shape": (block_shape_m, block_shape_n, block_shape_k),
             "warp_shape": (warp_shape_m, warp_shape_n, warp_shape_k),
             "use_stream_k": use_stream_k,
             "use_f16_accum": use_f16_accum,
-            "num_sms": num_sms,
+            "num_sms": min(num_blocks_m * num_blocks_n * 4, num_sms),
             "num_stages": num_stages,
             "num_ctas_per_sm": num_ctas_per_sm,
+            "num_write_splits": num_write_splits,
         }
 
     @classmethod

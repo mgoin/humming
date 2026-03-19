@@ -130,7 +130,7 @@ class HummingLayerMeta:
         assert self.use_int_weight_scale is not True, msg
         if self.use_int_weight_scale is None:
             self.use_int_weight_scale = (
-                self.a_dtype == dtypes.int8
+                self.a_dtype in [dtypes.int8, dtypes.int4]
                 and self.input_scale_group_size == 0
                 and self.weight_scale_group_size > 0
             )

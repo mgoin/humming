@@ -22,12 +22,13 @@ private:
 
 public:
   static constexpr uint32_t kNumStages = PipelineConfig::kNumStages;
+  static constexpr uint32_t kNumWriteSplits = PipelineConfig::kNumWriteSplits;
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kNumWarpsDimK = BlockShape::K / WarpShape::K;
   static constexpr uint32_t kMmaCTypeBits = MmaOpClass::kCTypeBits;
   static constexpr uint32_t M_WARPS = (BlockShape::M / WarpShape::M);
   static constexpr uint32_t kWarpReduceSize = M_WARPS * 16 * BlockShape::N * kMmaCTypeBits / 128 * (kNumWarpsDimK / 2);
-  static constexpr uint32_t kBlockOutputSize = BlockShape::M * BlockShape::N / 2 / 4;
+  static constexpr uint32_t kBlockOutputSize = BlockShape::M * BlockShape::N / 2 / 4 / kNumWriteSplits;
   static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementB::kBits));
 
   static constexpr uint32_t kSmemStrideA = BlockShape::K * ElementA::kBits / 32 / 4;

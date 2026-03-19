@@ -86,6 +86,7 @@ private:
   using WGMMA_CRegistersArrayType = CRegistersType[WarpShape::N * 4 / MmaShape::M][WarpShape::M / MmaShape::N];
   using CRegistersArrayType = std::conditional_t<kUseWgmma, WGMMA_CRegistersArrayType, MMA_CRegistersArrayType>;
 
+  static constexpr uint32_t kNumWriteSplits = PipelineConfig::kNumWriteSplits;
   static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
   static constexpr bool kHasInputScale = QuantParamConfig::kHasInputScale;
   static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
@@ -110,7 +111,7 @@ public:
   }
 
   CUDA_INLINE
-  void write(uint32_t *regs_ptr, uint32_t slice_count) {
+  void write(uint32_t *regs_ptr, uint32_t slice_count, uint32_t split_idx) {
     if (threadIdx.x >= kNumThreads / K_WARPS) return;
 
     auto &regs = *reinterpret_cast<CRegistersArrayType *>(regs_ptr);
@@ -127,6 +128,14 @@ public:
     uint32_t group_warp_id = warpid % 4;
     auto write_to_smem = [&](PackTypeC val, uint32_t row_8x8block, uint32_t col_8x8block) {
       scalar_t2 val_half2;
+
+      static_assert(kNumWriteSplits == 1 || kNumWriteSplits == 2);
+      if constexpr (kNumWriteSplits == 2) {
+        static_assert(M_WARPS == 1);
+        uint32_t m_8x8block = kUseWgmma ? col_8x8block : row_8x8block;
+        if (split_idx == 0 && m_8x8block >= BlockShape::M / 8 / 2) return;
+        if (split_idx == 1 && m_8x8block < BlockShape::M / 8 / 2) return;
+      }
 
       if constexpr (kUseWgmma) shlf_trans_mma_c(val);
       if constexpr (sizeof(ValTypeC) != 4) {
@@ -151,8 +160,10 @@ public:
       uint32_t &val_uint = *reinterpret_cast<uint32_t *>(&val_half2);
       if constexpr (kUseWgmma) {
         arith.may_apply_on_smem_write(val_uint, col_8x8block, row_8x8block);
+        col_8x8block = col_8x8block - BlockShape::M / 8 / 2 * split_idx;
       } else {
         arith.may_apply_on_smem_write(val_uint, row_8x8block, col_8x8block);
+        row_8x8block = row_8x8block - BlockShape::M / 8 / 2 * split_idx;
       }
       arith.may_apply_activation_on_smem_write(val_uint, slice_count);
 
@@ -161,7 +172,7 @@ public:
         uint32_t row = warp_delta_row + 8 * row_8x8block + sub_row;
         uint32_t col = col_8x8block * 4 + WarpShape::N / 2 * n_warp_id;
 
-        row = row + BlockShape::M * (col / 32);
+        row = row + (BlockShape::M / kNumWriteSplits) * (col / 32);
         col = ((col % 32 / 4) ^ ((sub_row + smem) % 8)) * 4 + laneid % 4;
 
         uint32_t idx = row * 32 + col;
@@ -172,7 +183,7 @@ public:
 
         uint32_t count = (64 / WarpShape::N);
         uint32_t col1 = ((n_warp_id % count * (8 / count) + row_8x8block) ^ ((sub_row + smem) % 8)) * 4 + laneid / 8;
-        uint32_t col2 = (n_warp_id / count) * (BlockShape::M * 64 / 2);
+        uint32_t col2 = (n_warp_id / count) * (BlockShape::M / kNumWriteSplits * 64 / 2);
         uint32_t idx = row * 32 + col1 + col2;
         smem_half2_ptr[idx] = val_half2;
       }

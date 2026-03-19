@@ -33,6 +33,7 @@ private:
   static constexpr bool kHasIndentityActivation = kHasActivation && !kHasGLUActivation;
 
   static constexpr uint32_t kNumMathThreads = PipelineConfig::kNumMathThreads;
+  static constexpr uint32_t kNumWriteSplits = PipelineConfig::kNumWriteSplits;
 
   using scalar_t = typename F16Conversion<ElementC>::scalar_t;
   using scalar_t2 = typename F16Conversion<ElementC>::scalar_t2;
@@ -72,20 +73,20 @@ public:
   }
 
   CUDA_INLINE
-  void write(uint32_t slice_id, uint32_t slice_count) {
+  void write(uint32_t slice_id, uint32_t slice_count, uint32_t split_idx) {
     constexpr bool kHasActivation = EpilogueConfig::kActivationType != ActivationType::NONE;
     if constexpr (kUseTmaC && kIsMoE) {
       write_tma_moe(slice_id, slice_count);
     } else if constexpr (kUseTmaC && !kIsMoE) {
       write_tma(slice_id, slice_count);
     } else {
-      write_legacy(slice_id, slice_count);
+      write_legacy(slice_id, slice_count, split_idx);
     }
   };
 
   CUDA_INLINE
-  void write_legacy(uint32_t slice_id, uint32_t slice_count) {
-    constexpr uint32_t total_write_int4s = BlockShape::M * BlockShape::N * 2 / 16;
+  void write_legacy(uint32_t slice_id, uint32_t slice_count, uint32_t split_idx) {
+    constexpr uint32_t total_write_int4s = BlockShape::M * BlockShape::N * 2 / 16 / kNumWriteSplits;
     constexpr bool is_full_div = total_write_int4s % kNumMathThreads == 0;
     constexpr uint32_t iters = CEIL_DIV(total_write_int4s, kNumMathThreads);
     uint32_t smem = cast_smem_ptr_to_uint(smem_ptr) / 128;
@@ -99,9 +100,10 @@ public:
 
         uint32_t smem_col_swizzled = smem_col ^ ((smem_row + smem) % 8);
         uint32_t smem_offset_swizzled = smem_row * 8 + smem_col_swizzled;
-        uint32_t gmem_row = smem_row % BlockShape::M;
+        uint32_t gmem_row = smem_row % (BlockShape::M / kNumWriteSplits);
+        if constexpr (kNumWriteSplits == 2) gmem_row += BlockShape::M / 2 * split_idx;
         gmem_row = kIsMoE ? moe_row_index[gmem_row] : gmem_row;
-        uint32_t gmem_col = smem_row / BlockShape::M * 8 + smem_col;
+        uint32_t gmem_col = smem_row / (BlockShape::M / kNumWriteSplits) * 8 + smem_col;
         bool pred1 = gmem_row < (kIsMoE ? output_shape_m : block_output_shape_m);
         bool pred2 = PadShape::N == 0 || (col_offset + gmem_col * 8 < ProblemShape::N - PadShape::N);
 

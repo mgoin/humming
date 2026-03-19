@@ -28,6 +28,7 @@ class PipelineConfig(BaseHummingConfig):
     use_tma_bs: bool | None = None
     use_tma_bzp: bool | None = None
     use_tma_bias: bool | None = None
+    num_write_splits: int = 1
 
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
         "num_threads",

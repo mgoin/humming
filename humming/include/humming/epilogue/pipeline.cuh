@@ -19,6 +19,7 @@ private:
   using SmemWriter = EpilogueSmemWriter<MmaOpClass, ArithClass, BlockShape, WarpShape, ElementA, ElementC, PipelineConfig, QuantParamConfig>;
   using GmemWriter = EpilogueGmemWriter<ArithClass, ProblemShape, BlockShape, PadShape, ElementC, SchedulerConfig, PipelineConfig, EpilogueConfig, MoEConfig>;
   using OutputPtrType = std::conditional_t<PipelineConfig::kUseTmaC, const void *, void *>;
+  static constexpr uint32_t kNumWriteSplits = PipelineConfig::kNumWriteSplits;
 
 public:
   SmemReducer smem_reducer;
@@ -44,11 +45,21 @@ public:
   CUDA_INLINE
   void call(uint32_t *regs_c_ptr) {
     if constexpr (BlockShape::K > WarpShape::K) smem_reducer.reduce(regs_c_ptr);
-    smem_writer.write(regs_c_ptr, slice_count);
-    sync_math_threads();
+    static_assert(kNumWriteSplits == 1 || kNumWriteSplits == 2);
+    if constexpr (kNumWriteSplits > 1) {
+      static_assert(BlockShape::M == WarpShape::M);
+      static_assert(BlockShape::M % 32 == 0);
+      static_assert(!PipelineConfig::kUseTmaC);
+    }
+
     if (slice_count > 1) acquire_gmem_barrier();
-    gmem_writer.write(slice_id, slice_count);
-    sync_math_threads();
+    PRAGMA_UNROLL
+    for (uint32_t i = 0; i < kNumWriteSplits; i++) {
+      smem_writer.write(regs_c_ptr, slice_count, i);
+      sync_math_threads();
+      gmem_writer.write(slice_id, slice_count, i);
+      sync_math_threads();
+    }
     if (slice_count > 1) release_gmem_barrier();
   }
 
