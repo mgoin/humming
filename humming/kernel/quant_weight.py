@@ -35,7 +35,7 @@ class QuantWeightKernel(KernelRuntime):
     has_zero_point: bool = False
     is_fp_zero_point: bool = False
 
-    def __post_init__(self):
+    def init_kernel(self):
         self.code = CODE_TEMPLATE.render(
             source_dtype=self.source_dtype.to_cpp_str(),
             target_dtype=self.target_dtype.to_cpp_str(),

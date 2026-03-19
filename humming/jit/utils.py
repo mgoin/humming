@@ -99,7 +99,7 @@ def get_humming_tmp_dir() -> str:
     tmp_dir = os.getenv("HUMMING_TMP_DIR")
     if tmp_dir is not None:
         return tmp_dir
-    dirname = os.path.join(os.path.expanduser("~"), ".humming/tmp/module/")
+    dirname = os.path.join(os.path.expanduser("~"), ".humming/tmp/")
     Path(dirname).mkdir(exist_ok=True, parents=True)
     return dirname
 

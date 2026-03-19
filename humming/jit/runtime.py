@@ -31,11 +31,19 @@ class KernelRuntime:
             cls._instances[signature] = instance
             instance.inited = False
             instance.cubin_loaded = False
-            instance.init_sm_version()
-            instance.__init__(*args, **kwargs)
-            instance.__post_init__()
-            instance.inited = True
         return cls._instances[signature]
+
+    def __post_init__(self):
+        if self.inited:
+            return
+        self.init_sm_version()
+        self.init_kernel()
+        self.inited = True
+        if hasattr(self, "_vars"):
+            for key, value in self._vars.items():
+                setattr(self, key, value)
+        else:
+            self._vars = vars(self)
 
     def init_sm_version(self):
         device_props = torch.cuda.get_device_properties()

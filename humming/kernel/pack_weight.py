@@ -20,7 +20,7 @@ class PackWeightKernel(KernelRuntime):
     name: ClassVar[str] = "pack_weight"
     num_bits: int
 
-    def __post_init__(self):
+    def init_kernel(self):
         self.code = CODE_TEMPLATE.render(num_bits=self.num_bits)
         self.arg_types = (ctypes.c_void_p, ctypes.c_void_p)
         self.prepare()

@@ -36,7 +36,7 @@ def get_default_f16_torch_dtype() -> torch.dtype:
     return torch_dtype
 
 
-@dataclasses.dataclass(kw_only=True)
+@dataclasses.dataclass(kw_only=True, unsafe_hash=True)
 class HummingLayerMeta:
     a_dtype: dtypes.DataType
     b_dtype: dtypes.DataType
@@ -148,6 +148,8 @@ class HummingModule(torch.nn.Module):
 
 
 class HummingMethod:
+    completed_layer_configs: set[tuple[HummingLayerMeta, tuple[str, ...]]] = set()
+
     @classmethod
     def may_set_param(cls, layer: torch.nn.Module, name: str, tensor: torch.Tensor | None):
         if tensor is None:
@@ -375,29 +377,32 @@ class HummingMethod:
         use_f16_accum: bool = False,
         sublayer_name: str = "",
     ):
-        from humming.tune import get_heuristics_class
+        from humming.tune import get_heuristics_config
 
         assert isinstance(layer.humming_metas, dict)
         meta = layer.humming_metas[sublayer_name]
-        heuristics_cls = get_heuristics_class()
-        configs = heuristics_cls.get_configs(meta, use_stream_k, use_f16_accum)
-        kernel_config_str_list = set([json.dumps(x[-1]) for x in configs])
+        configs = get_heuristics_config(meta, use_stream_k, use_f16_accum)
+        kernel_config_str_list = tuple(set([json.dumps(x[-1]) for x in configs]))
 
-        def build_kernel(config_str):
-            config = json.loads(config_str)
-            config.pop("num_sms", 0)
-            return cls.prepare_kernel(layer, sublayer_name=sublayer_name, **config)
+        if (meta, kernel_config_str_list) not in cls.completed_layer_configs:
 
-        if os.environ.get("HUMMING_DISABLE_PARALLEL_BUILD", "0") != "1":
-            # Parallelize kernel compilation using multiple threads,
-            # but ensure loading occurs in the main thread to prevent CUDA context issues.
-            # (KernelRuntime would skip loading when running in child thread).
-            executor = ThreadPoolExecutor(max_workers=8)
-            for kernel in executor.map(build_kernel, kernel_config_str_list):
-                kernel.load_cubin()
-            executor.shutdown(wait=False)
-        else:
-            list(build_kernel(x) for x in kernel_config_str_list)
+            def build_kernel(config_str):
+                config = json.loads(config_str)
+                config.pop("num_sms", 0)
+                return cls.prepare_kernel(layer, sublayer_name=sublayer_name, **config)
+
+            if os.environ.get("HUMMING_DISABLE_PARALLEL_BUILD", "0") != "1":
+                # Parallelize kernel compilation using multiple threads,
+                # but ensure loading occurs in the main thread to prevent CUDA context issues.
+                # (KernelRuntime would skip loading when running in child thread).
+                executor = ThreadPoolExecutor(max_workers=16)
+                for kernel in executor.map(build_kernel, kernel_config_str_list):
+                    kernel.load_cubin()
+                executor.shutdown(wait=False)
+            else:
+                list(build_kernel(x) for x in kernel_config_str_list)
+
+            cls.completed_layer_configs.add((meta, kernel_config_str_list))
 
         for min_shape_m, max_shape_m, kernel_config in configs:
             cls.add_kernel_config(

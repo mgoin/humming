@@ -146,7 +146,7 @@ class HummingKernel(
     c_dtype: dtypes.DataType
     bs_dtype: dtypes.DataType
 
-    def __post_init__(self) -> None:
+    def init_kernel(self) -> None:
         for key in ["a_dtype", "b_dtype", "c_dtype", "bs_dtype"]:
             dtype = getattr(self, key)
             if isinstance(dtype, str):

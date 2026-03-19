@@ -19,7 +19,7 @@ auto ptr = reinterpret_cast<void*>(&dequant_unpacked_fp_type);
 class DequantKernel(KernelRuntime):
     name: ClassVar[str] = "dequant_unpacked_fp_type"
 
-    def __post_init__(self):
+    def init_kernel(self):
         self.code = CODE_TEMPLATE
         self.arg_types = (
             ctypes.c_void_p,

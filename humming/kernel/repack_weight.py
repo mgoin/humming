@@ -33,7 +33,7 @@ class RepackWeightKernel(KernelRuntime):
     should_preprocess_with_zp: bool = False
     group_size_zp: int = 0
 
-    def __post_init__(self):
+    def init_kernel(self):
         if self.should_preprocess_with_zp:
             assert self.should_preprocess_for_int2fp
 

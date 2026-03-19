@@ -1,5 +1,8 @@
+import functools
+
 import torch
 
+from humming.layer import HummingLayerMeta
 from humming.tune.base import DeviceHeuristics
 from humming.tune.sm8x import Sm80Heuristics, Sm86Heuristics, Sm87Heuristics, Sm89Heuristics
 from humming.tune.sm75 import Sm75Heuristics
@@ -24,3 +27,9 @@ def get_heuristics_class(
     assert isinstance(sm_version, int)
 
     return heuristics_map[sm_version]
+
+
+@functools.lru_cache(maxsize=1024)
+def get_heuristics_config(meta: HummingLayerMeta, use_stream_k: bool, use_f16_accum: bool):
+    heuristics_cls = get_heuristics_class()
+    return heuristics_cls.get_configs(meta, use_stream_k, use_f16_accum)

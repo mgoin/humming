@@ -38,24 +38,25 @@ class DeviceHeuristics:
         block_shape_k = num_warps_k * warp_shape_k
         while meta.shape_k % block_shape_k:
             block_shape_k = block_shape_k // 2
-            assert block_shape_k % block_shape_k == 0
+            assert block_shape_k % warp_shape_k == 0
 
         block_shape = (block_shape_m, block_shape_n, block_shape_k)
         while block_shape_k > warp_shape_k:
             smem_size = estimate_smem_size_layer(meta, block_shape, num_stages)
             smem_size = smem_size * max_num_ctas_per_sm
-            if smem_size <= cls.max_smem_size:
+            if smem_size * max_num_ctas_per_sm <= cls.max_smem_size:
                 break
             block_shape_k = block_shape_k // 2
             block_shape = (block_shape_m, block_shape_n, block_shape_k)
 
         block_shape = (block_shape_m, block_shape_n, block_shape_k)
-        smem_size = estimate_smem_size_layer(meta, block_shape, num_stages) * max_num_ctas_per_sm
-        if smem_size > cls.max_smem_size:
+        smem_size = estimate_smem_size_layer(meta, block_shape, num_stages)
+        if smem_size * max_num_ctas_per_sm > cls.max_smem_size:
             assert max_num_ctas_per_sm > 1
             return cls.get_block_shape_k_and_num_ctas_per_sm(
                 meta=meta,
                 max_num_ctas_per_sm=max_num_ctas_per_sm - 1,
+                num_warps_m=num_warps_m,
                 num_warps_n=num_warps_n,
                 warp_shape_k=warp_shape_k,
                 block_shape_m=block_shape_m,
@@ -69,7 +70,7 @@ class DeviceHeuristics:
     def get_special_config_b8_g128(
         cls,
         meta: HummingLayerMeta,
-        block_shape: int,
+        block_shape: tuple[int, int, int],
         num_ctas_per_sm: int,
         use_stream_k: bool,
     ):
@@ -153,7 +154,7 @@ class DeviceHeuristics:
             warp_shape_n = 32
             block_shape_n = min(block_shape_n, 128)
 
-        # 3. init num_ctas_per_sm, reduce num_ctas_per_sm and block_shape_n / warp_shape_n 
+        # 3. init num_ctas_per_sm, reduce num_ctas_per_sm and block_shape_n / warp_shape_n
         #    for small m (to avoid too many ctas processing the same mn_block)
         num_blocks_n = meta.shape_n // block_shape_n
         num_blocks_m = cls.estimate_num_blocks_m(meta, shape_m, block_shape_m)
@@ -224,16 +225,19 @@ class DeviceHeuristics:
 
         # 7. increase warp_shape_k and num_stages if shared memory is enough
         block_shape = (block_shape_m, block_shape_n, block_shape_k)
-        if warp_shape_k == 512 // meta.a_dtype.num_bits:
+        if warp_shape_k == 512 // meta.a_dtype.num_bits and meta.shape_k % (block_shape_k * 2) == 0:
             block_shape_new = (block_shape_m, block_shape_n, block_shape_k * 2)
-            smem_size = estimate_smem_size_layer(meta, block_shape, num_stages)
-            if smem_size < cls.max_smem_size:
+            smem_size = estimate_smem_size_layer(meta, block_shape_new, num_stages)
+            if smem_size * num_ctas_per_sm < cls.max_smem_size:
                 block_shape_k = block_shape_k * 2
                 warp_shape_k = warp_shape_k * 2
-                block_shape = block_shape_new            
+                block_shape = block_shape_new
         smem_size = estimate_smem_size_layer(meta, block_shape, num_stages + 1)
-        if smem_size < cls.max_smem_size:
+        if smem_size * num_ctas_per_mn_block < cls.max_smem_size:
             num_stages = num_stages + 1
+
+        smem_size = estimate_smem_size_layer(meta, block_shape, num_stages)
+        assert smem_size * num_ctas_per_sm <= cls.max_smem_size, f"{block_shape} {num_stages}"
 
         return {
             "block_shape": (block_shape_m, block_shape_n, block_shape_k),
@@ -294,12 +298,7 @@ class DeviceHeuristics:
         return torch.cuda.get_device_properties().multi_processor_count
 
     @classmethod
-    def get_configs(
-        cls,
-        meta: HummingLayerMeta,
-        use_stream_k: bool,
-        use_f16_accum: bool,
-    ):
+    def get_configs(cls, meta: HummingLayerMeta, use_stream_k: bool, use_f16_accum: bool):
         last_shape_m = 0
         configs: list[list[int | dict]] = []
         last_config_str: str = ""
