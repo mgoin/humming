@@ -1,4 +1,3 @@
-
 import argparse
 
 import torch
@@ -38,6 +37,8 @@ def get_triton_moe_config(
         dtype = None
 
     configs = get_moe_configs(num_experts, shape_n, dtype)
+    if configs is None:
+        configs = get_moe_configs(num_experts, shape_n, dtype, 128, 128)
     if configs is not None:
         config = configs[min(configs.keys(), key=lambda x: abs(x - shape_m))]
         return config
@@ -128,15 +129,15 @@ def bench_triton_moe(
         memory_size = inputs.nbytes + outputs.nbytes
         if input_scale is not None:
             memory_size += input_scale.nbytes
-        memory_size += weight.nbytes
+        memory_size += weight.nbytes // num_experts * len(set(expert_ids.tolist()))
         if weight_scale is not None:
-            memory_size += weight_scale.nbytes
+            memory_size += weight_scale.nbytes // num_experts * len(set(expert_ids.tolist()))
 
         res = {
             "shape_m": shape_m,
             "time": t,
             "memory_gb_s": memory_size / t / 1e6,
-            "tops": shape_m * shape_n * shape_k * (top_k) * 2 / t / 1e9,
+            "tops": shape_m * shape_n * shape_k * top_k * 2 / t / 1e9,
         }
         benchmark_result.append(res)
 

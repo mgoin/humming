@@ -121,7 +121,7 @@ class HummingLayerMeta:
             assert self.top_k > 0
         if self.mma_type is None:
             sm_version = torch.cuda.get_device_capability()[0]
-            self.mma_type = "wgmma" if sm_version == (9, 0) else "mma"
+            self.mma_type = "wgmma" if sm_version == 9 else "mma"
 
         if self.mma_type is None:
             self.has_global_scale = 1

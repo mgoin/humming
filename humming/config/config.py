@@ -57,7 +57,7 @@ class PipelineConfig(BaseHummingConfig):
         config.num_math_threads = math.prod(block_shape) // math.prod(warp_shape) * 32
 
         if config.use_warp_spec is None:
-            config.use_warp_spec = raw_config["sm_version"] >= 90
+            config.use_warp_spec = False
 
         if config.use_warp_spec:
             config.num_load_threads = 128
@@ -67,7 +67,7 @@ class PipelineConfig(BaseHummingConfig):
             config.num_threads = config.num_math_threads
 
         if config.use_tma is None:
-            config.use_tma = raw_config["sm_version"] >= 90
+            config.use_tma = False
 
         for name in dir(config):
             if not name.startswith("use_tma_"):
@@ -78,7 +78,7 @@ class PipelineConfig(BaseHummingConfig):
                 setattr(config, name, config.use_tma)
 
         if config.use_mbarrier is None:
-            config.use_mbarrier = config.use_warp_spec or config.use_tma
+            config.use_mbarrier = False
 
         if config.use_cp_async is None:
             config.use_cp_async = raw_config["sm_version"] >= 80
@@ -147,7 +147,7 @@ class MoEConfig(BaseHummingConfig):
 
 @dataclasses.dataclass
 class MmaConfig(BaseHummingConfig):
-    mma_type: MmaType | None = None
+    mma_type: MmaType | None | str = None
     use_f16_accum: bool = False
 
     @classmethod
@@ -160,5 +160,9 @@ class MmaConfig(BaseHummingConfig):
                 config.mma_type = MmaType.WGMMA
             elif raw_config["sm_version"] >= 75:
                 config.mma_type = MmaType.MMA
+        elif config.mma_type == "mma":
+            config.mma_type = MmaType.MMA
+        elif config.mma_type == "wgmma":
+            config.mma_type = MmaType.WGMMA
 
         return config

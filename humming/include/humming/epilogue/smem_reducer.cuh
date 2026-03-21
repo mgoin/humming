@@ -28,7 +28,7 @@ public:
   CUDA_INLINE
   void reduce(uint32_t *regs_ptr) {
     constexpr uint32_t num_int4s = sizeof(CRegistersArrayType) / 16;
-    constexpr uint32_t num_int4s_per_time = num_int4s / (WarpShape::M / 16);
+    constexpr uint32_t num_int4s_per_time = num_int4s / MAX(WarpShape::M / 16, 1);
     constexpr uint32_t group_num_warps = BlockShape::K / WarpShape::K;
     constexpr uint32_t num_groups = kNumThreads / 32 / group_num_warps;
     uint32_t group_id = threadIdx.x / 32 % num_groups;

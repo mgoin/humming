@@ -6,13 +6,15 @@ from humming.layer import HummingLayerMeta
 from humming.tune.base import DeviceHeuristics
 from humming.tune.sm8x import Sm80Heuristics, Sm86Heuristics, Sm87Heuristics, Sm89Heuristics
 from humming.tune.sm75 import Sm75Heuristics
+from humming.tune.sm90 import Sm90Heuristics
 
 heuristics_map: dict[int, type[DeviceHeuristics]] = {
+    75: Sm75Heuristics,
     80: Sm80Heuristics,
     86: Sm86Heuristics,
     87: Sm87Heuristics,
     89: Sm89Heuristics,
-    75: Sm75Heuristics,
+    90: Sm90Heuristics,
 }
 
 

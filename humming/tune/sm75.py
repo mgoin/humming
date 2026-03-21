@@ -14,6 +14,7 @@ class Sm75Heuristics(DeviceHeuristics):
         a_dtype: dtypes.DataType,
         b_dtype: dtypes.DataType,
         group_size: int,
+        use_f16_accum: bool,
         is_moe: bool,
     ):
         if a_dtype.num_bits == 16:

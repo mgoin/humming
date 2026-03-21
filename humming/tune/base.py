@@ -16,100 +16,13 @@ class DeviceHeuristics:
     sm_version: int = 0
 
     @classmethod
-    def get_block_shape_k_and_num_ctas_per_sm(
-        cls,
-        meta: HummingLayerMeta,
-        max_num_ctas_per_sm: int,
-        num_warps_m: int,
-        num_warps_n: int,
-        warp_shape_k: int,
-        block_shape_m: int,
-        block_shape_n: int,
-        num_stages: int,
-    ):
-        assert max_num_ctas_per_sm in [1, 2]
-        max_num_warps = 8
-        while max_num_ctas_per_sm * num_warps_n * num_warps_m > max_num_warps:
-            max_num_ctas_per_sm -= 1
-
-        assert max_num_ctas_per_sm > 0
-
-        num_warps_k = max_num_warps // max_num_ctas_per_sm // num_warps_n // num_warps_m
-        block_shape_k = num_warps_k * warp_shape_k
-        while meta.shape_k % block_shape_k:
-            block_shape_k = block_shape_k // 2
-            assert block_shape_k % warp_shape_k == 0
-
-        block_shape = (block_shape_m, block_shape_n, block_shape_k)
-        while block_shape_k > warp_shape_k:
-            smem_size = estimate_smem_size_layer(meta, block_shape, num_stages)
-            smem_size = smem_size * max_num_ctas_per_sm
-            if smem_size * max_num_ctas_per_sm <= cls.max_smem_size:
-                break
-            block_shape_k = block_shape_k // 2
-            block_shape = (block_shape_m, block_shape_n, block_shape_k)
-
-        block_shape = (block_shape_m, block_shape_n, block_shape_k)
-        smem_size = estimate_smem_size_layer(meta, block_shape, num_stages)
-        if smem_size * max_num_ctas_per_sm > cls.max_smem_size:
-            assert max_num_ctas_per_sm > 1
-            return cls.get_block_shape_k_and_num_ctas_per_sm(
-                meta=meta,
-                max_num_ctas_per_sm=max_num_ctas_per_sm - 1,
-                num_warps_m=num_warps_m,
-                num_warps_n=num_warps_n,
-                warp_shape_k=warp_shape_k,
-                block_shape_m=block_shape_m,
-                block_shape_n=block_shape_n,
-                num_stages=num_stages,
-            )
-
-        return block_shape_k, max_num_ctas_per_sm
-
-    @classmethod
-    def get_special_config_b8_g128(
-        cls,
-        meta: HummingLayerMeta,
-        block_shape: tuple[int, int, int],
-        num_ctas_per_sm: int,
-        use_stream_k: bool,
-    ):
-        num_stages = 2 if cls.sm_version < 80 else 3
-        group_size = min(
-            meta.input_scale_group_size or 1024,
-            meta.weight_scale_group_size or 1024,
-        )
-        if meta.a_dtype.num_bits != 8 or group_size != 128:
-            return None
-
-        if meta.shape_n % 256 != 0:
-            return None
-
-        if block_shape[1] != 128 or num_ctas_per_sm != 2:
-            return None
-
-        new_block_shape = (block_shape[0], 256, 128)
-        smem_size = estimate_smem_size_layer(meta, new_block_shape, num_stages)
-        if smem_size > cls.max_smem_size:
-            return None
-
-        return {
-            "block_shape": (block_shape[0], 256, 128),
-            "warp_shape": (block_shape[0], 32, 128),
-            "use_stream_k": use_stream_k,
-            "use_f16_accum": False,
-            "num_sms": cls.get_num_sms(),
-            "num_stages": num_stages,
-            "num_ctas_per_sm": 1,
-        }
-
-    @classmethod
     def get_base_config(
         cls,
         a_dtype: dtypes.DataType,
         b_dtype: dtypes.DataType,
-        use_f16_accum: bool,
         group_size: int,
+        use_f16_accum: bool,
+        is_moe: bool,
     ):
         raise NotImplementedError
 
@@ -121,18 +34,10 @@ class DeviceHeuristics:
         use_stream_k: bool,
         use_f16_accum: bool,
     ):
-        if meta.a_dtype.num_bits == 16:
-            assert meta.a_dtype in cls.b16_allowed_dtypes
-        elif meta.a_dtype.num_bits == 8:
-            assert meta.a_dtype in cls.b8_allowed_dtypes
-        elif meta.a_dtype.num_bits == 4:
-            assert meta.a_dtype in cls.b4_allowed_dtypes
-        else:
-            raise AssertionError(f"unsupported a_dtype {meta.a_dtype} on sm{cls.sm_version}")
-
         # 1. base config
         group_size = meta.input_scale_group_size or meta.weight_scale_group_size
-        config = cls.get_base_config(meta.a_dtype, meta.b_dtype, use_f16_accum, group_size)
+        is_moe = meta.num_experts is not None
+        config = cls.get_base_config(meta.a_dtype, meta.b_dtype, group_size, use_f16_accum, is_moe)
         block_shape_m, block_shape_n, block_shape_k = config["block_shape"]
         warp_shape_m, warp_shape_n, warp_shape_k = config["warp_shape"]
         num_ctas_per_sm = config.get("num_ctas_per_sm", 1)
@@ -143,6 +48,8 @@ class DeviceHeuristics:
         # 2. block_shape_m and warp_shape_m
         if meta.num_experts is not None:
             shape_m = int(meta.top_k * shape_m / meta.num_experts / 0.9)
+            shape_m = max(shape_m, 1)
+
         if shape_m <= block_shape_m:
             block_shape_m = math.ceil(shape_m / 16) * 16
         else:
@@ -235,20 +142,6 @@ class DeviceHeuristics:
         }
 
     @classmethod
-    def get_max_block_shape_nk(cls, meta: HummingLayerMeta):
-        max_block_shape_n = 256
-        while meta.shape_n % max_block_shape_n != 0:
-            max_block_shape_n = max_block_shape_n // 2
-        assert max_block_shape_n >= 64
-
-        max_block_shape_k = 256
-        if meta.shape_k % max_block_shape_k != 0:
-            max_block_shape_k = max_block_shape_k // 2
-        assert meta.shape_k % max_block_shape_k == 0
-
-        return max_block_shape_n, max_block_shape_k
-
-    @classmethod
     def estimate_num_blocks_m(cls, meta: HummingLayerMeta, shape_m: int, block_shape_m: int):
         if meta.num_experts is None:
             estimated_num_blocks_m = math.ceil(shape_m / block_shape_m)
@@ -260,29 +153,20 @@ class DeviceHeuristics:
         return estimated_num_blocks_m
 
     @classmethod
-    def get_block_shape_m(
-        cls,
-        max_block_shape_m: int,
-        shape_m: int,
-        num_experts: int | None = None,
-        top_k: int = 0,
-    ):
-        if num_experts is not None:
-            shape_m = int(top_k * shape_m / num_experts / 0.9)
-        if shape_m <= max_block_shape_m:
-            block_shape_m = math.ceil(shape_m / 16) * 16
-        else:
-            blocks = [math.ceil(shape_m / ((i + 1) * 16)) for i in range(max_block_shape_m // 16)]
-            block_shape_m = np.argmin(blocks).item() * 16 + 16
-
-        return block_shape_m
-
-    @classmethod
     def get_num_sms(cls):
         return torch.cuda.get_device_properties().multi_processor_count
 
     @classmethod
     def get_configs(cls, meta: HummingLayerMeta, use_stream_k: bool, use_f16_accum: bool):
+        if meta.a_dtype.num_bits == 16:
+            assert meta.a_dtype in cls.b16_allowed_dtypes
+        elif meta.a_dtype.num_bits == 8:
+            assert meta.a_dtype in cls.b8_allowed_dtypes
+        elif meta.a_dtype.num_bits == 4:
+            assert meta.a_dtype in cls.b4_allowed_dtypes
+        else:
+            raise AssertionError(f"unsupported a_dtype {meta.a_dtype} on sm{cls.sm_version}")
+
         last_shape_m = 0
         configs: list[list[int | dict]] = []
         last_config_str: str = ""

@@ -1,0 +1,120 @@
+import math
+
+import numpy as np
+
+from humming import dtypes
+from humming.layer import HummingLayerMeta
+from humming.tune.base import DeviceHeuristics
+from humming.utils.smem import estimate_smem_size_layer
+
+
+class Sm90Heuristics(DeviceHeuristics):
+    max_smem_size: int = 227 * 1024
+    b16_allowed_dtypes: list[dtypes.DataType] = [dtypes.float16, dtypes.bfloat16]
+    b8_allowed_dtypes: list[dtypes.DataType] = [dtypes.int8, dtypes.float8e4m3, dtypes.float8e5m2]
+    b4_allowed_dtypes: list[dtypes.DataType] = []
+    sm_version: int = 90
+
+    @classmethod
+    def get_base_config(
+        cls,
+        a_dtype: dtypes.DataType,
+        b_dtype: dtypes.DataType,
+        group_size: int,
+        use_f16_accum: bool,
+        is_moe: bool,
+    ):
+        if a_dtype.num_bits == 16 or group_size == 0:
+            return {
+                "block_shape": (64, 256, 512 // a_dtype.num_bits),
+                "warp_shape": (64, 64, 512 // a_dtype.num_bits),
+                "num_ctas_per_sm": 3 if use_f16_accum else 2,
+            }
+        elif group_size >= 128:
+            return {
+                "block_shape": (64, 128, 1024 // a_dtype.num_bits),
+                "warp_shape": (64, 32, 1024 // a_dtype.num_bits),
+                "num_ctas_per_sm": 3 if use_f16_accum else 2,
+            }
+        else:
+            return {
+                "block_shape": (64, 256, 512 // a_dtype.num_bits),
+                "warp_shape": (64, 32, 512 // a_dtype.num_bits),
+                "num_ctas_per_sm": 2,
+            }
+
+    @classmethod
+    def get_config(
+        cls,
+        meta: HummingLayerMeta,
+        shape_m: int,
+        use_stream_k: bool,
+        use_f16_accum: bool,
+    ):
+        # 1. base config
+        group_size = meta.input_scale_group_size or meta.weight_scale_group_size
+        is_moe = meta.num_experts is not None
+        config = cls.get_base_config(meta.a_dtype, meta.b_dtype, group_size, use_f16_accum, is_moe)
+        block_shape_m, block_shape_n, block_shape_k = config["block_shape"]
+        num_ctas_per_sm = config.get("num_ctas_per_sm", 1)
+        warp_shape_m, warp_shape_n, warp_shape_k = config["warp_shape_n"]
+        num_stages = 3
+        assert meta.shape_n % block_shape_n == 0
+
+        # 2. block_shape_m and warp_shape_m
+        if meta.num_experts is not None:
+            shape_m = int(meta.top_k * shape_m / meta.num_experts / 0.9)
+            shape_m = max(shape_m, 1)
+
+        if shape_m <= block_shape_m:
+            block_shape_m = math.ceil(shape_m / 16) * 16
+        else:
+            blocks = [math.ceil(shape_m / ((i + 1) * 16)) for i in range(block_shape_m // 16)]
+            block_shape_m = np.argmin(blocks).item() * 16 + 16
+
+        num_blocks_n = meta.shape_n // block_shape_n
+        num_blocks_m = cls.estimate_num_blocks_m(meta, shape_m, block_shape_m)
+
+        num_sms = cls.get_num_sms()
+        while num_blocks_n * num_blocks_m * 2 < num_sms * num_ctas_per_sm:
+            if meta.a_dtype.num_bits != 16 and warp_shape_n == 64:
+                warp_shape_n = warp_shape_n // 2
+                block_shape_n = block_shape_n // 2
+                num_blocks_n = num_blocks_n * 2
+                if num_ctas_per_sm == 2:
+                    num_ctas_per_sm = 3
+                continue
+            elif num_ctas_per_sm > 1:
+                num_ctas_per_sm = num_ctas_per_sm - 1
+                continue
+            else:
+                break
+
+        num_warps_m = block_shape_m // warp_shape_m
+        num_warps_n = block_shape_n // warp_shape_n
+        num_warps_k = block_shape_k // warp_shape_k
+        num_warps = num_warps_m * num_warps_n * num_warps_k * num_ctas_per_sm
+
+        if num_warps == 4:
+            warp_shape_k = 512 // meta.a_dtype.num_bits
+            block_shape_k = warp_shape_k * 2
+
+        max_num_stages = 5
+        for num_stages_new in range(num_stages + 1, max_num_stages + 1):
+            block_shape = (block_shape_m, block_shape_n, block_shape_k)
+            smem_size = estimate_smem_size_layer(meta, block_shape, num_stages_new)
+            if smem_size * num_ctas_per_sm < cls.max_smem_size:
+                num_stages = num_stages_new
+
+        if num_ctas_per_sm == 1:
+            num_sms = min(num_sms, math.ceil(num_blocks_n * num_blocks_m * 4.5))
+
+        return {
+            "block_shape": (block_shape_m, block_shape_n, block_shape_k),
+            "warp_shape": (warp_shape_m, warp_shape_n, warp_shape_k),
+            "use_stream_k": use_stream_k,
+            "use_f16_accum": use_f16_accum,
+            "num_sms": min(num_blocks_m * num_blocks_n * 4, num_sms),
+            "num_stages": num_stages,
+            "num_ctas_per_sm": num_ctas_per_sm,
+        }

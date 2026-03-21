@@ -12,7 +12,6 @@ def bench_cutlass_w8a8(
     dtype: str,
     shape_m_list: list[int] | None = None,
 ) -> list[dict[str, int | float]]:
-    
     assert dtype in ["int8", "float8e4m3"]
 
     torch_dtype = torch.int8 if dtype == "int8" else torch.float8_e4m3fn
