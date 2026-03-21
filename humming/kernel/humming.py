@@ -25,7 +25,7 @@ CODE_TEMPLATE = jinja2.Template("""
 #else
 #include <humming/kernel/humming.cuh>
 #endif
-                                
+
 {{custom_activation_func}}
 
 class MmaOpClass {

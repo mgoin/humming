@@ -3,6 +3,7 @@ from humming.kernel.humming import HummingKernel
 from humming.kernel.pack_weight import PackWeightKernel
 from humming.kernel.quant_weight import QuantWeightKernel
 from humming.kernel.repack_weight import RepackWeightKernel
+from humming.kernel.tops_bench import TopsBenchKernel
 from humming.kernel.unpack_weight import UnpackWeightKernel
 
 __all__ = [
@@ -11,5 +12,6 @@ __all__ = [
     "PackWeightKernel",
     "QuantWeightKernel",
     "RepackWeightKernel",
+    "TopsBenchKernel",
     "UnpackWeightKernel",
 ]

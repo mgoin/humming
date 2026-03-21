@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from humming.ops.bench import tops_bench  # noqa
 from humming.ops.input import quant_input
 from humming.ops.utils import init_humming_launcher, register_op
 from humming.ops.weight import (
