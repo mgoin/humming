@@ -9,6 +9,7 @@ from typing import Any, Callable
 import torch
 
 from humming import dtypes, ops
+from humming.config.enum import ActivationType, MmaType
 from humming.jit.utils import make_humming_module
 from humming.kernel.humming import HummingKernel
 from humming.schema import (
@@ -56,10 +57,12 @@ class HummingLayerMeta:
     has_bias: bool = False
     has_global_scale: bool = False
     is_fp_zero_point: bool = False
-    mma_type: str | None = None
+    mma_type: MmaType | None = None
     top_k: int = 0
     is_moe: bool = False
     is_moe_down: bool = False
+    activation_type: ActivationType = ActivationType.NONE
+    custom_activation_func_impl: str | None = None
     sublayer_name: str = ""
 
     @property
@@ -97,14 +100,16 @@ class HummingLayerMeta:
 
     @property
     def should_apply_bs_on_c(self):
-        if self.mma_type == "mma":
+        if self.mma_type == MmaType.MMA:
             return self.weight_scale_group_size == 0 or self.a_dtype.num_bits != 16
-        elif self.mma_type == "wgmma":
+        elif self.mma_type == MmaType.WGMMA:
             return self.weight_scale_group_size == 0
         else:
             raise ValueError(f"unsupported mma_type: {self.mma_type}")
 
     def __post_init__(self):
+        if isinstance(self.activation_type, str):
+            self.activation_type = ActivationType(self.activation_type)
         if self.is_fp_zero_point:
             assert self.has_zero_point
         if self.a_dtype.num_bits != 16 and self.has_input_scale is None:
@@ -121,10 +126,9 @@ class HummingLayerMeta:
             assert self.top_k > 0
         if self.mma_type is None:
             sm_version = torch.cuda.get_device_capability()[0]
-            self.mma_type = "wgmma" if sm_version == 9 else "mma"
-
-        if self.mma_type is None:
-            self.has_global_scale = 1
+            self.mma_type = MmaType.WGMMA if sm_version == 9 else MmaType.MMA
+        if isinstance(self.mma_type, str):
+            self.mma_type = MmaType(self.mma_type)
 
         msg = "don't set use_int_weight_scale to True directly"
         assert self.use_int_weight_scale is not True, msg
@@ -171,7 +175,8 @@ class HummingMethod:
         has_bias: bool = False,
         top_k: int = 0,
         is_moe_down: bool = False,
-        has_stack: bool = False,
+        activation_type: ActivationType = ActivationType.NONE,
+        custom_activation_func_impl: str | None = None,
         torch_dtype: torch.dtype | None = None,
         sublayer_name: str = "",
     ):
@@ -544,7 +549,7 @@ class HummingMethod:
 
 
 @dataclasses.dataclass(repr=False, eq=False)
-class HummingLayer(torch.nn.Module):
+class HummingLayer(HummingModule):
     shape_n: int
     shape_k: int
     weight_config: BaseWeightSchema | dict[str, Any]
@@ -556,6 +561,8 @@ class HummingLayer(torch.nn.Module):
     top_k: int = 0
     is_moe_down: bool = False
     torch_dtype: torch.dtype | None = None
+    activation_type: str | None = None
+    custom_activation_func_impl: str | None = None
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -803,6 +810,8 @@ class HummingLayer(torch.nn.Module):
             has_bias=self.has_bias,
             top_k=self.top_k,
             is_moe_down=self.is_moe_down,
+            activation_type=ActivationType(self.activation_type or "none"),
+            custom_activation_func_impl=self.custom_activation_func_impl,
         )
 
         HummingMethod.transform_humming_layer(self)

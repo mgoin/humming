@@ -4,11 +4,26 @@ import torch
 import triton
 import vllm._custom_ops as vllm_ops
 from tqdm import tqdm
+from vllm.model_executor.layers.fused_moe.activation import (
+    MoEActivation,
+    apply_moe_activation,
+)
 from vllm.scalar_type import scalar_types
 
 from humming import dtypes, ops
 from humming.layer import HummingLayer
 from humming.utils.test import generate_random_moe_tensors
+
+
+def random_fill_tensor(tensor: torch.Tensor):
+    if tensor.dtype == torch.int32:
+        min_value = 2**31 * -1
+        max_value = 2**31 - 1
+        tensor.random_(min_value, max_value)
+    elif tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
+        tensor.normal_()
+    else:
+        tensor.copy_(tensor.float().random().to(tensor.dtype))
 
 
 def bench_marlin(
@@ -42,12 +57,8 @@ def bench_marlin(
         is_moe_down=is_moe_down,
     ).to("cuda:0")
 
-    if num_experts is not None:
-        weight = torch.randn((num_experts, shape_n, shape_k), device="cuda:0", dtype=torch.float16)
-    else:
-        weight = torch.randn((shape_n, shape_k), device="cuda:0")
-
-    layer.load_from_unquantized(weight)
+    for tensor in layer.state_dict().values():
+        random_fill_tensor(tensor)
     layer.transform()
 
     workspace = torch.zeros((1024,), dtype=torch.int32, device="cuda:0")
@@ -65,6 +76,7 @@ def bench_marlin(
     else:
         raise ValueError(f"unsupported dtype for marlin: {b_dtype}")
 
+    assert isinstance(layer.weight, torch.Tensor)
     weight = layer.weight.data
     if a_dtype not in ["float16", "bfloat16"] and num_experts is None:
         weight = weight.view(weight.size(1) * 2, -1)
@@ -74,8 +86,10 @@ def bench_marlin(
     default_shape_m_list = [2**i for i in range(15)]
     benchmark_result: list[dict[str, int | float]] = []
     for shape_m in tqdm(shape_m_list or default_shape_m_list):
-        inputs = torch.randn((shape_m, shape_k), dtype=torch_dtype, device="cuda:0")
-        outputs = torch.randn((shape_m * top_k, shape_n), dtype=torch_dtype, device="cuda:0")
+        if num_experts is not None and is_moe_down:
+            inputs = torch.randn((shape_m * top_k, shape_k), dtype=torch_dtype, device="cuda:0")
+        else:
+            inputs = torch.randn((shape_m, shape_k), dtype=torch_dtype, device="cuda:0")
 
         input_scale: torch.Tensor | None = None
         if a_dtype not in ["float16", "bfloat16"]:
@@ -118,7 +132,7 @@ def bench_marlin(
             )
 
         def run_moe():
-            vllm_ops.moe_wna16_marlin_gemm(
+            outputs = vllm_ops.moe_wna16_marlin_gemm(
                 input=inputs,  # noqa
                 output=None,
                 b_qweight=weight,
@@ -146,25 +160,38 @@ def bench_marlin(
                 use_fp32_reduce=True,
                 is_zp_float=False,
             )
+            if is_moe_down:
+                return outputs
+
+            activation_inputs = outputs
+            activation_outputs = torch.empty(
+                (activation_inputs.size(0), activation_inputs.size(1) // 2),
+                device=activation_inputs.device,
+                dtype=activation_inputs.dtype,
+            )
+            apply_moe_activation(MoEActivation.SILU, activation_outputs, activation_inputs)
+            return activation_outputs
 
         run = run_dense if num_experts is None else run_moe
+        outputs = run()
         torch.cuda.synchronize()
         t = triton.testing.do_bench(run, warmup=100, rep=1000)
 
-        memory_size = inputs.nbytes + outputs.nbytes
+        nbytes = inputs.nbytes + outputs.nbytes
         if input_scale is not None:
-            memory_size += input_scale.nbytes
+            nbytes += input_scale.nbytes
         for tensor in layer.state_dict().values():
             if num_experts is None:
-                memory_size += tensor.nbytes
+                nbytes += tensor.nbytes
             else:
-                memory_size += tensor.nbytes // num_experts * len(set(expert_ids.tolist()))
+                num_actived_experts = len(set(expert_ids.tolist()))
+                nbytes += tensor.nbytes // num_experts * num_actived_experts
 
         res = {
             "shape_m": shape_m,
             "time": t,
-            "memory_gb_s": memory_size / t / 1e6,
-            "tops": shape_m * shape_n * shape_k * (top_k or 1) * 2 / t / 1e9,
+            "memory_gbps": nbytes / t / 1e6,
+            "compute_tops": shape_m * shape_n * shape_k * (top_k or 1) * 2 / t / 1e9,
         }
         benchmark_result.append(res)
 

@@ -4,6 +4,10 @@ import torch
 import triton
 import triton.language as tl
 from tqdm import tqdm
+from vllm.model_executor.layers.fused_moe.activation import (
+    MoEActivation,
+    apply_moe_activation,
+)
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     get_default_config,
     get_moe_configs,
@@ -73,6 +77,7 @@ def bench_triton_moe(
     default_shape_m_list = [2**i for i in range(15)]
     benchmark_result: list[dict[str, int | float]] = []
     for shape_m in tqdm(shape_m_list or default_shape_m_list):
+        input_scale: torch.Tensor | None
         if is_moe_down:
             inputs = generate_random_tensor(torch_dtype, (shape_m * top_k, shape_k))
             input_scale = torch.randn((shape_m * top_k,), dtype=torch.float32, device="cuda:0")
@@ -82,7 +87,6 @@ def bench_triton_moe(
 
         if torch_dtype.itemsize == 2:
             input_scale = None
-        outputs = torch.randn((shape_m, top_k, shape_n), dtype=torch.float16, device="cuda:0")
 
         torch.cuda.manual_seed(shape_m)
         config = get_triton_moe_config(
@@ -102,10 +106,15 @@ def bench_triton_moe(
         _, topk_weights, sorted_token_ids, expert_ids, num_tokens_padded = moe_tensors
 
         def run():
-            return invoke_fused_moe_triton_kernel(
+            outputs = torch.randn(
+                (shape_m, top_k, shape_n),  # noqa
+                dtype=torch.float16,
+                device="cuda:0",
+            )
+            invoke_fused_moe_triton_kernel(
                 A=inputs,  # noqa
                 B=weight,
-                C=outputs,  # noqa
+                C=outputs,
                 A_scale=input_scale,  # noqa
                 B_scale=weight_scale,
                 topk_weights=topk_weights,  # noqa
@@ -123,21 +132,35 @@ def bench_triton_moe(
                 per_channel_quant=True,
             )
 
+            if is_moe_down:
+                return outputs
+            activation_inputs = outputs.view(-1, outputs.size(-1))
+            activation_outputs = torch.empty(
+                (activation_inputs.size(0), activation_inputs.size(1) // 2),
+                device=activation_inputs.device,
+                dtype=activation_inputs.dtype,
+            )
+            apply_moe_activation(MoEActivation.SILU, activation_outputs, activation_inputs)
+
+            return activation_outputs
+
         torch.cuda.synchronize()
+        outputs = run()
         t = triton.testing.do_bench(run, warmup=100, rep=1000)
 
-        memory_size = inputs.nbytes + outputs.nbytes
+        num_actived_experts = len(set(expert_ids.tolist()))
+        nbytes = inputs.nbytes + outputs.nbytes
         if input_scale is not None:
-            memory_size += input_scale.nbytes
-        memory_size += weight.nbytes // num_experts * len(set(expert_ids.tolist()))
+            nbytes += input_scale.nbytes
+        nbytes += weight.nbytes // num_experts * num_actived_experts
         if weight_scale is not None:
-            memory_size += weight_scale.nbytes // num_experts * len(set(expert_ids.tolist()))
+            nbytes += weight_scale.nbytes // num_experts * num_actived_experts
 
         res = {
             "shape_m": shape_m,
             "time": t,
-            "memory_gb_s": memory_size / t / 1e6,
-            "tops": shape_m * shape_n * shape_k * top_k * 2 / t / 1e9,
+            "memory_gbps": nbytes / t / 1e6,
+            "compute_tops": shape_m * shape_n * shape_k * top_k * 2 / t / 1e9,
         }
         benchmark_result.append(res)
 

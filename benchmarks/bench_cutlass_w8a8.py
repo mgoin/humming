@@ -25,7 +25,6 @@ def bench_cutlass_w8a8(
         inputs = torch.randint(-120, 120, (shape_m, 8192), dtype=torch.int8, device="cuda:0")
         inputs = inputs.view(torch_dtype)
         input_scale = torch.randn((shape_m,), dtype=torch.float32, device="cuda:0")
-        outputs = torch.randn((shape_m, shape_n), dtype=torch.float16, device="cuda:0")
 
         def run():
             return vllm_ops.cutlass_scaled_mm(
@@ -36,17 +35,18 @@ def bench_cutlass_w8a8(
                 out_dtype=torch.bfloat16,
             )
 
+        outputs = run()
         torch.cuda.synchronize()
         t = triton.testing.do_bench(run, warmup=100, rep=1000)
 
-        memory_size = inputs.nbytes + outputs.nbytes + input_scale.nbytes
-        memory_size += weight.nbytes + weight_scale.nbytes
+        nbytes = inputs.nbytes + outputs.nbytes + input_scale.nbytes
+        nbytes += weight.nbytes + weight_scale.nbytes
 
         res = {
             "shape_m": shape_m,
             "time": t,
-            "memory_gb_s": memory_size / t / 1e6,
-            "tops": shape_m * shape_n * shape_k * 2 / t / 1e9,
+            "memory_gbps": nbytes / t / 1e6,
+            "compute_tops": shape_m * shape_n * shape_k * 2 / t / 1e9,
         }
         benchmark_result.append(res)
 

@@ -9,6 +9,17 @@ from humming.layer import HummingLayer
 from humming.utils.test import generate_random_moe_tensors
 
 
+def random_fill_tensor(tensor: torch.Tensor):
+    if tensor.dtype == torch.int32:
+        min_value = 2**31 * -1
+        max_value = 2**31 - 1
+        tensor.random_(min_value, max_value)
+    elif tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
+        tensor.normal_()
+    else:
+        tensor.copy_(tensor.float().random().to(tensor.dtype))
+
+
 def bench_humming(
     shape_n: int,
     shape_k: int,
@@ -42,21 +53,22 @@ def bench_humming(
         input_config={"dtype": a_dtype, "group_size": input_scale_group_size},
         torch_dtype=torch_dtype,
         is_moe_down=is_moe_down,
+        activation_type=("none" if is_moe_down else "silu"),
     ).to("cuda:0")
 
-    if num_experts is not None:
-        weight = torch.randn((num_experts, shape_n, shape_k), device="cuda:0", dtype=torch.float16)
-    else:
-        weight = torch.randn((shape_n, shape_k), device="cuda:0")
-
-    layer.load_from_unquantized(weight)
+    for tensor in layer.state_dict().values():
+        random_fill_tensor(tensor)
     layer.transform()
     layer.prepare_default_kernel_configs(use_f16_accum=use_f16_accum)
 
     default_shape_m_list = [2**i for i in range(15)]
     benchmark_result: list[dict[str, int | float]] = []
     for shape_m in tqdm(shape_m_list or default_shape_m_list):
-        inputs = torch.randn((shape_m, shape_k), dtype=torch_dtype, device="cuda:0")
+        if num_experts is not None and is_moe_down:
+            inputs = torch.randn((shape_m * top_k, shape_k), dtype=torch_dtype, device="cuda:0")
+        else:
+            inputs = torch.randn((shape_m, shape_k), dtype=torch_dtype, device="cuda:0")
+
         input_scale: torch.Tensor | None = None
         if a_dtype not in ["float16", "bfloat16"]:
             inputs, input_scale = ops.quant_input(inputs, a_dtype, None, input_scale_group_size)
@@ -86,23 +98,26 @@ def bench_humming(
                 num_tokens_padded=num_tokens_padded,  # noqa
             )
 
+        outputs = run()
         torch.cuda.synchronize()
         t = triton.testing.do_bench(run, warmup=100, rep=1000)
 
-        memory_size = inputs.nbytes + run().nbytes
+        nbytes = inputs.nbytes + outputs.nbytes
         if input_scale is not None:
-            memory_size += input_scale.nbytes
+            nbytes += input_scale.nbytes
         for tensor in layer.state_dict().values():
             if num_experts is None:
-                memory_size += tensor.nbytes
+                nbytes += tensor.nbytes
             else:
-                memory_size += tensor.nbytes // num_experts * len(set(expert_ids.tolist()))
+                assert expert_ids is not None
+                num_actived_experts = len(set(expert_ids.tolist()))
+                nbytes += tensor.nbytes // num_experts * num_actived_experts
 
         res = {
             "shape_m": shape_m,
             "time": t,
-            "memory_gb_s": memory_size / t / 1e6,
-            "tops": shape_m * shape_n * shape_k * (top_k or 1) * 2 / t / 1e9,
+            "memory_gbps": nbytes / t / 1e6,
+            "compute_tops": shape_m * shape_n * shape_k * (top_k or 1) * 2 / t / 1e9,
         }
         benchmark_result.append(res)
 
