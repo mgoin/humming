@@ -1,0 +1,231 @@
+
+import argparse
+
+import torch
+import triton
+import vllm._custom_ops as vllm_ops
+from tqdm import tqdm
+from vllm.scalar_type import scalar_types
+
+from humming import dtypes, ops
+from humming.layer import HummingLayer
+from humming.utils.test import generate_random_moe_tensors
+
+
+def bench_marlin(
+    shape_n: int,
+    shape_k: int,
+    a_dtype: str,
+    b_dtype: str,
+    c_dtype: str,
+    bs_dtype: str,
+    weight_scale_group_size: int = 0,
+    num_experts: int | None = None,
+    top_k: int = 0,
+    has_zero_point: bool = False,
+    shape_m_list: list[int] | None = None,
+    is_moe_down: bool = False,
+) -> list[dict[str, int | float]]:
+    torch_dtype = dtypes.torch_dtype_map[dtypes.DataType.from_str(c_dtype)]
+    layer = HummingLayer(
+        shape_n=shape_n,
+        shape_k=shape_k,
+        num_experts=num_experts,
+        top_k=top_k,
+        weight_config={
+            "dtype": b_dtype,
+            "group_size": weight_scale_group_size,
+            "scale_dtype": bs_dtype,
+            "has_zero_point": has_zero_point,
+        },
+        input_config={"dtype": a_dtype},
+        torch_dtype=torch_dtype,
+        is_moe_down=is_moe_down,
+    ).to("cuda:0")
+
+    if num_experts is not None:
+        weight = torch.randn((num_experts, shape_n, shape_k), device="cuda:0", dtype=torch.float16)
+    else:
+        weight = torch.randn((shape_n, shape_k), device="cuda:0")
+
+    layer.load_from_unquantized(weight)
+    layer.transform()
+
+    workspace = torch.zeros((1024,), dtype=torch.int32, device="cuda:0")
+
+    if b_dtype in ["int4", "uint4"] and has_zero_point:
+        vllm_scalar_type = scalar_types.uint4
+    elif b_dtype in ["int4", "uint4"] and not has_zero_point:
+        vllm_scalar_type = scalar_types.uint4b8
+    elif b_dtype in ["int8", "uint8"] and not has_zero_point:
+        vllm_scalar_type = scalar_types.uint8b128
+    elif b_dtype == "float8e4m3":
+        vllm_scalar_type = scalar_types.float8_e4m3fn
+    elif b_dtype == "float4e2m1":
+        vllm_scalar_type = scalar_types.float4_e2m1f
+    else:
+        raise ValueError(f"unsupported dtype for marlin: {b_dtype}")
+
+    weight = layer.weight.data
+    if a_dtype not in ["float16", "bfloat16"] and num_experts is None:
+        weight = weight.view(weight.size(1) * 2, -1)
+    elif a_dtype not in ["float16", "bfloat16"] and num_experts is not None:
+        weight = weight.view(num_experts, weight.size(1) * 2, -1)
+
+    default_shape_m_list = [2**i for i in range(15)]
+    benchmark_result: list[dict[str, int | float]] = []
+    for shape_m in tqdm(shape_m_list or default_shape_m_list):
+        inputs = torch.randn((shape_m, shape_k), dtype=torch_dtype, device="cuda:0")
+        outputs = torch.randn((shape_m * top_k, shape_n), dtype=torch_dtype, device="cuda:0")
+
+        input_scale: torch.Tensor | None = None
+        if a_dtype not in ["float16", "bfloat16"]:
+            inputs, input_scale = ops.quant_input(inputs, a_dtype)
+
+        if num_experts is not None:
+            for block_size_m in [8, 16, 32, 48, 64]:
+                if block_size_m == 8 and a_dtype not in ["float16", "bfloat16"]:
+                    continue
+                if shape_m * top_k / num_experts / block_size_m < 0.9:
+                    break
+
+            torch.cuda.manual_seed(shape_m)
+            moe_tensors = generate_random_moe_tensors(
+                shape_m=shape_m,
+                num_experts=num_experts,
+                top_k=top_k,
+                block_size_config=block_size_m,
+            )
+            _, topk_weights, sorted_token_ids, expert_ids, num_tokens_padded = moe_tensors
+
+        def run_dense():
+            vllm_ops.marlin_gemm(
+                a=inputs,  # noqa
+                c=None,
+                b_q_weight=weight,
+                b_bias=None,
+                b_scales=layer.weight_scale,
+                a_scales=input_scale,  # noqa
+                global_scale=None,
+                b_zeros=getattr(layer, "zero_point", None),
+                g_idx=None,
+                perm=None,
+                workspace=workspace,
+                b_q_type=vllm_scalar_type,
+                size_m=inputs.size(0),  # noqa
+                size_n=shape_n,
+                size_k=shape_k,
+                use_atomic_add=True,
+            )
+
+        def run_moe():
+            vllm_ops.moe_wna16_marlin_gemm(
+                input=inputs,  # noqa
+                output=None,
+                b_qweight=weight,
+                b_bias=None,
+                b_scales=layer.weight_scale,
+                a_scales=input_scale,  # noqa
+                global_scale=None,
+                b_qzeros=getattr(layer, "zero_point", None),
+                g_idx=None,
+                perm=None,
+                workspace=workspace,
+                sorted_token_ids=sorted_token_ids,  # noqa
+                expert_ids=expert_ids,  # noqa
+                num_tokens_past_padded=num_tokens_padded,  # noqa
+                topk_weights=topk_weights,  # noqa
+                mul_topk_weights=is_moe_down,
+                b_q_type=vllm_scalar_type,
+                size_m=inputs.size(0),  # noqa
+                size_n=shape_n,
+                size_k=shape_k,
+                top_k=top_k,
+                moe_block_size=block_size_m,  # noqa
+                is_k_full=True,
+                use_atomic_add=False,
+                use_fp32_reduce=True,
+                is_zp_float=False,
+            )
+
+        run = run_dense if num_experts is None else run_moe
+        torch.cuda.synchronize()
+        t = triton.testing.do_bench(run, warmup=100, rep=1000)
+
+        memory_size = inputs.nbytes + outputs.nbytes
+        if input_scale is not None:
+            memory_size += input_scale.nbytes
+        for tensor in layer.state_dict().values():
+            if num_experts is None:
+                memory_size += tensor.nbytes
+            else:
+                memory_size += tensor.nbytes // num_experts * len(set(expert_ids.tolist()))
+
+        res = {
+            "shape_m": shape_m,
+            "time": t,
+            "memory_gb_s": memory_size / t / 1e6,
+            "tops": shape_m * shape_n * shape_k * (top_k or 1) * 2 / t / 1e9,
+        }
+        benchmark_result.append(res)
+
+    return benchmark_result
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_experts", type=int, default=None)
+    parser.add_argument("--top_k", type=int, default=0)
+    parser.add_argument("--shape_n", type=int, required=True)
+    parser.add_argument("--shape_k", type=int, required=True)
+    activation_dtypes = [
+        "float16",
+        "bfloat16",
+        "float8e4m3",
+        "float8e5m2",
+        "float4e2m1",
+        "int8",
+        "int4",
+    ]
+    scale_dtypes = ["float16", "bfloat16", "float8e4m3", "float8e5m2", "float8e8m0"]
+    f16_dtypes = ["float16", "bfloat16"]
+    parser.add_argument("--a_dtype", type=str, choices=activation_dtypes, required=True)
+    parser.add_argument("--b_dtype", type=str, required=True)
+    parser.add_argument("--bs_dtype", type=str, choices=scale_dtypes, required=True)
+    parser.add_argument("--c_dtype", type=str, choices=f16_dtypes, required=True)
+    parser.add_argument("--weight_scale_group_size", type=int, default=0)
+    parser.add_argument("--zero_point", default=False, action="store_true")
+    parser.add_argument("--is_moe_down", default=False, action="store_true")
+    parser.add_argument("--shape_m_list", type=int, default=None, nargs="+")
+
+    args = parser.parse_args()
+    benchmark_result = bench_marlin(
+        shape_n=args.shape_n,
+        shape_k=args.shape_k,
+        a_dtype=args.a_dtype,
+        b_dtype=args.b_dtype,
+        c_dtype=args.c_dtype,
+        bs_dtype=args.bs_dtype,
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        weight_scale_group_size=args.weight_scale_group_size,
+        has_zero_point=args.zero_point,
+        shape_m_list=args.shape_m_list,
+        is_moe_down=args.is_moe_down,
+    )
+
+    from tabulate import tabulate
+
+    table = tabulate(
+        benchmark_result,
+        headers="keys",
+        tablefmt="grid",
+        numalign="right",
+        floatfmt=".4f",
+    )
+
+    print(table)
+
+
+if __name__ == "__main__":
+    main()

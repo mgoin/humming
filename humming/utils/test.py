@@ -155,9 +155,17 @@ def generate_random_bias(n, dtype):
     return bias
 
 
-def generate_random_moe_tensors(m, num_experts, topk, block_size):
-    tensor = torch.randn((m, num_experts), dtype=torch.float32, device="cuda:0")
-    topk_weights, topk_ids = tensor.topk(topk, 1)
+def generate_random_moe_tensors(shape_m, num_experts, top_k, block_size_config: int | list[int]):
+    if isinstance(block_size_config, int):
+        block_size = block_size_config
+    else:
+        for i in range(len(block_size_config) // 3):
+            if shape_m > block_size_config[i * 3] and shape_m <= block_size_config[i * 3 + 1]:
+                block_size = block_size_config[i * 3 + 2]
+                break
+
+    tensor = torch.randn((shape_m, num_experts), dtype=torch.float32, device="cuda:0")
+    topk_weights, topk_ids = tensor.topk(top_k, 1)
     topk_ids = topk_ids.int()
 
     # TODO: moe_align_block_size cuda kernel

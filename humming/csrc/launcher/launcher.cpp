@@ -20,7 +20,7 @@ inline int64_t find_kernel_configs_target_index(IntArrayRef &configs, int64_t sh
       int64_t min_val = configs[i];
       int64_t max_val = configs[i + 1];
       max_val = max_val > 0 ? max_val : (1 << 30);
-      if (shape_m >= min_val && shape_m <= max_val) return i + 2;
+      if (shape_m > min_val && shape_m <= max_val) return i + 2;
     }
 
     STD_TORCH_CHECK(false, "shape_m is not within any range defined in configs.");

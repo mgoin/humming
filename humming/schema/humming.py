@@ -179,7 +179,7 @@ class HummingInputSchema(BaseInputSchema):
     input_scale_group_size: int = 0
 
     KWARGS_ALIAS: ClassVar[dict[str, list[str]]] = {
-        "a_dtype": ["input_dtype"],
+        "a_dtype": ["input_dtype", "dtype"],
         "input_scale_group_size": ["group_size"],
     }
 

@@ -28,8 +28,8 @@ def test_moe(m, num_experts, top_k, is_moe_down):
         generate_random_moe_tensors(
             m,
             num_experts=num_experts,
-            topk=top_k,
-            block_size=32,
+            top_k=top_k,
+            block_size_config=32,
         )
     )
 

@@ -564,9 +564,15 @@ class HummingLayer(torch.nn.Module):
             self.torch_dtype = get_default_f16_torch_dtype()
         assert self.torch_dtype in [torch.float16, torch.bfloat16], self.torch_dtype
 
-        if self.input_config is None:
-            self.input_config = {"quant_method": "humming"}
-            self.input_config["a_dtype"] = dtypes.DataType.from_torch_dtype(self.torch_dtype)
+        self.input_config = self.input_config or {}
+
+        if isinstance(self.input_config, dict):
+            if "quant_method" not in self.input_config:
+                self.input_config["quant_method"] = "humming"
+            if "dtype" not in self.input_config:
+                self.input_config["dtype"] = dtypes.DataType.from_torch_dtype(self.torch_dtype)
+        if isinstance(self.weight_config, dict) and "quant_method" not in self.weight_config:
+            self.weight_config["quant_method"] = "humming"
 
         self.input_schema: BaseInputSchema = (
             self.input_config
@@ -609,6 +615,38 @@ class HummingLayer(torch.nn.Module):
                 key_new = key.removeprefix(prefix).lstrip(".")
                 tensors_new[key_new] = tensors[key]
         return tensors_new
+
+    def load_from_unquantized(self, tensor: torch.Tensor):
+        assert isinstance(self.weight_schema, HummingWeightSchema)
+        assert tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]
+        expected_shape: tuple[int, ...] = (self.shape_n, self.shape_k)
+        if self.num_experts is not None:
+            expected_shape = (self.num_experts,) + expected_shape
+        assert tensor.shape == expected_shape
+
+        from humming.utils.weight import quantize_weight
+
+        f16_dtype = dtypes.DataType.from_torch_dtype(self.torch_dtype)
+        weight, weight_scale, zero_point, global_scale = quantize_weight(
+            weight=tensor,
+            dtype=self.weight_schema.b_dtype,
+            scale_dtype=self.weight_schema.bs_dtype or f16_dtype,
+            group_size=self.weight_schema.weight_scale_group_size,
+            has_zero_point=self.weight_schema.has_zero_point,
+            has_global_scale=self.weight_schema.has_global_scale,
+            is_fp_zero_point=self.weight_schema.is_fp_zero_point,
+            pack=True,
+        )
+
+        tensors = {"weight": weight}
+        if weight_scale is not None:
+            tensors["weight_scale"] = weight_scale
+        if zero_point is not None:
+            tensors["zero_point"] = zero_point
+        if global_scale is not None:
+            tensors["global_scale"] = global_scale
+
+        self.load_from_tensors(tensors)
 
     def load_from_tensors(self, tensors: dict[str, torch.Tensor], prefix: str = ""):
         tensors = self.filter_tensors(tensors, prefix)
@@ -772,8 +810,16 @@ class HummingLayer(torch.nn.Module):
     def add_kernel_config(self, **kwargs):
         HummingMethod.add_kernel_config(self, **kwargs)
 
-    def prepare_default_kernel_configs(self):
-        HummingMethod.prepare_default_kernel_configs(self)
+    def prepare_default_kernel_configs(
+        self,
+        use_stream_k: bool = True,
+        use_f16_accum: bool = False,
+    ):
+        HummingMethod.prepare_default_kernel_configs(
+            self,
+            use_stream_k=use_stream_k,
+            use_f16_accum=use_f16_accum,
+        )
 
     def forward(
         self,

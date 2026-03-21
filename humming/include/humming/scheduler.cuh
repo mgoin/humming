@@ -63,7 +63,7 @@ public:
       uint32_t streamk_mn_blocks = mn_blocks;
       if (mn_blocks > gridDim.x) {
         streamk_mn_blocks = mn_blocks % gridDim.x;
-        if (streamk_mn_blocks && streamk_mn_blocks * 3 <= gridDim.x) streamk_mn_blocks += gridDim.x;
+        if (streamk_mn_blocks && streamk_mn_blocks * 10 <= gridDim.x) streamk_mn_blocks += gridDim.x;
       }
 
       dp_mn_iters = (mn_blocks - streamk_mn_blocks) / gridDim.x;
