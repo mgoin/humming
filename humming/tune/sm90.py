@@ -62,15 +62,30 @@ class Sm90Heuristics(DeviceHeuristics):
         assert meta.shape_n % block_shape_n == 0
 
         # 2. block_shape_m and warp_shape_m
-        if meta.num_experts is not None:
+        if meta.num_experts is None:
+            if shape_m <= block_shape_m:
+                block_shape_m = math.ceil(shape_m / 16) * 16
+            else:
+                blocks = [math.ceil(shape_m / ((i + 1) * 16)) for i in range(block_shape_m // 16)]
+                block_shape_m = np.argmin(blocks).item() * 16 + 16
+        else:
+            for moe_block_size in [16, 32, 48, 64]:
+                if shape_m * meta.top_k / meta.num_experts / moe_block_size < 0.9:
+                    break
+
             shape_m = int(meta.top_k * shape_m / meta.num_experts / 0.9)
             shape_m = max(shape_m, 1)
-
-        if shape_m <= block_shape_m:
-            block_shape_m = math.ceil(shape_m / 16) * 16
-        else:
-            blocks = [math.ceil(shape_m / ((i + 1) * 16)) for i in range(block_shape_m // 16)]
-            block_shape_m = np.argmin(blocks).item() * 16 + 16
+            if block_shape_m == 128:
+                if np.ceil(shape_m / 96) * 96 < np.ceil(shape_m / 64) * 64:
+                    block_shape_m = 96
+                elif np.ceil(shape_m / 128) * 128 < np.ceil(shape_m / 64) * 64 * 1.05:
+                    block_shape_m = 128
+                else:
+                    block_shape_m = moe_block_size
+            elif shape_m >= 64 and shape_m < 96:
+                block_shape_m = 48
+            else:
+                block_shape_m = moe_block_size
 
         num_blocks_n = meta.shape_n // block_shape_n
         num_blocks_m = cls.estimate_num_blocks_m(meta, shape_m, block_shape_m)

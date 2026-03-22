@@ -34,6 +34,8 @@ class DeviceHeuristics:
         use_stream_k: bool,
         use_f16_accum: bool,
     ):
+        compute_bound_min_shape_m = meta.estimate_bound_min_shape_m(use_f16_accum)
+
         # 1. base config
         group_size = meta.input_scale_group_size or meta.weight_scale_group_size
         is_moe = meta.num_experts is not None
@@ -46,15 +48,30 @@ class DeviceHeuristics:
         num_warps_m = block_shape_m // warp_shape_m
 
         # 2. block_shape_m and warp_shape_m
-        if meta.num_experts is not None:
+        if meta.num_experts is None:
+            if shape_m <= block_shape_m:
+                block_shape_m = math.ceil(shape_m / 16) * 16
+            else:
+                blocks = [math.ceil(shape_m / ((i + 1) * 16)) for i in range(block_shape_m // 16)]
+                block_shape_m = np.argmin(blocks).item() * 16 + 16
+        else:
+            for moe_block_size in [16, 32, 48, 64]:
+                if shape_m * meta.top_k / meta.num_experts / moe_block_size < 0.9:
+                    break
+
             shape_m = int(meta.top_k * shape_m / meta.num_experts / 0.9)
             shape_m = max(shape_m, 1)
-
-        if shape_m <= block_shape_m:
-            block_shape_m = math.ceil(shape_m / 16) * 16
-        else:
-            blocks = [math.ceil(shape_m / ((i + 1) * 16)) for i in range(block_shape_m // 16)]
-            block_shape_m = np.argmin(blocks).item() * 16 + 16
+            if block_shape_m == 128:
+                if np.ceil(shape_m / 96) * 96 < np.ceil(shape_m / 64) * 64:
+                    block_shape_m = 96
+                elif np.ceil(shape_m / 128) * 128 < np.ceil(shape_m / 64) * 64 * 1.05:
+                    block_shape_m = 128
+                else:
+                    block_shape_m = moe_block_size
+            elif shape_m >= 64 and shape_m < 96:
+                block_shape_m = 48
+            else:
+                block_shape_m = moe_block_size
 
         assert num_warps_m <= 2
         if num_warps_m == 2 and block_shape_m >= 64:
@@ -123,7 +140,14 @@ class DeviceHeuristics:
             if smem_size * 2 <= cls.max_smem_size:
                 num_ctas_per_sm = 2
 
-        max_num_stages = 5
+        if shape_m < compute_bound_min_shape_m:
+            b_block_bits = block_shape_n * block_shape_k * meta.b_dtype.num_bits
+            b_load_iters = b_block_bits / 128 / (num_warps * 32 / num_ctas_per_sm)
+            if warp_shape_k % (1024 // meta.a_dtype.num_bits) == 0 and b_load_iters >= 4:
+                warp_shape_k = warp_shape_k // 2
+                block_shape_k = block_shape_k // 2
+
+        max_num_stages = 5 if cls.sm_version == 80 else 3
         for num_stages_new in range(num_stages + 1, max_num_stages + 1):
             block_shape = (block_shape_m, block_shape_n, block_shape_k)
             smem_size = estimate_smem_size_layer(meta, block_shape, num_stages_new)
@@ -174,9 +198,13 @@ class DeviceHeuristics:
         if meta.num_experts is None:
             max_shape_m = 8192
         else:
-            max_shape_m = int(meta.num_experts / meta.top_k * 256)
+            max_shape_m = int(meta.num_experts / meta.top_k * 1024)
 
-        for shape_m in range(16, max_shape_m, 16):
+        shape_m_candidates = list(range(16, max_shape_m, 16))
+        if meta.num_experts is not None:
+            shape_m_candidates = [1, 2, 4, 8] + shape_m_candidates
+
+        for shape_m in shape_m_candidates:
             config = cls.get_config(meta, shape_m, use_stream_k, use_f16_accum)
             config_str = str(config)
 

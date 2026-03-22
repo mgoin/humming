@@ -12,18 +12,11 @@ from vllm.scalar_type import scalar_types
 
 from humming import dtypes, ops
 from humming.layer import HummingLayer
-from humming.utils.test import generate_random_moe_tensors
-
-
-def random_fill_tensor(tensor: torch.Tensor):
-    if tensor.dtype == torch.int32:
-        min_value = 2**31 * -1
-        max_value = 2**31 - 1
-        tensor.random_(min_value, max_value)
-    elif tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
-        tensor.normal_()
-    else:
-        tensor.copy_(tensor.float().random().to(tensor.dtype))
+from humming.utils.test import (
+    generate_random_moe_tensors,
+    random_fill_tensor,
+    save_benchmark_result,
+)
 
 
 def bench_marlin(
@@ -57,11 +50,9 @@ def bench_marlin(
         is_moe_down=is_moe_down,
     ).to("cuda:0")
 
-    for tensor in layer.state_dict().values():
+    for tensor in layer.parameters():
         random_fill_tensor(tensor)
     layer.transform()
-
-    workspace = torch.zeros((1024,), dtype=torch.int32, device="cuda:0")
 
     if b_dtype in ["int4", "uint4"] and has_zero_point:
         vllm_scalar_type = scalar_types.uint4
@@ -79,11 +70,11 @@ def bench_marlin(
     assert isinstance(layer.weight, torch.Tensor)
     weight = layer.weight.data
     if a_dtype not in ["float16", "bfloat16"] and num_experts is None:
-        weight = weight.view(weight.size(1) * 2, -1)
+        weight = weight.view(weight.size(0) * 2, -1)
     elif a_dtype not in ["float16", "bfloat16"] and num_experts is not None:
         weight = weight.view(num_experts, weight.size(1) * 2, -1)
 
-    default_shape_m_list = [2**i for i in range(15)]
+    default_shape_m_list = [2**i for i in range(13)]
     benchmark_result: list[dict[str, int | float]] = []
     for shape_m in tqdm(shape_m_list or default_shape_m_list):
         if num_experts is not None and is_moe_down:
@@ -112,7 +103,7 @@ def bench_marlin(
             _, topk_weights, sorted_token_ids, expert_ids, num_tokens_padded = moe_tensors
 
         def run_dense():
-            vllm_ops.marlin_gemm(
+            return vllm_ops.marlin_gemm(
                 a=inputs,  # noqa
                 c=None,
                 b_q_weight=weight,
@@ -123,7 +114,7 @@ def bench_marlin(
                 b_zeros=getattr(layer, "zero_point", None),
                 g_idx=None,
                 perm=None,
-                workspace=workspace,
+                workspace=layer.locks,
                 b_q_type=vllm_scalar_type,
                 size_m=inputs.size(0),  # noqa
                 size_n=shape_n,
@@ -143,7 +134,7 @@ def bench_marlin(
                 b_qzeros=getattr(layer, "zero_point", None),
                 g_idx=None,
                 perm=None,
-                workspace=workspace,
+                workspace=layer.locks,
                 sorted_token_ids=sorted_token_ids,  # noqa
                 expert_ids=expert_ids,  # noqa
                 num_tokens_past_padded=num_tokens_padded,  # noqa
@@ -200,20 +191,10 @@ def bench_marlin(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_experts", type=int, default=None)
-    parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--shape_n", type=int, required=True)
     parser.add_argument("--shape_k", type=int, required=True)
-    activation_dtypes = [
-        "float16",
-        "bfloat16",
-        "float8e4m3",
-        "float8e5m2",
-        "float4e2m1",
-        "int8",
-        "int4",
-    ]
-    scale_dtypes = ["float16", "bfloat16", "float8e4m3", "float8e5m2", "float8e8m0"]
+    activation_dtypes = ["float16", "bfloat16", "float8e4m3", "int8"]
+    scale_dtypes = ["float16", "bfloat16", "float8e4m3", "float8e8m0"]
     f16_dtypes = ["float16", "bfloat16"]
     parser.add_argument("--a_dtype", type=str, choices=activation_dtypes, required=True)
     parser.add_argument("--b_dtype", type=str, required=True)
@@ -221,8 +202,11 @@ def main():
     parser.add_argument("--c_dtype", type=str, choices=f16_dtypes, required=True)
     parser.add_argument("--weight_scale_group_size", type=int, default=0)
     parser.add_argument("--zero_point", default=False, action="store_true")
+    parser.add_argument("--num_experts", type=int, default=None)
+    parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--is_moe_down", default=False, action="store_true")
     parser.add_argument("--shape_m_list", type=int, default=None, nargs="+")
+    parser.add_argument("--output_file", type=str, default=None)
 
     args = parser.parse_args()
     benchmark_result = bench_marlin(
@@ -239,6 +223,8 @@ def main():
         shape_m_list=args.shape_m_list,
         is_moe_down=args.is_moe_down,
     )
+
+    save_benchmark_result(benchmark_result, args, ["vllm"])
 
     from tabulate import tabulate
 

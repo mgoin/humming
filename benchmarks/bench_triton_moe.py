@@ -14,7 +14,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
     invoke_fused_moe_triton_kernel,
 )
 
-from humming.utils.test import generate_random_moe_tensors
+from humming.utils.test import generate_random_moe_tensors, save_benchmark_result
 
 
 def generate_random_tensor(dtype, shape: tuple[int, ...]):
@@ -58,8 +58,12 @@ def bench_triton_moe(
     is_moe_down: bool,
     dtype: str,
     out_dtype: str,
+    block_shape: str | list[int] | None,
     shape_m_list: list[int] | None = None,
 ) -> list[dict[str, int | float]]:
+    if isinstance(block_shape, str):
+        block_shape = [int(x) for x in block_shape.split("x")]
+
     dtype_map = {
         "int8": torch.int8,
         "float8e4m3": torch.float8_e4m3fn,
@@ -71,19 +75,34 @@ def bench_triton_moe(
     weight = generate_random_tensor(torch_dtype, (num_experts, shape_n, shape_k))
     if torch_dtype.itemsize == 2:
         weight_scale: torch.Tensor | None = None
-    else:
+    elif block_shape is None:
         weight_scale = torch.randn((num_experts, shape_n), dtype=torch.float32, device="cuda:0")
+    else:
+        weight_scale = torch.randn(
+            (num_experts, shape_n // block_shape[0], shape_k // block_shape[1]),
+            dtype=torch.float32,
+            device="cuda:0",
+        )
 
-    default_shape_m_list = [2**i for i in range(15)]
+    default_shape_m_list = [2**i for i in range(13)]
     benchmark_result: list[dict[str, int | float]] = []
     for shape_m in tqdm(shape_m_list or default_shape_m_list):
         input_scale: torch.Tensor | None
+        num_groups = shape_k // block_shape[1] if block_shape is not None else 1
         if is_moe_down:
             inputs = generate_random_tensor(torch_dtype, (shape_m * top_k, shape_k))
-            input_scale = torch.randn((shape_m * top_k,), dtype=torch.float32, device="cuda:0")
+            input_scale = torch.randn(
+                (shape_m * top_k, num_groups),
+                dtype=torch.float32,
+                device="cuda:0",
+            )
         else:
             inputs = generate_random_tensor(torch_dtype, (shape_m, shape_k))
-            input_scale = torch.randn((shape_m,), dtype=torch.float32, device="cuda:0")
+            input_scale = torch.randn(
+                (shape_m, num_groups),
+                dtype=torch.float32,
+                device="cuda:0",
+            )
 
         if torch_dtype.itemsize == 2:
             input_scale = None
@@ -129,7 +148,8 @@ def bench_triton_moe(
                 use_int8_w8a8=dtype == "int8",
                 use_int8_w8a16=False,
                 use_int4_w4a16=False,
-                per_channel_quant=True,
+                per_channel_quant=block_shape is None,
+                block_shape=block_shape,
             )
 
             if is_moe_down:
@@ -161,6 +181,7 @@ def bench_triton_moe(
             "time": t,
             "memory_gbps": nbytes / t / 1e6,
             "compute_tops": shape_m * shape_n * shape_k * top_k * 2 / t / 1e9,
+            "config": config,
         }
         benchmark_result.append(res)
 
@@ -170,8 +191,6 @@ def bench_triton_moe(
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--num_experts", type=int, required=True)
-    parser.add_argument("--top_k", type=int, required=True)
     parser.add_argument("--shape_n", type=int, required=True)
     parser.add_argument("--shape_k", type=int, required=True)
     parser.add_argument(
@@ -181,8 +200,12 @@ def main():
         required=True,
     )
     parser.add_argument("--out_dtype", type=str, choices=["float16", "bfloat16"], required=True)
-    parser.add_argument("--shape_m_list", type=int, default=None, nargs="+")
+    parser.add_argument("--num_experts", type=int, required=True)
+    parser.add_argument("--top_k", type=int, required=True)
     parser.add_argument("--is_moe_down", default=False, action="store_true")
+    parser.add_argument("--shape_m_list", type=int, default=None, nargs="+")
+    parser.add_argument("--output_file", type=str, default=None)
+    parser.add_argument("--block_shape", type=str, default= None)
 
     args = parser.parse_args()
     benchmark_result = bench_triton_moe(
@@ -193,8 +216,11 @@ def main():
         is_moe_down=args.is_moe_down,
         dtype=args.dtype,
         out_dtype=args.out_dtype,
+        block_shape=args.block_shape,
         shape_m_list=args.shape_m_list,
     )
+
+    save_benchmark_result(benchmark_result, args, ["vllm"])
 
     from tabulate import tabulate
 

@@ -6,18 +6,11 @@ from tqdm import tqdm
 
 from humming import dtypes, ops
 from humming.layer import HummingLayer
-from humming.utils.test import generate_random_moe_tensors
-
-
-def random_fill_tensor(tensor: torch.Tensor):
-    if tensor.dtype == torch.int32:
-        min_value = 2**31 * -1
-        max_value = 2**31 - 1
-        tensor.random_(min_value, max_value)
-    elif tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
-        tensor.normal_()
-    else:
-        tensor.copy_(tensor.float().random().to(tensor.dtype))
+from humming.utils.test import (
+    generate_random_moe_tensors,
+    random_fill_tensor,
+    save_benchmark_result,
+)
 
 
 def bench_humming(
@@ -53,19 +46,19 @@ def bench_humming(
         input_config={"dtype": a_dtype, "group_size": input_scale_group_size},
         torch_dtype=torch_dtype,
         is_moe_down=is_moe_down,
-        activation_type=("none" if is_moe_down else "silu"),
+        activation_type=("silu" if num_experts is not None and not is_moe_down else "none"),
     ).to("cuda:0")
 
-    for tensor in layer.state_dict().values():
+    for tensor in layer.parameters():
         random_fill_tensor(tensor)
     layer.transform()
     layer.prepare_default_kernel_configs(use_f16_accum=use_f16_accum)
 
-    default_shape_m_list = [2**i for i in range(15)]
+    default_shape_m_list = [2**i for i in range(13)]
     benchmark_result: list[dict[str, int | float]] = []
     for shape_m in tqdm(shape_m_list or default_shape_m_list):
         if num_experts is not None and is_moe_down:
-            inputs = torch.randn((shape_m * top_k, shape_k), dtype=torch_dtype, device="cuda:0")
+            inputs = torch.randn((shape_m, top_k, shape_k), dtype=torch_dtype, device="cuda:0")
         else:
             inputs = torch.randn((shape_m, shape_k), dtype=torch_dtype, device="cuda:0")
 
@@ -126,8 +119,6 @@ def bench_humming(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_experts", type=int, default=None)
-    parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--shape_n", type=int, required=True)
     parser.add_argument("--shape_k", type=int, required=True)
     activation_dtypes = [
@@ -150,8 +141,11 @@ def main():
     parser.add_argument("--zero_point", default=False, action="store_true")
     parser.add_argument("--use_fp_zero_point", default=False, action="store_true")
     parser.add_argument("--use_f16_accum", default=False, action="store_true")
+    parser.add_argument("--num_experts", type=int, default=None)
+    parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--is_moe_down", default=False, action="store_true")
     parser.add_argument("--shape_m_list", type=int, default=None, nargs="+")
+    parser.add_argument("--output_file", type=str, default=None)
 
     args = parser.parse_args()
     benchmark_result = bench_humming(
@@ -171,6 +165,8 @@ def main():
         shape_m_list=args.shape_m_list,
         is_moe_down=args.is_moe_down,
     )
+
+    save_benchmark_result(benchmark_result, args)
 
     from tabulate import tabulate
 

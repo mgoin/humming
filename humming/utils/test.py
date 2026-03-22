@@ -1,8 +1,12 @@
+import importlib.metadata
+import json
 import math
+from pathlib import Path
 
 import torch
 
 from humming import dtypes, ops
+from humming.utils.device import calculate_gpu_bandwidth, get_device_name
 from humming.utils.weight import quantize_weight
 
 
@@ -193,3 +197,57 @@ def generate_random_moe_tensors(shape_m, num_experts, top_k, block_size_config: 
     )
 
     return topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_padded
+
+
+def random_fill_tensor(tensor: torch.Tensor):
+    if tensor.dtype == torch.int32:
+        min_value = 2**31 * -1
+        max_value = 2**31 - 1
+        tensor.random_(min_value, max_value)
+    elif tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
+        tensor.normal_(std=0.01)
+    else:
+        tensor.copy_(tensor.float().random_().to(tensor.dtype))
+
+
+def save_benchmark_result(result, args, packages: list[str] | None = None):
+    kwargs = vars(args)
+    output_file = kwargs.pop("output_file", None)
+    if output_file is None:
+        return
+    kwargs.pop("shape_m_list", None)
+    if "num_experts" in kwargs and kwargs["num_experts"] is None:
+        del kwargs["num_experts"]
+        del kwargs["top_k"]
+        del kwargs["is_moe_down"]
+
+    versions = {}
+    packages = packages or []
+    packages.insert(0, "torch")
+    for package in packages:
+        versions[package] = importlib.metadata.version(package)
+
+    result_new = {}
+    for x in result.copy():
+        x = x.copy()
+        shape_m = x.pop("shape_m")
+        result_new[shape_m] = x
+
+    dtype = kwargs.get("dtype", kwargs.get("a_dtype"))
+    use_f16_accum = kwargs.get("use_f16_accum", False)
+
+    data = {
+        "problem": vars(args),
+        "device": {
+            "device_name": get_device_name(),
+            "memory_gbps": calculate_gpu_bandwidth(),
+            "compute_tops": ops.tops_bench(dtype, use_f16_accum=use_f16_accum),
+        },
+        "packages": versions,
+        "result": result_new,
+    }
+
+    Path(output_file).parent.mkdir(exist_ok=True, parents=True)
+
+    with open(output_file, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)

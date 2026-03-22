@@ -64,7 +64,8 @@ class TopsBenchKernel(KernelRuntime):
         self.num_warps = 32
         self.ops_per_mma_per_warp = self.mma_shape_m * self.mma_shape_n * self.mma_shape_k * 2
         if self.mma_type == MmaType.WGMMA:
-            self.ops_per_mma_per_warp // 4
+            self.ops_per_mma_per_warp = self.ops_per_mma_per_warp // 4
+            self.num_warps = self.num_warps // 4
         self.sm_count = torch.cuda.get_device_properties().multi_processor_count
         self.num_ctas = self.sm_count * 2
         self.ops_per_call = self.ops_per_mma_per_warp * self.num_warps * self.num_ctas

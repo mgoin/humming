@@ -18,6 +18,7 @@ from humming.schema import (
     HummingInputSchema,
     HummingWeightSchema,
 )
+from humming.utils.device import estimate_compute_bound_threshold
 from humming.utils.weight import (
     prepare_humming_bias,
     prepare_humming_tensor_for_glu,
@@ -106,6 +107,28 @@ class HummingLayerMeta:
             return self.weight_scale_group_size == 0
         else:
             raise ValueError(f"unsupported mma_type: {self.mma_type}")
+
+    @property
+    def weight_nbytes(self):
+        nbytes1 = self.shape_n * self.shape_k * self.b_dtype.num_bits // 8
+        num_groups = self.shape_k / (self.weight_scale_group_size or self.shape_k)
+        nbytes2 = self.shape_n * num_groups * self.bs_dtype.num_bits // 8
+        nbytes3 = self.shape_n * num_groups * (math.ceil(self.b_dtype.num_bits / 4) * 4) // 8
+        nbytes = nbytes1 + nbytes2
+        if self.has_zero_point and self.is_fp_zero_point:
+            nbytes = nbytes + nbytes2
+        elif self.has_zero_point:
+            nbytes = nbytes + nbytes3
+        return nbytes * (self.num_experts or 1)
+
+    def estimate_bound_min_shape_m(self, use_f16_accum: bool = False):
+        return estimate_compute_bound_threshold(
+            weight_nbytes=self.weight_nbytes // (self.num_experts or 1),
+            shape_n=self.shape_n,
+            shape_k=self.shape_k,
+            dtype=str(self.a_dtype),
+            use_f16_accum=use_f16_accum,
+        )
 
     def __post_init__(self):
         if isinstance(self.activation_type, str):

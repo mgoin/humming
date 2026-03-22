@@ -22,20 +22,20 @@ def tops_bench(dtype: str, mma_type: str | None = None, use_f16_accum: bool = Fa
         out_dtype = "float32"
     else:
         out_dtype = "int32"
-    
+
     if use_f16_accum:
         assert dtype in ["float16", "float8e4m3", "float8e5m2"]
         out_dtype = "float16"
 
     kernel = TopsBenchKernel(
-        mma_type="mma",
+        mma_type=mma_type,
         mma_shape_m=mma_shape_m,
         mma_shape_n=mma_shape_n,
         mma_shape_k=mma_shape_k,
         ab_dtype=dtype,
         cd_dtype=out_dtype,
         repeat_count=65536,
-        unroll_count=128,
+        unroll_count=64,
     )
 
     ops_per_call = kernel.ops_per_call
