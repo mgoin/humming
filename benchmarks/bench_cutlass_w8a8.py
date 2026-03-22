@@ -22,7 +22,7 @@ def bench_cutlass_w8a8(
     weight = weight.view(torch_dtype)
     weight_scale = torch.randn((shape_n,), dtype=torch.float32, device="cuda:0")
 
-    default_shape_m_list = [2**i for i in range(13)]
+    default_shape_m_list = [2**i for i in range(15)]
     benchmark_result: list[dict[str, int | float]] = []
     for shape_m in tqdm(shape_m_list or default_shape_m_list):
         inputs = torch.randint(-120, 120, (shape_m, shape_k), dtype=torch.int8, device="cuda:0")

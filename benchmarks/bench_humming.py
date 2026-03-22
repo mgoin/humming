@@ -54,7 +54,7 @@ def bench_humming(
     layer.transform()
     layer.prepare_default_kernel_configs(use_f16_accum=use_f16_accum)
 
-    default_shape_m_list = [2**i for i in range(13)]
+    default_shape_m_list = [2**i for i in range(15)]
     benchmark_result: list[dict[str, int | float]] = []
     for shape_m in tqdm(shape_m_list or default_shape_m_list):
         if num_experts is not None and is_moe_down:

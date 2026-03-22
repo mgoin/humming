@@ -29,7 +29,7 @@ __global__ void tops_bench(uint32_t* out_ptr) {
   typename MmaOpClass::CRegisters regs_c;
 
   if constexpr (MmaOpClass::kMmaType == MmaType::WGMMA) {
-    __shared__ alignas(1024) int4 smem[1024];
+    __shared__ alignas(1024) int4 smem[2048];
     uint64_t desc = make_wgmma_smem_desc<128>(smem, 0);
     PRAGMA_UNROLL_COUNT(kUnrollCount)
     for (uint32_t i = 0; i < kRepeatCount; i++) {

@@ -84,7 +84,7 @@ def bench_triton_moe(
             device="cuda:0",
         )
 
-    default_shape_m_list = [2**i for i in range(13)]
+    default_shape_m_list = [2**i for i in range(15)]
     benchmark_result: list[dict[str, int | float]] = []
     for shape_m in tqdm(shape_m_list or default_shape_m_list):
         input_scale: torch.Tensor | None

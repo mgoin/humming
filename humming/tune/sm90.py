@@ -24,10 +24,16 @@ class Sm90Heuristics(DeviceHeuristics):
         use_f16_accum: bool,
         is_moe: bool,
     ):
-        if a_dtype.num_bits == 16 or group_size == 0:
+        if a_dtype.num_bits == 16:
             return {
                 "block_shape": (64, 256, 512 // a_dtype.num_bits),
                 "warp_shape": (64, 64, 512 // a_dtype.num_bits),
+                "num_ctas_per_sm": 3 if use_f16_accum else 2,
+            }
+        elif group_size == 0:
+            return {
+                "block_shape": (128, 128, 512 // a_dtype.num_bits),
+                "warp_shape": (128, 32, 512 // a_dtype.num_bits),
                 "num_ctas_per_sm": 3 if use_f16_accum else 2,
             }
         elif group_size >= 128:
@@ -57,19 +63,19 @@ class Sm90Heuristics(DeviceHeuristics):
         config = cls.get_base_config(meta.a_dtype, meta.b_dtype, group_size, use_f16_accum, is_moe)
         block_shape_m, block_shape_n, block_shape_k = config["block_shape"]
         num_ctas_per_sm = config.get("num_ctas_per_sm", 1)
-        warp_shape_m, warp_shape_n, warp_shape_k = config["warp_shape_n"]
+        warp_shape_m, warp_shape_n, warp_shape_k = config["warp_shape"]
         num_stages = 3
         assert meta.shape_n % block_shape_n == 0
 
         # 2. block_shape_m and warp_shape_m
         if meta.num_experts is None:
             if shape_m <= block_shape_m:
-                block_shape_m = math.ceil(shape_m / 16) * 16
+                block_shape_m = math.ceil(shape_m / 8) * 8
             else:
-                blocks = [math.ceil(shape_m / ((i + 1) * 16)) for i in range(block_shape_m // 16)]
-                block_shape_m = np.argmin(blocks).item() * 16 + 16
+                blocks = [math.ceil(shape_m / ((i + 1) * 8)) for i in range(block_shape_m // 8)]
+                block_shape_m = np.argmin(blocks).item() * 8 + 8
         else:
-            for moe_block_size in [16, 32, 48, 64]:
+            for moe_block_size in [8, 16, 32, 48, 64]:
                 if shape_m * meta.top_k / meta.num_experts / moe_block_size < 0.9:
                     break
 
@@ -87,6 +93,7 @@ class Sm90Heuristics(DeviceHeuristics):
             else:
                 block_shape_m = moe_block_size
 
+        warp_shape_m = block_shape_m
         num_blocks_n = meta.shape_n // block_shape_n
         num_blocks_m = cls.estimate_num_blocks_m(meta, shape_m, block_shape_m)
 
@@ -113,6 +120,11 @@ class Sm90Heuristics(DeviceHeuristics):
         if num_warps == 4:
             warp_shape_k = 512 // meta.a_dtype.num_bits
             block_shape_k = warp_shape_k * 2
+
+        if num_warps <= 8 and block_shape_m <= 16:
+            num_warps_k = block_shape_k // warp_shape_k
+            warp_shape_k = 512 // meta.a_dtype.num_bits
+            block_shape_k = warp_shape_k * num_warps_k * 2
 
         max_num_stages = 5
         for num_stages_new in range(num_stages + 1, max_num_stages + 1):

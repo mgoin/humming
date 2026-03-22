@@ -200,9 +200,11 @@ class DeviceHeuristics:
         else:
             max_shape_m = int(meta.num_experts / meta.top_k * 1024)
 
-        shape_m_candidates = list(range(16, max_shape_m, 16))
-        if meta.num_experts is not None:
-            shape_m_candidates = [1, 2, 4, 8] + shape_m_candidates
+        shape_m_candidates = [1, 2, 4, 8]
+        if cls.sm_version == 90:
+            shape_m_candidates += list(range(8, max_shape_m, 8))
+        else:
+            shape_m_candidates += list(range(16, max_shape_m, 16))
 
         for shape_m in shape_m_candidates:
             config = cls.get_config(meta, shape_m, use_stream_k, use_f16_accum)
