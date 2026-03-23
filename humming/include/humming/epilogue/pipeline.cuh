@@ -40,6 +40,10 @@ public:
       : GS(GS), locks(locks), arith(arith),
         smem_reducer(smem.reduce), smem_writer(smem.reduce, arith),
         gmem_writer(arith, smem.reduce, output_ptr, smem.wr_row_index, output_shape_m) {
+    if (threadIdx.x == 0) {
+      if constexpr (PipelineConfig::kUseTmaC) prefetch_tensor_map(output_ptr);
+    }
+    __syncwarp();
   }
 
   CUDA_INLINE

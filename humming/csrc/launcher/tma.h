@@ -11,8 +11,11 @@ inline CUtensorMapDataType get_tma_dtype(ScalarType type) {
     case ScalarType::Int: return CU_TENSOR_MAP_DATA_TYPE_INT32;
     case ScalarType::Long: return CU_TENSOR_MAP_DATA_TYPE_INT64;
     case ScalarType::Short: return CU_TENSOR_MAP_DATA_TYPE_UINT16;
+    case ScalarType::Char: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+    case ScalarType::Byte: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
     case ScalarType::Float8_e8m0fnu: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
     case ScalarType::Float8_e5m2: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+    case ScalarType::Float8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
     case ScalarType::Float8_e4m3fnuz: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
     default: ASSERT_CHECK(false, "Unsupported torch dtype for TMA");
   }

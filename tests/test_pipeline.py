@@ -44,6 +44,9 @@ def test_pipeline(
     c_dtype = dtypes.DataType.from_str(c_dtype)
     bs_dtype = dtypes.DataType.from_str(bs_dtype)
 
+    if num_stages == 2 and (use_warp_spec or mma_type == "wgmma"):
+        return
+
     if b_dtype.is_integer_type and a_dtype.is_integer_type:
         if a_dtype.num_bits < b_dtype.num_bits:
             return

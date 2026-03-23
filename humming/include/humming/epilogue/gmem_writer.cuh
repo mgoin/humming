@@ -15,6 +15,19 @@ CUDA_INLINE T reduce_add_f162(T a, T b) {
   return a;
 };
 
+
+template <typename scalar_t2, typename T>
+CUDA_INLINE T atomic_reduce_add_f162(T a, T b) {
+  scalar_t2 *a_half2_ptr = reinterpret_cast<scalar_t2 *>(&a);
+  scalar_t2 *b_half2_ptr = reinterpret_cast<scalar_t2 *>(&b);
+
+  PRAGMA_UNROLL
+  for (uint32_t i = 0; i < sizeof(T) / 4; i++) {
+    atomicAdd(&b_half2_ptr[i], a_half2_ptr[i]);
+  };
+  return a;
+};
+
 template <
     class ArithClass,
     class ProblemShape, class BlockShape, class PadShape, class ElementC,

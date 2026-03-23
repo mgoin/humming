@@ -220,7 +220,7 @@ inline CUtensorMap make_tma_desc_a(const Tensor &tensor, KernelData &kernel_data
     tma_block_shape_k = 1024 / a_dtype_num_bits;
   }
 
-  return make_tma_desc(tensor, {tma_block_shape_m, tma_block_shape_k}, swizzle_bytes);
+  return make_tma_desc(tensor, {tma_block_shape_k, tma_block_shape_m}, swizzle_bytes);
 }
 
 inline CUtensorMap make_tma_desc_b(Tensor &tensor, KernelData &kernel_data) {
@@ -240,7 +240,7 @@ inline CUtensorMap make_tma_desc_b(Tensor &tensor, KernelData &kernel_data) {
 inline CUtensorMap make_tma_desc_c(Tensor &tensor, KernelData &kernel_data) {
   if (!kernel_data.use_tma_c) return CUtensorMap();
   uint32_t tma_block_shape_m = kernel_data.is_moe ? 1 : kernel_data.block_shape_m;
-  return make_tma_desc(tensor, {64, tma_block_shape_m});
+  return make_tma_desc(tensor, {64, tma_block_shape_m}, 128);
 }
 
 inline CUtensorMap make_tma_desc_bs(std::optional<Tensor> &tensor_, KernelData &kernel_data) {
