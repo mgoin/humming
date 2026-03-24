@@ -32,6 +32,11 @@ def get_heuristics_class(
 
 
 @functools.lru_cache(maxsize=1024)
-def get_heuristics_config(meta: HummingLayerMeta, use_stream_k: bool, use_f16_accum: bool):
+def get_heuristics_config(
+    meta: HummingLayerMeta,
+    use_stream_k: bool,
+    use_f16_accum: bool,
+    use_batch_invariance: bool,
+):
     heuristics_cls = get_heuristics_class()
-    return heuristics_cls.get_configs(meta, use_stream_k, use_f16_accum)
+    return heuristics_cls.get_configs(meta, use_stream_k, use_f16_accum, use_batch_invariance)

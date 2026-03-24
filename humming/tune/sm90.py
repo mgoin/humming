@@ -28,25 +28,31 @@ class Sm90Heuristics(DeviceHeuristics):
             return {
                 "block_shape": (64, 256, 512 // a_dtype.num_bits),
                 "warp_shape": (64, 64, 512 // a_dtype.num_bits),
-                "num_ctas_per_sm": 3 if use_f16_accum else 2,
+                "num_ctas_per_sm": 2,
             }
-        elif group_size == 0:
+        elif group_size == 0 and not is_moe:
             return {
-                "block_shape": (128, 128, 512 // a_dtype.num_bits),
-                "warp_shape": (128, 32, 512 // a_dtype.num_bits),
-                "num_ctas_per_sm": 3 if use_f16_accum else 2,
+                "block_shape": (64, 256, 512 // a_dtype.num_bits),
+                "warp_shape": (64, 64, 512 // a_dtype.num_bits),
+                "num_ctas_per_sm": 2,
+            }
+        elif group_size == 0 and is_moe:
+            return {
+                "block_shape": (64, 128, 512 // a_dtype.num_bits),
+                "warp_shape": (64, 32, 512 // a_dtype.num_bits),
+                "num_ctas_per_sm": 3,
             }
         elif group_size >= 128:
             return {
                 "block_shape": (64, 128, 1024 // a_dtype.num_bits),
                 "warp_shape": (64, 32, 1024 // a_dtype.num_bits),
-                "num_ctas_per_sm": 3 if use_f16_accum else 2,
+                "num_ctas_per_sm": 3 if is_moe else 2,
             }
         else:
             return {
-                "block_shape": (64, 256, 512 // a_dtype.num_bits),
+                "block_shape": (64, 128, 512 // a_dtype.num_bits),
                 "warp_shape": (64, 32, 512 // a_dtype.num_bits),
-                "num_ctas_per_sm": 2,
+                "num_ctas_per_sm": 3 if is_moe else 2,
             }
 
     @classmethod
@@ -56,6 +62,7 @@ class Sm90Heuristics(DeviceHeuristics):
         shape_m: int,
         use_stream_k: bool,
         use_f16_accum: bool,
+        use_batch_invariance: bool,
     ):
         # 1. base config
         group_size = meta.input_scale_group_size or meta.weight_scale_group_size
@@ -128,7 +135,7 @@ class Sm90Heuristics(DeviceHeuristics):
             warp_shape_k = 512 // meta.a_dtype.num_bits
             block_shape_k = warp_shape_k * num_warps_k * 2
 
-        max_num_stages = 5
+        max_num_stages = 4
         for num_stages_new in range(num_stages + 1, max_num_stages + 1):
             block_shape = (block_shape_m, block_shape_n, block_shape_k)
             smem_size = estimate_smem_size_layer(meta, block_shape, num_stages_new)
@@ -136,9 +143,10 @@ class Sm90Heuristics(DeviceHeuristics):
                 num_stages = num_stages_new
 
         if num_ctas_per_sm == 1:
-            num_sms = min(num_sms, math.ceil(num_blocks_n * num_blocks_m * 4.5))
+            factor = min(4.5, meta.shape_k / (3 * block_shape_k))
+            num_sms = min(num_sms, math.ceil(num_blocks_n * num_blocks_m * factor))
 
-        return {
+        config = {
             "block_shape": (block_shape_m, block_shape_n, block_shape_k),
             "warp_shape": (warp_shape_m, warp_shape_n, warp_shape_k),
             "use_stream_k": use_stream_k,
@@ -147,3 +155,20 @@ class Sm90Heuristics(DeviceHeuristics):
             "num_stages": num_stages,
             "num_ctas_per_sm": num_ctas_per_sm,
         }
+
+        if block_shape_m >= 48 and num_ctas_per_sm <= 2 and num_warps <= 8 and not is_moe:
+            config["use_tma"] = True
+            config["use_warp_spec"] = True
+            config["use_mbarrier"] = True
+
+        if use_batch_invariance:
+            warp_shape_k = 512 // meta.a_dtype.num_bits
+            block_shape_k = 512 // meta.a_dtype.num_bits
+            # TODO: check if TMA / cp.async affect batch invariance
+            config["use_tma"] = False
+            config["use_warp_spec"] = False
+            config["use_mbarrier"] = False
+            config["use_stream_k"] = False
+
+        return config
+

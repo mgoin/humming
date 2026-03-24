@@ -2,10 +2,11 @@
 
 #include <humming/utils/all.cuh>
 
-template <class MmaOpClass, class BlockShape, class WarpShape, class ElementC, class PipelineConfig>
+template <class MmaOpClass, class BlockShape, class WarpShape, class ElementC, class PipelineConfig, class QuantParamConfig>
 class EpilogueSmemReducer {
 private:
-  using MmaTypeC = typename MmaOpClass::ValTypeC;
+  static constexpr bool kForceFloatAccum = (QuantParamConfig::kWeightScaleGroupSize > 0 || QuantParamConfig::kInputScaleGroupSize > 0) && !QuantParamConfig::kUseIntWeightScale;
+  using MmaTypeC = std::conditional_t<kForceFloatAccum, float, typename MmaOpClass::ValTypeC>;
   using MmaShape = class MmaOpClass::MmaShape;
   using OutputType32 = std::conditional_t<std::is_same<ElementC, Float16>::value, half2, nv_bfloat162>;
   using ValTypeC32 = std::conditional_t<sizeof(MmaTypeC) == 2, OutputType32, MmaTypeC>;
@@ -69,7 +70,7 @@ public:
     };
 
     PRAGMA_UNROLL
-    for (uint32_t m = 0; m < WarpShape::M / 16; m++) {
+    for (uint32_t m = 0; m < MAX(WarpShape::M / 16, 1); m++) {
       PRAGMA_UNROLL
       for (uint32_t i = 1; i < group_num_warps; i *= 2) {
         uint32_t buffer_id = group_warp_id % (group_num_warps / (2 * i));

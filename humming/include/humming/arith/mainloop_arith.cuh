@@ -42,7 +42,7 @@ private:
       kIsF16Accum, kIsGroupInputScale, kIsGroupWeightScale>();
 
   static constexpr uint32_t kDequantBSBits = (ElementA::kBits < 16 && !kIsF16Accum) ? 32 : 16;
-  static constexpr uint32_t kNumSubBlocksM = WarpShape::M / 16;
+  static constexpr uint32_t kNumSubBlocksM = CEIL_DIV(WarpShape::M, 16);
   static constexpr uint32_t kNumSubBlocksN = WarpShape::N / 16;
   static constexpr uint32_t kNumASPerSubBlock = kUseWgmma ? 4 : 2;
   static constexpr uint32_t kNumBSPerSubBlock = !kUseWgmma && ElementA::kBits < 16 ? 4 : 2;

@@ -24,13 +24,13 @@ public:
     uint32_t smem = cast_smem_ptr_to_uint(smem_ptr) / 128;
 
     PRAGMA_UNROLL
-    for (uint32_t load_iter_id = 0; load_iter_id < WarpShape::M / 16; load_iter_id++) {
+    for (uint32_t load_iter_id = 0; load_iter_id < CEIL_DIV(WarpShape::M, 16); load_iter_id++) {
 
       uint32_t row = m_iter_id * (BlockShape::M / M_WARPS) + load_iter_id * 16;
       uint32_t col = 2 * kWarpItersK * (threadIdx.x / (kNumThreads / K_WARPS)) + iter_id * 2;
 
       if constexpr (MmaShape::M == 8) {
-        row += (lane_id / 16) * 8;
+        row += (lane_id / 16) * 8 + lane_id % 8;
         col += (lane_id / 8) % 2;
       } else {
         row += lane_id % 16;
@@ -49,7 +49,12 @@ public:
       }
 
       uint32_t a_sh_rd = row * 8 + col;
-      ld_shared<4>(smem_ptr + a_sh_rd, reinterpret_cast<int4 *>(regs_ptr) + load_iter_id);
+
+      if ((load_iter_id == CEIL_DIV(WarpShape::M, 16) - 1) && WarpShape::M % 16 == 8) {
+        ld_shared<2>(smem_ptr + a_sh_rd, reinterpret_cast<int4 *>(regs_ptr) + load_iter_id);
+      } else {
+        ld_shared<4>(smem_ptr + a_sh_rd, reinterpret_cast<int4 *>(regs_ptr) + load_iter_id);
+      }
     };
   };
 };

@@ -15,7 +15,7 @@ template <
     class QuantParamConfig, class MoEConfig>
 class EpiloguePipeline {
 private:
-  using SmemReducer = EpilogueSmemReducer<MmaOpClass, BlockShape, WarpShape, ElementC, PipelineConfig>;
+  using SmemReducer = EpilogueSmemReducer<MmaOpClass, BlockShape, WarpShape, ElementC, PipelineConfig, QuantParamConfig>;
   using SmemWriter = EpilogueSmemWriter<MmaOpClass, ArithClass, BlockShape, WarpShape, ElementA, ElementC, PipelineConfig, QuantParamConfig>;
   using GmemWriter = EpilogueGmemWriter<ArithClass, ProblemShape, BlockShape, PadShape, ElementC, SchedulerConfig, PipelineConfig, EpilogueConfig, MoEConfig>;
   using OutputPtrType = std::conditional_t<PipelineConfig::kUseTmaC, const void *, void *>;

@@ -117,7 +117,7 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
       __syncthreads();
     }
   } else {
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(208));
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(200));
 
     uint32_t block_padded_shape_m = MoEConfig::kIsMoE ? num_tokens_padded_ptr[0] : shape_m;
     auto scheduler = Scheduler(smem, sorted_token_ids_ptr, expert_ids_ptr, block_padded_shape_m);

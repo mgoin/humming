@@ -403,13 +403,14 @@ class HummingMethod:
         layer: HummingModule | torch.nn.Module,
         use_stream_k: bool = True,
         use_f16_accum: bool = False,
+        use_batch_invariance: bool = False,
         sublayer_name: str = "",
     ):
         from humming.tune import get_heuristics_config
 
         assert isinstance(layer.humming_metas, dict)
         meta = layer.humming_metas[sublayer_name]
-        configs = get_heuristics_config(meta, use_stream_k, use_f16_accum)
+        configs = get_heuristics_config(meta, use_stream_k, use_f16_accum, use_batch_invariance)
         kernel_config_str_list = tuple(set([json.dumps(x[-1]) for x in configs]))
 
         if (meta, kernel_config_str_list) not in cls.completed_layer_configs:

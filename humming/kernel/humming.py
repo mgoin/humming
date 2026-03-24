@@ -245,10 +245,22 @@ class HummingKernel(
         mma_shape_m = 64 if self.mma_config.mma_type == MmaType.WGMMA else 16
         mma_shape_n = self.warp_shape[0] if self.mma_config.mma_type == MmaType.WGMMA else 8
         mma_shape_k = 256 // self.a_dtype.num_bits
-        if self.sm_version == 75:
+        if self.sm_version == 75 and self.a_dtype == dtypes.int8:
+            mma_shape_m = 8
+
+        if self.mma_config.mma_type == MmaType.MMA and self.warp_shape[0] % 16 == 8:
+            mma_shape_m = 8
+
+        if self.mma_config.mma_type == MmaType.MMA and mma_shape_m == 8:
             mma_shape_k = mma_shape_k // 2
-            if self.a_dtype == dtypes.int8:
-                mma_shape_m = 8
+
+        if self.mma_config.mma_type == MmaType.WGMMA:
+            assert self.warp_shape[0] % mma_shape_n == 0
+            assert self.warp_shape[1] % (mma_shape_m // 4) == 0
+        else:
+            assert self.warp_shape[0] % mma_shape_m == 0
+            assert self.warp_shape[1] % mma_shape_n == 0
+        assert self.warp_shape[2] % mma_shape_k == 0
 
         input_group_size = self.problem_shape[2]
         weight_group_size = self.problem_shape[2]

@@ -33,6 +33,7 @@ class DeviceHeuristics:
         shape_m: int,
         use_stream_k: bool,
         use_f16_accum: bool,
+        use_batch_invariance: bool,
     ):
         compute_bound_min_shape_m = meta.estimate_bound_min_shape_m(use_f16_accum)
 
@@ -154,12 +155,26 @@ class DeviceHeuristics:
             if smem_size * num_ctas_per_sm < cls.max_smem_size:
                 num_stages = num_stages_new
 
+        if use_batch_invariance:
+            warp_shape_k = 512 // meta.a_dtype.num_bits
+            block_shape_k = 512 // meta.a_dtype.num_bits
+            use_stream_k = False
+
+            if cls.sm_version != 75:
+                num_warps_m = block_shape_m // warp_shape_m
+                warp_shape_m = math.ceil(warp_shape_m / 16) * 16
+                block_shape_m = num_warps_m * warp_shape_m
+
+        if num_ctas_per_sm == 1:
+            factor = min(4.5, meta.shape_k / (3 * block_shape_k))
+            num_sms = min(num_sms, math.ceil(num_blocks_n * num_blocks_m * factor))
+
         return {
             "block_shape": (block_shape_m, block_shape_n, block_shape_k),
             "warp_shape": (warp_shape_m, warp_shape_n, warp_shape_k),
             "use_stream_k": use_stream_k,
             "use_f16_accum": use_f16_accum,
-            "num_sms": min(num_blocks_m * num_blocks_n * 4, num_sms),
+            "num_sms": num_sms,
             "num_stages": num_stages,
             "num_ctas_per_sm": num_ctas_per_sm,
             "num_write_splits": num_write_splits,
@@ -181,7 +196,13 @@ class DeviceHeuristics:
         return torch.cuda.get_device_properties().multi_processor_count
 
     @classmethod
-    def get_configs(cls, meta: HummingLayerMeta, use_stream_k: bool, use_f16_accum: bool):
+    def get_configs(
+        cls,
+        meta: HummingLayerMeta,
+        use_stream_k: bool,
+        use_f16_accum: bool,
+        use_batch_invariance: bool,
+    ):
         if meta.a_dtype.num_bits == 16:
             assert meta.a_dtype in cls.b16_allowed_dtypes
         elif meta.a_dtype.num_bits == 8:
@@ -207,7 +228,13 @@ class DeviceHeuristics:
             shape_m_candidates += list(range(16, max_shape_m, 16))
 
         for shape_m in shape_m_candidates:
-            config = cls.get_config(meta, shape_m, use_stream_k, use_f16_accum)
+            config = cls.get_config(
+                meta=meta,
+                shape_m=shape_m,
+                use_stream_k=use_stream_k,
+                use_f16_accum=use_f16_accum,
+                use_batch_invariance=use_batch_invariance,
+            )
             config_str = str(config)
 
             if last_config_str == config_str:
