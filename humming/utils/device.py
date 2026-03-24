@@ -15,7 +15,21 @@ def calculate_gpu_bandwidth(gpu_index=0):
     try:
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
-        bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
+        gpu_name = pynvml.nvmlDeviceGetName(handle)
+        try:
+            bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
+        except pynvml.NVMLError_FunctionNotFound:
+            # nvidia driver 470 + cuda-compat supports cuda 12
+            # but doesn't support nvmlDeviceGetMemoryBusWidth.
+            # so we hardcode bus width for some old devices.
+            if "A100" in gpu_name or "A800" in gpu_name:
+                bus_width = 5120
+            elif "A10" in gpu_name:
+                bus_width = 384
+            elif "T4" in gpu_name:
+                bus_width = 256
+            else:
+                raise
         mem_clock_mhz = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_MEM)
         return (mem_clock_mhz * 2 * bus_width) / 8 / 1000
     finally:
