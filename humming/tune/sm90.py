@@ -160,6 +160,11 @@ class Sm90Heuristics(DeviceHeuristics):
             config["use_tma"] = True
             config["use_warp_spec"] = True
             config["use_mbarrier"] = True
+        elif config["num_stages"] == 4:
+            block_shape = (block_shape_m, block_shape_n, block_shape_k)
+            smem_size = estimate_smem_size_layer(meta, block_shape, 5)
+            if smem_size * num_ctas_per_sm < cls.max_smem_size:
+                config["num_stages"] = 5
 
         if use_batch_invariance:
             warp_shape_k = 512 // meta.a_dtype.num_bits
