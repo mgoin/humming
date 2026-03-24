@@ -31,6 +31,8 @@ def get_triton_moe_config(
     shape_k: int,
     shape_m: int,
     top_k: int,
+    is_moe_down: bool,
+    block_shape: list[int] | None,
     torch_dtype: torch.dtype,
 ):
     if torch_dtype == torch.float8_e4m3fn:
@@ -40,8 +42,17 @@ def get_triton_moe_config(
     else:
         dtype = None
 
-    configs = get_moe_configs(num_experts, shape_n, dtype)
-    if configs is None:
+    if not is_moe_down:
+        shape_n = shape_n // 2
+    else:
+        shape_n, shape_k = shape_k, shape_n
+
+    if block_shape is None:
+        configs = get_moe_configs(num_experts, shape_n, dtype)
+    else:
+        configs = get_moe_configs(num_experts, shape_n, dtype, block_shape[0], block_shape[1])
+
+    if configs is None and block_shape is None:
         configs = get_moe_configs(num_experts, shape_n, dtype, 128, 128)
     if configs is not None:
         config = configs[min(configs.keys(), key=lambda x: abs(x - shape_m))]
@@ -115,6 +126,8 @@ def bench_triton_moe(
             shape_m=shape_m,
             top_k=top_k,
             torch_dtype=torch_dtype,
+            is_moe_down=is_moe_down,
+            block_shape=block_shape,
         )
         moe_tensors = generate_random_moe_tensors(
             shape_m=shape_m,

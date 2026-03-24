@@ -46,7 +46,7 @@ class Sm90Heuristics(DeviceHeuristics):
             return {
                 "block_shape": (64, 128, 1024 // a_dtype.num_bits),
                 "warp_shape": (64, 32, 1024 // a_dtype.num_bits),
-                "num_ctas_per_sm": 3 if is_moe else 2,
+                "num_ctas_per_sm": 2,
             }
         else:
             return {
@@ -160,7 +160,7 @@ class Sm90Heuristics(DeviceHeuristics):
             config["use_tma"] = True
             config["use_warp_spec"] = True
             config["use_mbarrier"] = True
-        elif config["num_stages"] == 4:
+        elif config["num_stages"] == 4 and block_shape_m <= 32:
             block_shape = (block_shape_m, block_shape_n, block_shape_k)
             smem_size = estimate_smem_size_layer(meta, block_shape, 5)
             if smem_size * num_ctas_per_sm < cls.max_smem_size:
