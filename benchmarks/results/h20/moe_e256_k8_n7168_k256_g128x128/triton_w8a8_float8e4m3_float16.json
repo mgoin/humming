@@ -1,0 +1,218 @@
+{
+    "problem": {
+        "shape_n": 7168,
+        "shape_k": 256,
+        "dtype": "float8e4m3",
+        "out_dtype": "float16",
+        "num_experts": 256,
+        "top_k": 8,
+        "is_moe_down": true,
+        "block_shape": "128x128"
+    },
+    "device": {
+        "device_name": "NVIDIA H20",
+        "memory_gbps": 4022.784,
+        "compute_tops": 284.19856821921957
+    },
+    "packages": {
+        "torch": "2.10.0+cu128",
+        "vllm": "0.18.0"
+    },
+    "result": {
+        "1": {
+            "time": 0.026631306262423774,
+            "memory_gbps": 555.7537378811616,
+            "compute_tops": 1.1024666875400904,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "2": {
+            "time": 0.0436112525701814,
+            "memory_gbps": 678.7444582648657,
+            "compute_tops": 1.3464473625357227,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "4": {
+            "time": 0.06909167688486358,
+            "memory_gbps": 803.7274893839718,
+            "compute_tops": 1.6997779949053249,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "8": {
+            "time": 0.1223500702540759,
+            "memory_gbps": 907.7376070922212,
+            "compute_tops": 1.9197457223542158,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "16": {
+            "time": 0.18544933747264208,
+            "memory_gbps": 950.3248833444817,
+            "compute_tops": 2.533101786191608,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "32": {
+            "time": 0.29766360218389815,
+            "memory_gbps": 992.983696466161,
+            "compute_tops": 3.156328449655585,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "64": {
+            "time": 0.4250002557687839,
+            "memory_gbps": 997.9375453146531,
+            "compute_tops": 4.421287202759409,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 256,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "128": {
+            "time": 0.48421403895396503,
+            "memory_gbps": 978.5226405735135,
+            "compute_tops": 7.76122970766919,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "256": {
+            "time": 0.5311846895846064,
+            "memory_gbps": 940.8733832122172,
+            "compute_tops": 14.149867109079826,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "512": {
+            "time": 0.5955364240715836,
+            "memory_gbps": 889.4138369886383,
+            "compute_tops": 25.241756722831624,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 256,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "1024": {
+            "time": 0.7193464790735076,
+            "memory_gbps": 819.4659363026689,
+            "compute_tops": 41.794562073511976,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "2048": {
+            "time": 1.1562988904535916,
+            "memory_gbps": 613.2351607825565,
+            "compute_tops": 52.001729518578415,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 256,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "4096": {
+            "time": 2.0724087333270775,
+            "memory_gbps": 457.57843071699523,
+            "compute_tops": 58.0286515657238,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 256,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "8192": {
+            "time": 3.8566697300888424,
+            "memory_gbps": 369.9311675223832,
+            "compute_tops": 62.36421197789716,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 256,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        },
+        "16384": {
+            "time": 7.448057207194242,
+            "memory_gbps": 320.02008976215944,
+            "compute_tops": 64.58547830263124,
+            "config": {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 256,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 3
+            }
+        }
+    }
+}
