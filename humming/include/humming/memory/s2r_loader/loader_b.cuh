@@ -14,8 +14,11 @@ private:
   static constexpr uint32_t N_WARPS = BlockShape::N / WarpShape::N;
   static constexpr uint32_t K_WARPS = BlockShape::K / WarpShape::K;
 
+  static constexpr bool kIsWarpHalfGroup = WarpShape::N == ElementA::kBits * 2;
+  static constexpr bool kLoadHalfGroup = (ElementB::kBits == 2 || ElementB::kBits == 4 || ElementB::kBits == 8) && kIsWarpHalfGroup;
+  static constexpr uint32_t TRUE_N_WARPS = kIsWarpHalfGroup ? N_WARPS / 2 : N_WARPS;
   static constexpr uint32_t kSmemStride = BlockShape::N * kPartMmaShapeK * ElementB::kBits / 32 / 4;
-  static constexpr uint32_t kNumIntsPerThread = ElementB::kBits;
+  static constexpr uint32_t kNumIntsPerThread = ElementB::kBits / (kLoadHalfGroup ? 2 : 1);
   using LoadType = typename LoadTypeChooser<kNumIntsPerThread * 4>::Type;
   static constexpr uint32_t kLoadIters = kNumIntsPerThread / (sizeof(LoadType) / 4);
 
@@ -23,13 +26,14 @@ public:
   CUDA_INLINE
   void load(const int4 *smem_ptr, uint32_t *regs_ptr, uint32_t iter_id) {
     uint32_t n_warp_id = (threadIdx.x / 32) % N_WARPS;
+    if (kIsWarpHalfGroup) n_warp_id = n_warp_id / 2;
     uint32_t lane_id = threadIdx.x % 32;
-    constexpr uint32_t warp_weight_blocks = WarpShape::N / (ElementA::kBits * 4);
+    constexpr uint32_t warp_weight_blocks = MAX(WarpShape::N / (ElementA::kBits * 4), 1);
     uint32_t idx = warp_weight_blocks * 32 * n_warp_id + lane_id;
 
     if constexpr (K_WARPS > 1) {
       uint32_t k_warp_id = (threadIdx.x / (kNumThreads / K_WARPS));
-      idx = N_WARPS * 32 * warp_weight_blocks * kWarpItersK * k_warp_id + idx;
+      idx = TRUE_N_WARPS * 32 * warp_weight_blocks * kWarpItersK * k_warp_id + idx;
     }
 
     uint32_t smem_start_idx = idx * kLoadIters;
@@ -41,7 +45,11 @@ public:
     for (uint32_t i = 0; i < warp_weight_blocks; i++) {
       PRAGMA_UNROLL
       for (uint32_t j = 0; j < kLoadIters; j++) {
-        reg_ptr_load[i * kLoadIters + j] = smem_ptr_load[smem_start_idx + 32 * kLoadIters * i + j];
+        if constexpr (kLoadHalfGroup) {
+          reg_ptr_load[i * kLoadIters + j] = smem_ptr_load[(smem_start_idx + 32 * kLoadIters * i + j) * 2 + (threadIdx.x / 32) % 2];
+        } else {
+          reg_ptr_load[i * kLoadIters + j] = smem_ptr_load[smem_start_idx + 32 * kLoadIters * i + j];
+        }
       }
     }
   };

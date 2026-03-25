@@ -11,6 +11,8 @@ template <
 struct WMMA {
 public:
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
+  static constexpr uint32_t kNumWarpShapeNSplits = WarpShape::N == ElementA::kBits * 2 ? 2 : 1;
+
   static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
 
@@ -20,7 +22,7 @@ public:
   SharedStorage &smem;
   ArithClass &arith;
   typename MmaOpClass::ARegisters regs_a[2][WarpShape::M / MmaShape::M][kPartMmaShapeK / MmaShape::K];
-  uint32_t regs_qb[2][ElementB::kBits * (WarpShape::N / 4 / ElementA::kBits)];
+  uint32_t regs_qb[2][ElementB::kBits * (16 / ElementA::kBits)];
   typename MmaOpClass::BRegisters regs_b[2][WarpShape::N / MmaShape::N][kPartMmaShapeK / MmaShape::K];
   typename MmaOpClass::CRegisters regs_c[2][WarpShape::M / MmaShape::M][WarpShape::N / MmaShape::N];
 
@@ -40,12 +42,16 @@ public:
 
   CUDA_INLINE
   void transform_b(uint32_t buffer_id) {
+    if constexpr (ElementB::kBits == 1 && kNumWarpShapeNSplits == 2) {
+      regs_qb[buffer_id][0] = regs_qb[buffer_id][0] >> (threadIdx.x / 32 % 2 * 8);
+    }
+
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < WarpShape::N / 16; i++) {
       uint32_t *regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id][i * 16 / MmaShape::N]);
       uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, i);
       uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
-      dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint>(regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
+      dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
       arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
     };
   };

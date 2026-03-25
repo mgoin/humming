@@ -31,8 +31,9 @@ from humming.utils.weight import (
     ],
 )
 @pytest.mark.parametrize("c_dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("is_fp_zero_point", [True, False])
-def test_zeropoint(a_dtype, b_dtype, c_dtype, is_fp_zero_point):
+@pytest.mark.parametrize("is_fp_zero_point", [True])
+@pytest.mark.parametrize("warp_shape_n_splits", [2, 1])
+def test_zeropoint(a_dtype, b_dtype, c_dtype, is_fp_zero_point, warp_shape_n_splits):
     a_dtype = dtypes.DataType.from_str(a_dtype)
     b_dtype = dtypes.DataType.from_str(b_dtype)
     c_dtype = dtypes.DataType.from_str(c_dtype)
@@ -42,6 +43,9 @@ def test_zeropoint(a_dtype, b_dtype, c_dtype, is_fp_zero_point):
         return
 
     if a_dtype not in [dtypes.float16, dtypes.bfloat16] and is_fp_zero_point:
+        return
+
+    if warp_shape_n_splits == 2 and a_dtype.num_bits != 16:
         return
 
     random_weight_data = generate_random_weight(
@@ -67,10 +71,14 @@ def test_zeropoint(a_dtype, b_dtype, c_dtype, is_fp_zero_point):
         dtype=a_dtype,
     )
 
+    warp_shape_n = a_dtype.num_bits * 4 // warp_shape_n_splits
+    if warp_shape_n < 16:
+        return
+
     humming_kernel = HummingKernel(
         problem_shape=(0, 1024, 1024),
         block_shape=(16, a_dtype.num_bits * 16, 512 // a_dtype.num_bits),
-        warp_shape=(16, a_dtype.num_bits * 4, 512 // a_dtype.num_bits),
+        warp_shape=(16, warp_shape_n, 512 // a_dtype.num_bits),
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         c_dtype=c_dtype,

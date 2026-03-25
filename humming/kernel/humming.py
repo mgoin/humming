@@ -305,10 +305,10 @@ class HummingKernel(
 
         assert self.warp_shape[1] <= 64
         if self.a_dtype.num_bits == 16:
-            assert self.warp_shape[1] == 64
+            assert self.warp_shape[1] >= 32
             assert self.warp_shape[2] >= 32
         elif self.a_dtype.num_bits == 8:
-            assert self.warp_shape[1] >= 32
+            assert self.warp_shape[1] >= 16
             assert self.warp_shape[2] >= 64
         elif self.a_dtype.num_bits == 4:
             assert self.warp_shape[1] >= 16

@@ -17,14 +17,18 @@ from humming.utils.weight import (
     "block_shape, warp_shape, a_dtype",
     [
         # 16bit activation
+        [(8, 256, 32), (8, 32, 32), dtypes.bfloat16],
         [(8, 256, 32), (8, 64, 32), dtypes.bfloat16],
+        [(8, 256, 128), (8, 32, 64), dtypes.bfloat16],
         [(8, 256, 128), (8, 64, 32), dtypes.bfloat16],
         [(16, 256, 32), (16, 64, 32), dtypes.bfloat16],
         [(32, 128, 64), (16, 64, 32), dtypes.bfloat16],
         [(48, 128, 64), (24, 64, 32), dtypes.bfloat16],
         [(32, 128, 64), (32, 64, 64), dtypes.bfloat16],
+        [(32, 128, 64), (32, 32, 64), dtypes.bfloat16],
         [(48, 256, 64), (48, 64, 32), dtypes.bfloat16],
         [(64, 64, 64), (32, 64, 32), dtypes.bfloat16],
+        [(64, 64, 64), (32, 32, 32), dtypes.bfloat16],
         [(128, 64, 128), (32, 64, 32), dtypes.bfloat16],
         [(120, 64, 128), (120, 64, 32), dtypes.bfloat16],
         [(96, 256, 128), (48, 64, 64), dtypes.bfloat16],

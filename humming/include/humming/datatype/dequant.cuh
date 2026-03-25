@@ -39,7 +39,7 @@ CUDA_INLINE void dequant_b1248(const uint32_t *qb, uint32_t *res, uint32_t j, ui
 }
 
 
-template <class SourceType, class TargetType, bool kHasZeroPoint, bool kIsFpZeroPoint>
+template <class SourceType, class TargetType, bool kHasZeroPoint, bool kIsFpZeroPoint, uint32_t kNumWarpShapeNSplits = 1>
 CUDA_INLINE void dequant_b3567(const uint32_t *qb, uint32_t *res, uint32_t j, uint32_t *zp_vals = nullptr) {
   static_assert(SourceType::kBits <= TargetType::kBits);
   constexpr uint32_t kPaddedNumBits = static_next_power_of_2(SourceType::kBits);
@@ -49,14 +49,33 @@ CUDA_INLINE void dequant_b3567(const uint32_t *qb, uint32_t *res, uint32_t j, ui
 
   PRAGMA_UNROLL
   for (uint32_t i = 0; i < 4; i++) {
-    uint32_t index = j * 4 + i;
     uint32_t zp_val = zp_vals[i];
+    uint32_t index;
 
-    if (index * kPaddedNumBits % TargetType::kBits == 0) {
-      const uint32_t idx1 = index / TargetType::kBits;
-      const uint32_t idx2 = index * kPaddedNumBits / TargetType::kBits % kPaddedNumBits;
-      const uint32_t qb_offset = idx1 * SourceType::kBits;
-      qb_val = get_quanted_value_group<SourceType::kNumBits, !kIsFpToFp>(qb + qb_offset, idx2);
+    if constexpr (kNumWarpShapeNSplits == 1) {
+      index = j * 4 + i;
+      if (index * kPaddedNumBits % TargetType::kBits == 0) {
+        const uint32_t idx1 = index / TargetType::kBits;
+        const uint32_t idx2 = index * kPaddedNumBits / TargetType::kBits % kPaddedNumBits;
+        const uint32_t qb_offset = idx1 * SourceType::kBits;
+        qb_val = get_quanted_value_group<SourceType::kNumBits, !kIsFpToFp>(qb + qb_offset, idx2);
+      }
+    } else if (threadIdx.x / 32 % 2 == 0) {
+      index = j * 4 + i;
+      if (index * kPaddedNumBits % TargetType::kBits == 0) {
+        const uint32_t idx1 = index / TargetType::kBits;
+        const uint32_t idx2 = index * kPaddedNumBits / TargetType::kBits % kPaddedNumBits;
+        const uint32_t qb_offset = idx1 * SourceType::kBits;
+        qb_val = get_quanted_value_group<SourceType::kNumBits, !kIsFpToFp>(qb + qb_offset, idx2);
+      }
+    } else {
+      index = (j + 2) * 4 + i;
+      if (index * kPaddedNumBits % TargetType::kBits == 0) {
+        const uint32_t idx1 = index / TargetType::kBits;
+        const uint32_t idx2 = index * kPaddedNumBits / TargetType::kBits % kPaddedNumBits;
+        const uint32_t qb_offset = idx1 * SourceType::kBits;
+        qb_val = get_quanted_value_group<SourceType::kNumBits, !kIsFpToFp>(qb + qb_offset, idx2);
+      }
     }
 
     uint32_t shift_count;
@@ -80,11 +99,11 @@ CUDA_INLINE void dequant_b3567(const uint32_t *qb, uint32_t *res, uint32_t j, ui
 }
 
 
-template <class SourceType, class TargetType, bool kHasZeroPoint = false, bool kIsFpZeroPoint = false>
+template <class SourceType, class TargetType, bool kHasZeroPoint = false, bool kIsFpZeroPoint = false, uint32_t kNumWarpShapeNSplits = 1>
 CUDA_INLINE void dequant(const uint32_t *qb, uint32_t *res, uint32_t j, uint32_t *zp_vals = nullptr) {
   if constexpr (SourceType::kBits == static_next_power_of_2(SourceType::kBits)) {
     dequant_b1248<SourceType, TargetType, kHasZeroPoint, kIsFpZeroPoint>(qb, res, j, zp_vals);
   } else {
-    dequant_b3567<SourceType, TargetType, kHasZeroPoint, kIsFpZeroPoint>(qb, res, j, zp_vals);
+    dequant_b3567<SourceType, TargetType, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(qb, res, j, zp_vals);
   }
 }

@@ -85,7 +85,11 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
   auto pbias = [&]() {if constexpr (PipelineConfig::kUseTmaBias) return &Bias; else return Bias; };
 
   if (threadIdx.x >= PipelineConfig::kNumMathThreads) {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(48));
+    if constexpr (PipelineConfig::kNumCtasPerSm == 1) {
+      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(48));
+    } else {
+      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(24));
+    }
 
     uint32_t block_padded_shape_m = MoEConfig::kIsMoE ? num_tokens_padded_ptr[0] : shape_m;
     auto scheduler = Scheduler(smem, sorted_token_ids_ptr, expert_ids_ptr, block_padded_shape_m);
@@ -117,7 +121,11 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
       __syncthreads();
     }
   } else {
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(200));
+    if constexpr (PipelineConfig::kNumCtasPerSm == 2) {
+      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(232));
+    } else {
+      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(200));
+    }
 
     uint32_t block_padded_shape_m = MoEConfig::kIsMoE ? num_tokens_padded_ptr[0] : shape_m;
     auto scheduler = Scheduler(smem, sorted_token_ids_ptr, expert_ids_ptr, block_padded_shape_m);

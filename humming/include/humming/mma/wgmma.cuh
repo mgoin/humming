@@ -40,6 +40,7 @@ public:
   static constexpr uint32_t K_WARPS = BlockShape::K / WarpShape::K;
   static constexpr uint32_t kWarpItersK = WarpShape::K / (256 / ElementA::kBits);
   static constexpr uint32_t kSwizzleBytes = ElementA::kBits * BlockShape::K >= 1024 ? 128 : 64;
+  static constexpr uint32_t kNumWarpShapeNSplits = WarpShape::N == ElementA::kBits * 2 ? 2 : 1;
 
   SharedStorage &smem;
   ArithClass &arith;
@@ -77,12 +78,16 @@ public:
 
   CUDA_INLINE
   void transform_b(uint32_t buffer_id) {
+    if constexpr (ElementB::kBits == 1 && kNumWarpShapeNSplits == 2) {
+      regs_qb[buffer_id][0] = regs_qb[buffer_id][0] >> (threadIdx.x / 32 % 2 * 8);
+    }
+
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < WarpShape::N / (MmaShape::M / 4); i++) {
       uint32_t *regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id][i * 64 / MmaShape::M]);
       uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, i);
       uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
-      dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint>(regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
+      dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
       arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
       uint32_t tmp = regs_b_ptr[1];
       regs_b_ptr[1] = regs_b_ptr[2];

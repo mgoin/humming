@@ -2,6 +2,7 @@ import math
 
 import numpy as np
 
+import torch
 from humming import dtypes
 from humming.layer import HummingLayerMeta
 from humming.tune.base import DeviceHeuristics
@@ -16,7 +17,7 @@ class Sm90Heuristics(DeviceHeuristics):
     sm_version: int = 90
 
     @classmethod
-    def get_base_config(
+    def get_base_config_h20(
         cls,
         a_dtype: dtypes.DataType,
         b_dtype: dtypes.DataType,
@@ -53,6 +54,56 @@ class Sm90Heuristics(DeviceHeuristics):
                 "block_shape": (64, 128, 512 // a_dtype.num_bits),
                 "warp_shape": (64, 32, 512 // a_dtype.num_bits),
                 "num_ctas_per_sm": 3 if is_moe else 2,
+            }
+
+    @classmethod
+    def get_base_config(
+        cls,
+        a_dtype: dtypes.DataType,
+        b_dtype: dtypes.DataType,
+        group_size: int,
+        use_f16_accum: bool,
+        is_moe: bool,
+    ):
+        gpu_name = torch.cuda.get_device_name()
+        if "H20" in gpu_name and "H200" not in gpu_name or is_moe:
+            return cls.get_base_config_h20(
+                a_dtype=a_dtype,
+                b_dtype=b_dtype,
+                group_size=group_size,
+                use_f16_accum=use_f16_accum,
+                is_moe=is_moe,
+            )
+
+        if a_dtype.num_bits == 16 and use_f16_accum:
+            return {
+                "block_shape": (128, 256, 64),
+                "warp_shape": (128, 64, 64),
+                "num_ctas_per_sm": 2,
+            }
+        else:
+            return {
+                "block_shape": (128, 128, 64),
+                "warp_shape": (128, 32, 64),
+                "num_ctas_per_sm": 2,
+            }
+        elif group_size == 0:
+            return {
+                "block_shape": (128, 128, 1024 // a_dtype.num_bits),
+                "warp_shape": (128, 32, 1024 // a_dtype.num_bits),
+                "num_ctas_per_sm": 2,
+            }
+        elif group_size >= 128:
+            return {
+                "block_shape": (64, 128, 1024 // a_dtype.num_bits),
+                "warp_shape": (64, 32, 1024 // a_dtype.num_bits),
+                "num_ctas_per_sm": 2,
+            }
+        else:
+            return {
+                "block_shape": (64, 128, 512 // a_dtype.num_bits),
+                "warp_shape": (64, 32, 512 // a_dtype.num_bits),
+                "num_ctas_per_sm": 2,
             }
 
     @classmethod
@@ -160,6 +211,7 @@ class Sm90Heuristics(DeviceHeuristics):
             config["use_tma"] = True
             config["use_warp_spec"] = True
             config["use_mbarrier"] = True
+            config["num_stages"] = 3
         elif config["num_stages"] == 4 and block_shape_m <= 32:
             block_shape = (block_shape_m, block_shape_n, block_shape_k)
             smem_size = estimate_smem_size_layer(meta, block_shape, 5)
@@ -176,4 +228,3 @@ class Sm90Heuristics(DeviceHeuristics):
             config["use_stream_k"] = False
 
         return config
-
