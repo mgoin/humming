@@ -55,7 +55,7 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
       SchedulerConfig, PipelineConfig, QuantParamConfig, MoEConfig>;
   using ProducerPipeline = ProducerPipeline<
       SharedStorage, ProblemShape, BlockShape, PadShape, ElementA, ElementB, ElementBS,
-      PipelineConfig, EpilogueConfig, QuantParamConfig, MoEConfig>;
+      SchedulerConfig, PipelineConfig, EpilogueConfig, QuantParamConfig, MoEConfig>;
   using ConsumerPipeline = ConsumerPipeline<SharedStorage, PipelineConfig, EpilogueConfig, QuantParamConfig, MoEConfig>;
   using MainloopArithmetic = MainloopArithmetic<
       MmaOpClass, BlockShape, WarpShape,
@@ -85,8 +85,8 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
   auto pbias = [&]() {if constexpr (PipelineConfig::kUseTmaBias) return &Bias; else return Bias; };
 
   if (threadIdx.x >= PipelineConfig::kNumMathThreads) {
-    if constexpr (PipelineConfig::kNumCtasPerSm == 1) {
-      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(48));
+    if constexpr (PipelineConfig::kNumCtasPerSm == 1 && ElementA::kBits != 16) {
+      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(40));
     } else {
       asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(24));
     }
@@ -95,10 +95,10 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
     auto scheduler = Scheduler(smem, sorted_token_ids_ptr, expert_ids_ptr, block_padded_shape_m);
 
     auto producer = ProducerPipeline(smem, pa(), pb(), pas(), pbs(), pbzp(), pbias(), topk_weights_ptr, shape_m);
+    producer.init_mbarrir();
+    __syncthreads();
     while (scheduler.get_next_block()) {
       uint32_t &slice_iters = scheduler.slice_iters;
-      producer.init_mbarrir();
-      __syncthreads();
 
       producer.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.k_block_id);
       producer.load_stage<true, true>(0);
@@ -110,21 +110,22 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
       while (slice_iters) {
         PRAGMA_UNROLL
         for (uint32_t stage_id = 0; stage_id < kNumStages; stage_id++) {
-          if (slice_iters == 1) producer.load_channel();
+          if (slice_iters == 1) {
+            producer.wait_channel();
+            producer.load_channel();
+          }
           producer.wait_stage(stage_id);
           producer.load_stage(stage_id + kNumStages - 1, slice_iters >= kNumStages);
           slice_iters--;
           if (!slice_iters) break;
         }
       }
-
-      __syncthreads();
     }
   } else {
     if constexpr (PipelineConfig::kNumCtasPerSm == 2) {
       asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(232));
     } else {
-      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(200));
+      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(232));
     }
 
     uint32_t block_padded_shape_m = MoEConfig::kIsMoE ? num_tokens_padded_ptr[0] : shape_m;
@@ -137,11 +138,13 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
     auto consumer = ConsumerPipeline(smem);
     auto s2r_pipe = S2RMemoryPipeline(smem, mma, epilogue);
 
+    consumer.init_mbarrir();
+    __syncthreads();
+    consumer.arrive(kNumStages);
+
     while (scheduler.get_next_block()) {
       mma.zero_accum();
       if constexpr (PipelineConfig::kUseTmaC) tma_wait_store_group<0, true>();
-      consumer.init_mbarrir();
-      __syncthreads();
 
       uint32_t &slice_iters = scheduler.slice_iters;
       epilogue.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id);
@@ -163,8 +166,9 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
             mma.run(stage_id, warp_k_iter_id);
             if (warp_k_iter_id == warp_k_iters - 2) {
               consumer.arrive(stage_id);
-              sync_part_threads<PipelineConfig::kNumMathThreads, PipelineConfig::kNumThreads>();
-              consumer.wait_stage((stage_id + 1) % kNumStages);
+              if (slice_iters > 1) {
+                consumer.wait_stage((stage_id + 1) % kNumStages);
+              }
             }
 
             mma.transform_b((warp_k_iter_id + 1) % 2);
@@ -176,9 +180,13 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
       };
 
       consumer.wait_channel();
-      __syncthreads();
       s2r_pipe.load_channel(scheduler.slice_id);
+      consumer.arrive(kNumStages);
       epilogue.call(mma.final_regs_c_as_ptr());
     }
   }
+
+  __syncthreads();
+  __cluster_barrier_arrive();
+  __cluster_barrier_wait();
 };

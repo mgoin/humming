@@ -45,7 +45,7 @@ CUDA_INLINE void barrier_release(int *lock, bool reset = false) {
 }
 
 CUDA_INLINE
-void mbarrier_wait(uint64_t *barrier, bool phase_parity) {
+void mbarrier_wait(void *barrier, bool phase_parity) {
   uint32_t smem_int_mbar = cast_smem_ptr_to_uint(barrier);
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -73,4 +73,22 @@ void mbarrier_wait(uint64_t *barrier, bool phase_parity) {
                : "r"(smem_int_mbar), "r"((uint32_t)phase_parity)
                : "memory");
 #endif
+};
+
+
+template <bool kUseCluster = false>
+CUDA_INLINE void mbarrier_arrive(void *barrier) {
+  uint32_t smem_int_mbar = cast_smem_ptr_to_uint(barrier);
+
+  if constexpr (kUseCluster) {
+    asm volatile ("mbarrier.arrive.shared::cluster.b64 _, [%0];"
+                  :
+                  : "r"(smem_int_mbar)
+                  : "memory");
+  } else {
+    asm volatile ("mbarrier.arrive.shared.b64 _, [%0];"
+            :
+            : "r"(smem_int_mbar)
+            : "memory");
+  }
 };

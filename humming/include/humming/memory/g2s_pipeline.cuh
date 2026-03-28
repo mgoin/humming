@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cooperative_groups.h>
 #include <cuda_awbarrier_primitives.h>
 #include <humming/memory/g2s_loader/loader_a.cuh>
 #include <humming/memory/g2s_loader/loader_as.cuh>
@@ -14,7 +15,7 @@ template <
     class SharedStorage,
     class ProblemShape, class BlockShape, class PadShape,
     class ElementA, class ElementB, class ElementBS,
-    class PipelineConfig, class EpilogueConfig,
+    class SchedulerConfig, class PipelineConfig, class EpilogueConfig,
     class QuantParamConfig, class MoEConfig>
 class ProducerPipeline {
 private:
@@ -39,9 +40,10 @@ private:
   static constexpr bool kIsGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
   static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kHasBias = EpilogueConfig::kHasBias;
-
   static constexpr bool kIsMoE = MoEConfig::kIsMoE;
   static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
+  static constexpr bool kHasChannelData = kIsChannelInputScale || kIsChannelWeightScale || kHasBias || kIsMoEDown;
+
   static constexpr uint32_t kNumStages = PipelineConfig::kNumStages;
 
   template <bool kIsFirst = false>
@@ -103,8 +105,8 @@ public:
   static constexpr bool kHasChannelTmaMBarrier = get_channel_load_bytes().x > 0;
   static constexpr bool kHasChannelCpAsyncMBarrier = get_channel_load_bytes().y > 0;
 
-  using LoaderA = G2SMemoryLoaderA<ProblemShape, BlockShape, PadShape, ElementA, PipelineConfig, MoEConfig>;
-  using LoaderB = G2SMemoryLoaderB<ProblemShape, BlockShape, ElementA, ElementB, PipelineConfig, MoEConfig>;
+  using LoaderA = G2SMemoryLoaderA<ProblemShape, BlockShape, PadShape, ElementA, SchedulerConfig, PipelineConfig, MoEConfig>;
+  using LoaderB = G2SMemoryLoaderB<ProblemShape, BlockShape, ElementA, ElementB, SchedulerConfig, PipelineConfig, MoEConfig>;
   using LoaderAS = G2SMemoryLoaderAS<ProblemShape, BlockShape, PadShape, PipelineConfig, QuantParamConfig, MoEConfig>;
   using LoaderBS = G2SMemoryLoaderBS<ProblemShape, BlockShape, ElementBS, PipelineConfig, QuantParamConfig, MoEConfig>;
   using LoaderBZP = G2SMemoryLoaderBZP<ProblemShape, BlockShape, ElementB, PipelineConfig, QuantParamConfig, MoEConfig>;
@@ -119,8 +121,9 @@ public:
   LoaderBZP loader_bzp;
   LoaderBias loader_bias;
   LoaderTopkWeights loader_topk_weights;
-  uint32_t phase = 0;
+  uint32_t phases[PipelineConfig::kNumStages + 1] = {0};
   const uint32_t thread_id = threadIdx.x - kLoadThreadOffset;
+  uint32_t cluster_rank = blockIdx.x % PipelineConfig::kMultiCastSize;
 
   CUDA_INLINE
   ProducerPipeline(
@@ -154,8 +157,6 @@ public:
 
   CUDA_INLINE void init_mbarrir() {
     if constexpr (kUseMBarrier) {
-      phase = 0;
-
       uint32_t count;
       if (thread_id < kNumStages) {
         constexpr uint32_t cp_async_thread_count = kHasStageCpAsyncMBarrier ? kNumLoadThreads : 0;
@@ -172,8 +173,8 @@ public:
       }
 
       if (thread_id < kNumStages + 2) __mbarrier_init(&smem.load_mbar[thread_id], count);
-
-      if (thread_id < kNumStages) __mbarrier_init(&smem.math_mbar[thread_id], PipelineConfig::kNumMathThreads);
+      uint32_t factor = (PipelineConfig::kMultiCastSize > 1 && cluster_rank == 0) ? PipelineConfig::kMultiCastSize : 1;
+      if (thread_id < kNumStages + 1) __mbarrier_init(&smem.math_mbar[thread_id], PipelineConfig::kNumMathThreads * factor);
     }
   }
 
@@ -196,16 +197,13 @@ public:
       if constexpr (kHasZeroPoint && (kIsGroupWeightScale || kIsFirst)) {
         loader_bzp.load<kShouldAdvance>(smem.bzp[stage_id], &smem.load_mbar[mbar_index]);
       }
-
       load_bytes = get_stage_load_bytes<kIsFirst>();
-    } else {
-      load_bytes = {0, 0};
-    }
 
-    if constexpr (kIsFirst) {
-      commit_load<kHasFirstStageCpAsyncMBarrier, kHasFirstStageTmaMBarrier>(mbar_index, load_bytes);
-    } else {
-      commit_load<kHasStageCpAsyncMBarrier, kHasStageTmaMBarrier>(mbar_index, load_bytes);
+      if constexpr (kIsFirst) {
+        commit_load<kHasFirstStageCpAsyncMBarrier, kHasFirstStageTmaMBarrier>(mbar_index, load_bytes);
+      } else {
+        commit_load<kHasStageCpAsyncMBarrier, kHasStageTmaMBarrier>(mbar_index, load_bytes);
+      }
     }
   }
 
@@ -229,6 +227,7 @@ public:
       }
       if constexpr (kHasTmaMBarrier) {
         if (thread_id == 0) tma_commit_mbarrier(&smem.load_mbar[stage_id], load_bytes.x);
+        __syncwarp();
       }
     } else if constexpr (kUseCpAsync) {
       cp_async_commit_group();
@@ -236,8 +235,15 @@ public:
   }
 
   CUDA_INLINE void wait_stage(uint32_t stage_id) {
-    mbarrier_wait(&smem.math_mbar[stage_id], phase);
-    if (stage_id == kNumStages - 1) phase ^= 1;
+    mbarrier_wait(&smem.math_mbar[stage_id], phases[stage_id]);
+    phases[stage_id] ^= 1;
+  }
+
+  CUDA_INLINE void wait_channel() {
+    if constexpr (kHasChannelData && kUseMBarrier) {
+      mbarrier_wait(&smem.math_mbar[kNumStages], phases[kNumStages]);
+      phases[kNumStages] ^= 1;
+    }
   }
 
   CUDA_INLINE void seek(uint32_t expert_id, uint32_t m_block_id, uint32_t n_block_id, uint32_t k_block_id) {
@@ -276,7 +282,9 @@ private:
 
 public:
   SharedStorage &smem;
-  uint32_t phase = 0;
+  uint32_t phases[PipelineConfig::kNumStages + 2] = {0};
+  uint32_t cluster_rank = blockIdx.x % PipelineConfig::kMultiCastSize;
+  const uint32_t lane_id = threadIdx.x % 32;
 
   CUDA_INLINE
   ConsumerPipeline(SharedStorage &smem)
@@ -284,18 +292,14 @@ public:
   }
 
   CUDA_INLINE void init_mbarrir() {
-    if constexpr (kUseMBarrier) {
-      phase = 0;
-    }
   }
 
   template <bool kIsFirst = false>
   CUDA_INLINE void wait_stage(uint32_t stage_id) {
     stage_id = kIsFirst ? kNumStages : (stage_id % kNumStages);
     if constexpr (kUseMBarrier) {
-      mbarrier_wait(&smem.load_mbar[stage_id], phase);
-      __syncwarp();
-      if (!kIsFirst && stage_id == 0) phase ^= 1;
+      mbarrier_wait(&smem.load_mbar[stage_id], phases[stage_id]);
+      phases[stage_id] ^= 1;
     } else if constexpr (kUseCpAsync) {
       cp_async_wait_group<kNumStages - 2>();
       __syncthreads();
@@ -307,8 +311,8 @@ public:
   CUDA_INLINE void wait_channel() {
     if constexpr (kHasChannelData) {
       if constexpr (kUseMBarrier) {
-        mbarrier_wait(&smem.load_mbar[kNumStages + 1], 0);
-        __syncwarp();
+        mbarrier_wait(&smem.load_mbar[kNumStages + 1], phases[kNumStages + 1]);
+        phases[kNumStages + 1] ^= 1;
       } else if constexpr (kUseCpAsync) {
         cp_async_wait_group<0>();
         __syncthreads();
@@ -319,6 +323,12 @@ public:
   }
 
   CUDA_INLINE void arrive(uint32_t stage_id) {
-    __mbarrier_arrive(&smem.math_mbar[stage_id]);
+    mbarrier_arrive(&smem.math_mbar[stage_id]);
+    if constexpr (PipelineConfig::kMultiCastSize > 1) {
+      if (cluster_rank >= 1) {
+        void* aa = __cluster_map_shared_rank(&smem.math_mbar[stage_id], 0);
+        mbarrier_arrive<true>(aa);
+      }
+    }
   }
 };

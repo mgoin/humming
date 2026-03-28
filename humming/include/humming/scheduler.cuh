@@ -15,6 +15,7 @@ private:
   static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
   static constexpr uint32_t kTopK = MoEConfig::kTopK;
   static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
+  static constexpr uint32_t kMultiCastSize = PipelineConfig::kMultiCastSize;
 
   static constexpr bool kIsGroupInputScale = QuantParamConfig::kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
   static constexpr bool kIsGroupWeightScale = QuantParamConfig::kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
@@ -24,6 +25,7 @@ private:
 
   static constexpr uint32_t N_BLOCKS = ProblemShape::N / BlockShape::N;
   static constexpr uint32_t K_BLOCKS = ProblemShape::K / BlockShape::K;
+  static constexpr bool kUseMMajorScheduler = SchedulerConfig::kUseMMajorScheduler;
 
   uint32_t m_blocks;
   uint32_t mn_blocks;
@@ -50,27 +52,30 @@ public:
   uint32_t slice_count;
   uint32_t slice_id;
   uint32_t locks_offset;
+  uint32_t cluster_rank = blockIdx.x % kMultiCastSize;
+  uint32_t shape_m;
 
   CUDA_INLINE
   Scheduler(SharedStorage &smem, const uint32_t *row_index_blocks, const uint32_t *expert_ids, uint32_t shape_m)
-      : smem(smem), row_index_blocks(row_index_blocks), expert_ids(expert_ids) {
-    m_blocks = CEIL_DIV(shape_m, BlockShape::M);
+      : smem(smem), row_index_blocks(row_index_blocks), expert_ids(expert_ids), shape_m(shape_m) {
+    m_blocks = CEIL_DIV(shape_m, BlockShape::M * kMultiCastSize);
     mn_blocks = m_blocks * N_BLOCKS;
     mnk_blocks = mn_blocks * K_BLOCKS;
+    uint32_t kNumCtaGroups = gridDim.x / kMultiCastSize;
 
     if constexpr (kUseStreamK) {
 
       uint32_t streamk_mn_blocks = mn_blocks;
-      if (mn_blocks > gridDim.x) {
-        streamk_mn_blocks = mn_blocks % gridDim.x;
-        if (streamk_mn_blocks && streamk_mn_blocks * 10 <= gridDim.x) streamk_mn_blocks += gridDim.x;
+      if (mn_blocks > kNumCtaGroups) {
+        streamk_mn_blocks = mn_blocks % kNumCtaGroups;
+        if (streamk_mn_blocks && streamk_mn_blocks * 10 <= kNumCtaGroups) streamk_mn_blocks += kNumCtaGroups;
       }
 
-      dp_mn_iters = (mn_blocks - streamk_mn_blocks) / gridDim.x;
+      dp_mn_iters = (mn_blocks - streamk_mn_blocks) / kNumCtaGroups;
 
       uint32_t streamk_mnk_blocks = streamk_mn_blocks * K_BLOCKS;
 
-      streamk_mnk_total_iters = CEIL_DIV(streamk_mnk_blocks, gridDim.x);
+      streamk_mnk_total_iters = CEIL_DIV(streamk_mnk_blocks, kNumCtaGroups);
 
       constexpr int32_t blocks_per_group = kMaxGroupSize / BlockShape::K;
 
@@ -78,7 +83,7 @@ public:
         streamk_mnk_total_iters = blocks_per_group * CEIL_DIV(streamk_mnk_total_iters, blocks_per_group);
       };
 
-      streamk_mnk_next_index = gridDim.x * dp_mn_iters * K_BLOCKS + streamk_mnk_total_iters * blockIdx.x;
+      streamk_mnk_next_index = kNumCtaGroups * dp_mn_iters * K_BLOCKS + streamk_mnk_total_iters * (blockIdx.x / kMultiCastSize);
 
       if (streamk_mnk_next_index >= mnk_blocks) {
         streamk_mnk_iters = 0;
@@ -87,15 +92,15 @@ public:
         if (streamk_mnk_iters > streamk_mnk_total_iters) streamk_mnk_iters = streamk_mnk_total_iters;
       };
     } else {
-      dp_mn_iters = mn_blocks / gridDim.x;
-      if (blockIdx.x < mn_blocks % gridDim.x) { dp_mn_iters += 1; };
+      dp_mn_iters = mn_blocks / kNumCtaGroups;
+      if (blockIdx.x / kMultiCastSize < mn_blocks % kNumCtaGroups) { dp_mn_iters += 1; };
     }
 
     dp_mn_total_iters = dp_mn_iters;
     slice_count = 1;
     slice_id = 0;
 
-    if (dp_mn_iters) { dp_mn_next_index = blockIdx.x; };
+    if (dp_mn_iters) { dp_mn_next_index = blockIdx.x / kMultiCastSize; };
   };
 
 
@@ -104,11 +109,18 @@ public:
     bool has_next_block = false;
     if (dp_mn_iters) {
       slice_iters = K_BLOCKS;
-      m_block_id = dp_mn_next_index / N_BLOCKS;
-      n_block_id = dp_mn_next_index % N_BLOCKS;
-      k_block_id = 0;
 
-      dp_mn_next_index += gridDim.x;
+      if constexpr (!kUseMMajorScheduler) {
+        m_block_id = dp_mn_next_index / N_BLOCKS;
+        n_block_id = dp_mn_next_index % N_BLOCKS;
+        m_block_id = m_block_id * kMultiCastSize + cluster_rank;
+      } else {
+        m_block_id = dp_mn_next_index % m_blocks;
+        n_block_id = dp_mn_next_index / m_blocks;
+        n_block_id = n_block_id * kMultiCastSize + cluster_rank;
+      }
+      k_block_id = 0;
+      dp_mn_next_index += gridDim.x / kMultiCastSize;
       dp_mn_iters--;
       has_next_block = true;
     } else if constexpr (kUseStreamK) {
@@ -124,8 +136,16 @@ public:
   bool get_streamk_next_block() {
     if (!streamk_mnk_iters) return false;
     uint32_t streamk_mn_index = streamk_mnk_next_index / K_BLOCKS;
-    m_block_id = streamk_mn_index / N_BLOCKS;
-    n_block_id = streamk_mn_index % N_BLOCKS;
+
+    if constexpr (!kUseMMajorScheduler) {
+      m_block_id = streamk_mn_index / N_BLOCKS;
+      n_block_id = streamk_mn_index % N_BLOCKS;
+      m_block_id = m_block_id * kMultiCastSize + cluster_rank;
+    } else {
+      m_block_id = streamk_mn_index % m_blocks;
+      n_block_id = streamk_mn_index / m_blocks;
+      n_block_id = n_block_id * kMultiCastSize + cluster_rank;
+    }
     k_block_id = streamk_mnk_next_index - streamk_mn_index * K_BLOCKS;
 
     slice_iters = K_BLOCKS - k_block_id;
@@ -149,7 +169,8 @@ public:
 
     slice_id = slice_count - 1 - slice_id;
 
-    locks_offset = streamk_mn_index - dp_mn_total_iters * gridDim.x;
+    locks_offset = streamk_mn_index - dp_mn_total_iters * gridDim.x / kMultiCastSize;
+    locks_offset = locks_offset * kMultiCastSize + cluster_rank;
 
     return true;
   };

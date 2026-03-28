@@ -187,8 +187,8 @@ class WgmmaOpClassImpl:
             f"using DRegisters = {self.reg_cd_type}[{self.reg_cd_count}];",
             "",
             "CUDA_INLINE",
-            f"static void fma(uint32_t *a, uint64_t &desc, {reg_cd_type} *d, bool pred = false) {{",
-            *self.generate_ptx(indent=2, has_scale_d=False).strip("\n").split("\n"),
+            f"static void fma(uint32_t *a, uint64_t &desc, {reg_cd_type} *d, bool pred = true) {{",
+            *self.generate_ptx(indent=2, has_scale_d=True).strip("\n").split("\n"),
             "};",
         ]
 
@@ -198,7 +198,7 @@ class WgmmaOpClassImpl:
 
         return code
 
-    def generate_ptx(self, indent=2, has_scale_d=False):
+    def generate_ptx(self, indent=2, has_scale_d=True):
         a_dtype = self.a_dtype
         b_dtype = self.b_dtype
         cd_dtype = self.cd_dtype

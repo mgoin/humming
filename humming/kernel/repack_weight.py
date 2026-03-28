@@ -18,6 +18,7 @@ auto ptr = reinterpret_cast<void*>(&weight_repack_nk<
     {{is_weight_pakced}},
     {{should_preprocess_for_int2fp}},
     {{should_preprocess_with_zp}},
+    {{use_wgmma}},
     {{group_size_zp}}
   >);
 """)
@@ -31,6 +32,7 @@ class RepackWeightKernel(KernelRuntime):
     is_weight_pakced: bool
     should_preprocess_for_int2fp: bool = False
     should_preprocess_with_zp: bool = False
+    use_wgmma: bool = False
     group_size_zp: int = 0
 
     def init_kernel(self):
@@ -43,6 +45,7 @@ class RepackWeightKernel(KernelRuntime):
             is_weight_pakced=int(self.is_weight_pakced),
             should_preprocess_for_int2fp=int(self.should_preprocess_for_int2fp),
             should_preprocess_with_zp=int(self.should_preprocess_with_zp),
+            use_wgmma=int(self.use_wgmma),
             group_size_zp=self.group_size_zp,
         )
         self.arg_types = (

@@ -102,7 +102,7 @@ CUDA_INLINE uint32_t extract_packed_value(uint32_t *smem_row, uint32_t index) {
 template <
     uint32_t kNumBitsB, uint32_t kNumBitsA, bool kPackedInput,
     bool kShouldPreprocessForINT2FP, bool kShouldPreprocessWithZP,
-    uint32_t kGroupSizeZP>
+    bool kShouldTransposeMiniBlock, uint32_t kGroupSizeZP>
 __global__ void weight_repack_nk(
     const uint32_t *in_ptr, uint32_t *out_ptr, const uint32_t *zp_ptr,
     uint32_t shape_n, uint32_t shape_k,
@@ -224,7 +224,11 @@ __global__ void weight_repack_nk(
         uint32_t i4 = i % 2;
         uint32_t i5 = j % 2;
         uint32_t i6 = k;
-        tmp[i1][i2][i3][i4][i5][i6] = extract_value;
+        if constexpr (kShouldTransposeMiniBlock) {
+          tmp[i1][i2][i3][i5][i4][i6] = extract_value;
+        } else {
+          tmp[i1][i2][i3][i4][i5][i6] = extract_value;
+        }
       }
     }
   }

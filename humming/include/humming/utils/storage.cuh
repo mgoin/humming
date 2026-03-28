@@ -77,5 +77,5 @@ public:
   uint32_t topk_weights[kIsMoE ? BlockShape::M : 0];
 
   uint64_t load_mbar[kUseMBarrier ? (kNumStages + 2) : 0];
-  uint64_t math_mbar[kUseWarpSpec ? kNumStages : 0];
+  uint64_t math_mbar[kUseWarpSpec ? (kNumStages + 1) : 0];
 };

@@ -106,6 +106,7 @@ def repack_weight(
     is_weight_pakced: bool,
     should_preprocess_for_int2fp: bool = False,
     should_preprocess_with_zp: bool = False,
+    use_wgmma: bool = False,
     group_size_zp: int = 0,
     padded_shape_n: int | None = None,
     padded_shape_k: int | None = None,
@@ -152,6 +153,7 @@ def repack_weight(
             is_weight_pakced=is_weight_pakced,
             should_preprocess_for_int2fp=should_preprocess_for_int2fp,
             should_preprocess_with_zp=should_preprocess_with_zp,
+            use_wgmma=use_wgmma,
             group_size_zp=group_size_zp,
         )
 

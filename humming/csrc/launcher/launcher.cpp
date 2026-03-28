@@ -149,6 +149,17 @@ Tensor launch_kernel(
   config.blockDimX = kernel_data.num_threads;
   config.blockDimY = 1;
   config.blockDimZ = 1;
+
+  CUlaunchAttribute attrs[1]; 
+  if (kernel_data.multi_cast_size > 1) {
+    attrs[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+    attrs[0].value.clusterDim.x = kernel_data.multi_cast_size;
+    attrs[0].value.clusterDim.y = 1;
+    attrs[0].value.clusterDim.z = 1;
+    config.attrs = attrs;
+    config.numAttrs = 1;
+  }
+
   config.sharedMemBytes = kernel_data.smem_size;
   config.hStream = get_current_cuda_stream(dev);
 
@@ -196,6 +207,7 @@ int64_t register_kernel(const std::string &cubin_path, const std::string &func_n
         reader.getUint32("WEIGHT_SCALE_GROUP_SIZE"),
         reader.getUint32("TOP_K"),
         reader.getUint32("NUM_CTAS_PER_SM"),
+        reader.getUint32("MULTI_CAST_SIZE"),
 
         reader.getBool("USE_STREAM_K"),
         reader.getBool("IS_MOE"),

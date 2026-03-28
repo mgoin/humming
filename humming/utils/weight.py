@@ -153,6 +153,7 @@ def prepare_humming_weight(
     weight: torch.Tensor,
     b_dtype: dtypes.DataType,
     a_dtype: dtypes.DataType,
+    use_wgmma: bool = False,
     zero_point: torch.Tensor | None = None,
     packed: bool = False,
     padded_shape_n: int | None = None,
@@ -211,6 +212,7 @@ def prepare_humming_weight(
         is_weight_pakced=packed,
         should_preprocess_for_int2fp=should_preprocess_for_int2fp,
         should_preprocess_with_zp=should_preprocess_with_zp,
+        use_wgmma=use_wgmma,
         group_size_zp=group_size_zp,
     )
 

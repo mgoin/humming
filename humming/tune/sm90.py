@@ -81,13 +81,7 @@ class Sm90Heuristics(DeviceHeuristics):
                 "warp_shape": (128, 64, 64),
                 "num_ctas_per_sm": 2,
             }
-        else:
-            return {
-                "block_shape": (128, 128, 64),
-                "warp_shape": (128, 32, 64),
-                "num_ctas_per_sm": 2,
-            }
-        elif group_size == 0:
+        elif group_size == 0 or a_dtype.num_bits == 16:
             return {
                 "block_shape": (128, 128, 1024 // a_dtype.num_bits),
                 "warp_shape": (128, 32, 1024 // a_dtype.num_bits),

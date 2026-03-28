@@ -78,6 +78,7 @@ struct KernelData {
   uint32_t weight_scale_group_size;
   uint32_t top_k;
   uint32_t num_ctas_per_sm;
+  uint32_t multi_cast_size;
 
   bool use_stream_k;
   bool is_moe;

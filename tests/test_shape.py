@@ -98,7 +98,7 @@ def test_shape(
     )
 
     _, weight_ref, weight, weight_scale, _, _ = random_weight_data
-    weight = prepare_humming_weight(weight, b_dtype, a_dtype)
+    weight = prepare_humming_weight(weight, b_dtype, a_dtype, use_wgmma=mma_type == "wgmma")
 
     if mma_type == "mma":
         to_apply_on_c = weight_scale_group_size == 0 or a_dtype.num_bits != 16

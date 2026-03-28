@@ -183,11 +183,11 @@ public:
         for (uint32_t k = 0; k < 2; k++) {
           uint32_t g = k % kNumGroupsB;
           if constexpr (kIsFpZeroPoint) {
-            scalar_t2 bzp_single = bzp_f16_ptr[g][i];
+            scalar_t2 bzp_single = bzp_f16_ptr[g][MmaOpClass::kMmaType == MmaType::WGMMA ? k : i];
             b_f16_ptr[i * 2 + k] = __hsub2(b_f16_ptr[i * 2 + k], bzp_single);
           }
           if constexpr (kIsGroupWeightScale) {
-            scalar_t2 bs_single = bs_f16_ptr[g][i];
+            scalar_t2 bs_single = bs_f16_ptr[g][MmaOpClass::kMmaType == MmaType::WGMMA ? k : i];
             b_f16_ptr[i * 2 + k] = __hmul2(b_f16_ptr[i * 2 + k], bs_single);
           }
         };

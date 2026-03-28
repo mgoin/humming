@@ -12,6 +12,7 @@ from humming.config.enum import ActivationType, MmaType
 @dataclasses.dataclass
 class SchedulerConfig(BaseHummingConfig):
     use_stream_k: bool = True
+    use_m_major_scheduler: bool = False
 
 
 @dataclasses.dataclass
@@ -29,6 +30,7 @@ class PipelineConfig(BaseHummingConfig):
     use_tma_bzp: bool | None = None
     use_tma_bias: bool | None = None
     num_write_splits: int = 1
+    multi_cast_size: int = 1
 
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
         "num_threads",

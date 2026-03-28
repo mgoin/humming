@@ -42,6 +42,8 @@ public:
 
   CUDA_INLINE
   void transform_b(uint32_t buffer_id) {
+    if constexpr (std::is_same<ElementA, ElementB>::value) return;
+
     if constexpr (ElementB::kBits == 1 && kNumWarpShapeNSplits == 2) {
       regs_qb[buffer_id][0] = regs_qb[buffer_id][0] >> (threadIdx.x / 32 % 2 * 8);
     }
@@ -79,7 +81,11 @@ public:
 
   template <class T = uint32_t>
   CUDA_INLINE T *regs_qb_as_ptr(uint32_t buffer_id) {
-    return reinterpret_cast<T *>(regs_qb[buffer_id]);
+    if constexpr (std::is_same<ElementA, ElementB>::value) {
+      return reinterpret_cast<T *>(regs_b[buffer_id]);
+    } else {
+      return reinterpret_cast<T *>(regs_qb[buffer_id]);
+    };
   };
 
   template <class T = uint32_t>

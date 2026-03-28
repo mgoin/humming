@@ -90,7 +90,7 @@ def test_pipeline(
     elif mma_type == "wgmma":
         to_apply_on_c = weight_scale_group_size == 0
 
-    weight = prepare_humming_weight(weight, b_dtype, a_dtype)
+    weight = prepare_humming_weight(weight, b_dtype, a_dtype, use_wgmma=mma_type == "wgmma")
     weight_scale = prepare_humming_weight_scale(
         weight_scale,
         to_apply_on_c=to_apply_on_c,
@@ -214,7 +214,7 @@ def test_write_splits(
     elif mma_type == "wgmma":
         to_apply_on_c = weight_scale_group_size == 0
 
-    weight = prepare_humming_weight(weight, b_dtype, a_dtype)
+    weight = prepare_humming_weight(weight, b_dtype, a_dtype, use_wgmma=mma_type == "wgmma")
     weight_scale = prepare_humming_weight_scale(
         weight_scale,
         to_apply_on_c=to_apply_on_c,
@@ -238,7 +238,7 @@ def test_write_splits(
         b_dtype=b_dtype,
         c_dtype=c_dtype,
         bs_dtype=bs_dtype,
-        num_stages=2,
+        num_stages=2 if mma_type == "mma" else 3,
         use_warp_spec=False,
         input_scale_group_size=input_scale_group_size,
         weight_scale_group_size=weight_scale_group_size,
@@ -248,7 +248,7 @@ def test_write_splits(
         mma_type=mma_type,
         use_mbarrier=False,
         use_stream_k=False,
-        writer_splits=num_write_splits,
+        num_write_splits=num_write_splits,
     )
 
     torch_dtype = dtypes.torch_dtype_map[c_dtype]

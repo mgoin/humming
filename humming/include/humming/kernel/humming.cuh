@@ -55,7 +55,7 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
       SchedulerConfig, PipelineConfig, QuantParamConfig, MoEConfig>;
   using ProducerPipeline = ProducerPipeline<
       SharedStorage, ProblemShape, BlockShape, PadShape, ElementA, ElementB, ElementBS,
-      PipelineConfig, EpilogueConfig, QuantParamConfig, MoEConfig>;
+      SchedulerConfig, PipelineConfig, EpilogueConfig, QuantParamConfig, MoEConfig>;
   using ConsumerPipeline = ConsumerPipeline<SharedStorage, PipelineConfig, EpilogueConfig, QuantParamConfig, MoEConfig>;
   using MainloopArithmetic = MainloopArithmetic<
       MmaOpClass, BlockShape, WarpShape,
@@ -93,14 +93,14 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
   auto consumer = ConsumerPipeline(smem);
   auto s2r_pipe = S2RMemoryPipeline(smem, mma, epilogue);
 
+  producer.init_mbarrir();
+  __syncthreads();
+
   while (scheduler.get_next_block()) {
     mma.zero_accum();
     __syncthreads();
 
     uint32_t &slice_iters = scheduler.slice_iters;
-    producer.init_mbarrir();
-    consumer.init_mbarrir();
-    __syncthreads();
     producer.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.k_block_id);
     epilogue.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id);
     epilogue.set_streamk_state(scheduler.slice_count, scheduler.slice_id, scheduler.locks_offset);
@@ -130,11 +130,11 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
           if (warp_k_iter_id == warp_k_iters - 2) {
             if constexpr (kNumStages == 2) {
               __syncthreads();
-              consumer.wait_stage((stage_id + 1) % kNumStages);
+              if (slice_iters > 1) consumer.wait_stage((stage_id + 1) % kNumStages);
               producer.load_stage(stage_id, slice_iters > kNumStages);
             } else {
               producer.load_stage(stage_id + kNumStages - 1, slice_iters >= kNumStages);
-              consumer.wait_stage((stage_id + 1) % kNumStages);
+              if (slice_iters > 1) consumer.wait_stage((stage_id + 1) % kNumStages);
             }
 
             __syncthreads();

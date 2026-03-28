@@ -11,11 +11,10 @@ CUDA_INLINE uint64_t make_wgmma_smem_desc(void *smem_ptr, uint32_t iter_id) {
   constexpr uint64_t stride = (swizzle_bytes * 8) >> 4;
   constexpr uint64_t desc_base = (swizzle_type << 62) | (stride << 32);
 
-  uint64_t addr = cast_smem_ptr_to_uint(smem_ptr);
+  uint32_t addr = cast_smem_ptr_to_uint(smem_ptr);
   uint64_t desc = desc_base;
-  uint64_t base_offset = 0;
 
-  desc |= (addr >> 4);
+  reinterpret_cast<uint32_t*>(&desc)[0] = (addr >> 4);
 
   return desc;
 };
@@ -78,6 +77,8 @@ public:
 
   CUDA_INLINE
   void transform_b(uint32_t buffer_id) {
+    if constexpr (std::is_same<ElementA, ElementB>::value) return;
+
     if constexpr (ElementB::kBits == 1 && kNumWarpShapeNSplits == 2) {
       regs_qb[buffer_id][0] = regs_qb[buffer_id][0] >> (threadIdx.x / 32 % 2 * 8);
     }
@@ -89,9 +90,6 @@ public:
       uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
       dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
       arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
-      uint32_t tmp = regs_b_ptr[1];
-      regs_b_ptr[1] = regs_b_ptr[2];
-      regs_b_ptr[2] = tmp;
     };
   };
 
@@ -118,9 +116,21 @@ public:
     }
   };
 
+  template <class T>
+  CUDA_INLINE void fence_regs(T & regs) {
+    PRAGMA_UNROLL
+    for (uint32_t r = 0; r < sizeof(T) / 4; r++) {
+      warpgroup_fence_operand(reinterpret_cast<uint32_t*>(regs)[r]);
+    }
+  };
+
   template <class T = uint32_t>
   CUDA_INLINE T *regs_qb_as_ptr(uint32_t buffer_id) {
-    return reinterpret_cast<T *>(regs_qb[buffer_id]);
+    if constexpr (std::is_same<ElementA, ElementB>::value) {
+      return reinterpret_cast<T *>(regs_b[buffer_id]);
+    } else {
+      return reinterpret_cast<T *>(regs_qb[buffer_id]);
+    };
   };
 
   template <class T = uint32_t>

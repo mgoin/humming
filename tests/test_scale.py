@@ -101,7 +101,7 @@ def test_scale(
     elif mma_type == "wgmma":
         to_apply_on_c = weight_scale_group_size == 0
 
-    weight = prepare_humming_weight(weight, b_dtype, a_dtype)
+    weight = prepare_humming_weight(weight, b_dtype, a_dtype, use_wgmma=mma_type == "wgmma")
     weight_scale = prepare_humming_weight_scale(weight_scale, to_apply_on_c=to_apply_on_c)
 
     _, inputs_ref, inputs, input_scale = generate_random_inputs(

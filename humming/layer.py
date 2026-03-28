@@ -378,6 +378,7 @@ class HummingMethod:
             b_dtype=meta.b_dtype,
             a_dtype=meta.a_dtype,
             zero_point=zero_point,
+            use_wgmma=meta.mma_type == MmaType.WGMMA,
             packed=True,
         )
 
