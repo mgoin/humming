@@ -17,10 +17,8 @@ private:
   static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
   static constexpr uint32_t kMultiCastSize = PipelineConfig::kMultiCastSize;
 
-  static constexpr bool kIsGroupInputScale = QuantParamConfig::kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
-  static constexpr bool kIsGroupWeightScale = QuantParamConfig::kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
-  static constexpr uint32_t kInputScaleGroupSize = kIsGroupInputScale ? QuantParamConfig::kInputScaleGroupSize : 1;
-  static constexpr uint32_t kWeightScaleGroupSize = kIsGroupWeightScale ? QuantParamConfig::kWeightScaleGroupSize : 1;
+  static constexpr uint32_t kInputScaleGroupSize = QuantParamConfig::kInputScaleGroupSize > 0 ? QuantParamConfig::kInputScaleGroupSize : 1;
+  static constexpr uint32_t kWeightScaleGroupSize = QuantParamConfig::kWeightScaleGroupSize > 0 ? QuantParamConfig::kWeightScaleGroupSize : 1;
   static constexpr uint32_t kMaxGroupSize = MAX(kInputScaleGroupSize, kWeightScaleGroupSize);
 
   static constexpr uint32_t N_BLOCKS = ProblemShape::N / BlockShape::N;

@@ -94,8 +94,8 @@ inline void check_tensor_c(Tensor &tensor, KernelData &kernel_data, int64_t dev,
 };
 
 inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t shape_m) {
-  if (!kernel_data.has_input_scale) return;
-  ASSERT_CHECK(tensor.has_value(), "as must not be none if has_input_scale");
+  if (get_dtype_num_bits(kernel_data.a_dtype_id) == 16) return;
+  ASSERT_CHECK(tensor.has_value(), "as must not be none for 4b or 8b activation");
 
   uint32_t problem_shape_k = kernel_data.problem_shape_k;
   uint32_t group_size = kernel_data.input_scale_group_size;
@@ -108,17 +108,23 @@ inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_da
 };
 
 inline void check_tensor_bs(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t num_experts) {
-  if (!kernel_data.has_weight_scale) return;
-  ASSERT_CHECK(tensor.has_value(), "bs must not be none if has_weight_scale");
-
+  if (kernel_data.is_tensor_weight_scale && !kernel_data.is_group_weight_scale) return;
   uint32_t problem_shape_k = kernel_data.problem_shape_k;
+  uint32_t problem_shape_n = kernel_data.problem_shape_n;
   uint32_t group_size = kernel_data.weight_scale_group_size;
+  uint32_t group_size_n = kernel_data.weight_scale_group_size_n;
+
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(problem_shape_k, group_size);
+  uint32_t num_groups_n = group_size_n == 0 ? 1 : CEIL_DIV(problem_shape_n, group_size_n);
 
   std::vector<int64_t> expected_shape = {};
   if (kernel_data.is_moe) expected_shape.push_back(num_experts);
   expected_shape.push_back(num_groups);
-  expected_shape.push_back(kernel_data.problem_shape_n);
+  if (kernel_data.is_block_weight_scale) {
+    expected_shape.push_back(num_groups_n);
+  } else {
+    expected_shape.push_back(kernel_data.problem_shape_n);
+  }
   auto expected_dtype = dtype_id_to_tensor_dtype(kernel_data.bs_dtype_id);
   check_tensor_common(tensor.value(), "bs", dev, expected_dtype, expected_shape);
 };
@@ -157,7 +163,7 @@ inline void check_tensor_bias(std::optional<Tensor> &tensor, KernelData &kernel_
 };
 
 inline void check_tensor_gs(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t num_experts) {
-  if (!kernel_data.has_global_scale) return;
+  if (!kernel_data.is_tensor_weight_scale) return;
   ASSERT_CHECK(tensor.has_value(), "gs must not be none if has_global_scale");
   std::vector<int64_t> expected_shape = {kernel_data.is_moe ? num_experts : 1};
   check_tensor_common(tensor.value(), "gs", dev, ScalarType::Float, expected_shape);
@@ -249,6 +255,9 @@ inline CUtensorMap make_tma_desc_bzp(std::optional<Tensor> &tensor_, KernelData 
   uint32_t block_shape_n = kernel_data.block_shape_n;
   uint32_t block_shape_k = kernel_data.block_shape_k;
   uint32_t group_size = kernel_data.weight_scale_group_size;
+  if (kernel_data.is_channel_weight_scale || kernel_data.is_group_weight_scale) {
+    ASSERT_CHECK(false, "TMA is not supported for blockwise scale and tensorwise scale");
+  }
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(block_shape_k, group_size);
 
   auto tensor = tensor_.value();

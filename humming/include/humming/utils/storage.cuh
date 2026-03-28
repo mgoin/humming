@@ -11,12 +11,13 @@ template <
     class QuantParamConfig, class MoEConfig>
 struct SharedStorage {
 private:
-  static constexpr bool kHasInputScale = QuantParamConfig::kHasInputScale;
-  static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
-  static constexpr bool kHasChannelInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
-  static constexpr bool kHasGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
-  static constexpr bool kHasChannelWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
-  static constexpr bool kHasGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
+  static constexpr bool kHasInputScale = ElementA::kBits != 16;
+  static constexpr bool kIsChannelInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
+  static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
+  static constexpr bool kIsChannelWeightScale = QuantParamConfig::kIsChannelWeightScale;
+  static constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
+  static constexpr bool kIsGroupOrBlockWeightScale = kIsGroupWeightScale || kIsBlockWeightScale;
   static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
 
@@ -39,8 +40,8 @@ public:
 
   static constexpr uint32_t kGroupSzieA = QuantParamConfig::kInputScaleGroupSize;
   static constexpr uint32_t kGroupSzieB = QuantParamConfig::kWeightScaleGroupSize;
-  static constexpr uint32_t kNumGroupsA = kHasGroupInputScale ? CEIL_DIV(BlockShape::K, kGroupSzieA) : 0;
-  static constexpr uint32_t kNumGroupsB = kHasGroupWeightScale ? CEIL_DIV(BlockShape::K, kGroupSzieB) : 0;
+  static constexpr uint32_t kNumGroupsA = kIsGroupInputScale ? CEIL_DIV(BlockShape::K, kGroupSzieA) : 0;
+  static constexpr uint32_t kNumGroupsB = kIsGroupOrBlockWeightScale ? CEIL_DIV(BlockShape::K, kGroupSzieB) : 0;
 
   static constexpr uint32_t kStageSizeA = BlockShape::M * kSmemStrideA;
   static constexpr uint32_t kStageSizeB = BlockShape::K / kPartMmaShapeK * kSmemStrideB;
@@ -48,9 +49,9 @@ public:
   static constexpr uint32_t kStageSizeBS = kNumGroupsB * kSmemStrideBS;
   static constexpr uint32_t kStageSizeBZP = kNumGroupsB * kSmemStrideBZP;
 
-  static constexpr uint32_t kChannelSizeAS = kHasChannelInputScale ? BlockShape::M / 4 : 0;
-  static constexpr uint32_t kChannelSizeBS = kHasChannelWeightScale ? kSmemStrideBS : 0;
-  static constexpr uint32_t kChannelSizeBZP = (kHasChannelWeightScale && kHasZeroPoint) ? kSmemStrideBZP : 0;
+  static constexpr uint32_t kChannelSizeAS = kIsChannelInputScale ? BlockShape::M / 4 : 0;
+  static constexpr uint32_t kChannelSizeBS = kIsChannelWeightScale ? kSmemStrideBS : 0;
+  static constexpr uint32_t kChannelSizeBZP = (kIsChannelWeightScale && kHasZeroPoint) ? kSmemStrideBZP : 0;
   static constexpr uint32_t kBiasSize = EpilogueConfig::kHasBias ? kSmemStrideBias : 0;
 
   static constexpr bool kUseWarpSpec = PipelineConfig::kUseWarpSpec;
@@ -64,7 +65,7 @@ public:
       int4 b[kNumStages][kStageSizeB];
       int4 as[kNumStages][kStageSizeAS];
       int4 bs[kNumStages][kStageSizeBS];
-      int4 bzp[kHasChannelWeightScale ? 1 : kNumStages][kHasChannelWeightScale ? kChannelSizeBZP : kStageSizeBZP];
+      int4 bzp[kIsChannelWeightScale ? 1 : kNumStages][kIsChannelWeightScale ? kChannelSizeBZP : kStageSizeBZP];
       int4 bs_c[kChannelSizeBS];
       int4 bias[kBiasSize];
       int4 as_c[kChannelSizeAS];

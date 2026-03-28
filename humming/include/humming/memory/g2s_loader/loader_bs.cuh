@@ -16,18 +16,21 @@ private:
   static constexpr uint32_t kNumLoadThreads = PipelineConfig::kNumLoadThreads;
   static constexpr uint32_t kLoadThreadOffset = PipelineConfig::kNumThreads - kNumLoadThreads;
 
-  static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
-  static constexpr bool kIsChannelScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
-  static constexpr bool kIsGroupScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
-  static constexpr uint32_t kGroupSize = kIsChannelScale ? ProblemShape::K : QuantParamConfig::kWeightScaleGroupSize;
+  static constexpr bool kIsChannel = QuantParamConfig::kIsChannelWeightScale;
+  static constexpr bool kIsGroup = QuantParamConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlock = QuantParamConfig::kIsBlockWeightScale;
+  static constexpr bool kIsTensor = QuantParamConfig::kIsTensorWeightScale;
+  static constexpr bool kIsGroupOrBlock = kIsGroup || kIsBlock;
+  static constexpr uint32_t kGroupSize = !kIsGroupOrBlock ? ProblemShape::K : QuantParamConfig::kWeightScaleGroupSize;
+  static constexpr uint32_t kGroupSizeN = kIsBlock ? QuantParamConfig::kWeightScaleGroupSizeN : 1;
 
-  static constexpr uint32_t kSmemStride = BlockShape::N * ElementBS::kBits / 32 / 4;
+  static constexpr uint32_t kSmemStride = CEIL_DIV(BlockShape::N, kGroupSizeN) * ElementBS::kBits / 32 / 4;
   static constexpr uint32_t kGmemStride = ProblemShape::N * ElementBS::kBits / 32 / 4;
-  static constexpr uint32_t kProblemNumGroups = CEIL_DIV(ProblemShape::K, (kHasWeightScale ? kGroupSize : 1));
+  static constexpr uint32_t kProblemNumGroups = CEIL_DIV(ProblemShape::K, kGroupSize);
   static constexpr uint32_t kGmemExpertStride = kGmemStride * kProblemNumGroups;
-  static constexpr uint32_t kNumGroups = CEIL_DIV(BlockShape::K, (kHasWeightScale ? kGroupSize : 1));
+  static constexpr uint32_t kNumGroups = CEIL_DIV(BlockShape::K, kGroupSize);
   static constexpr uint32_t kNumInt4s = kSmemStride * kNumGroups;
-  static constexpr uint32_t kLoadsPerGroup = kIsChannelScale ? 1 : CEIL_DIV(kGroupSize, BlockShape::K);
+  static constexpr uint32_t kLoadsPerGroup = kIsChannel ? 1 : CEIL_DIV(kGroupSize, BlockShape::K);
 
 public:
   const CUtensorMap *tensor_map_ptr;
@@ -62,14 +65,32 @@ public:
 
   CUDA_INLINE
   void load_legacy(int4 *smem_ptr) {
-    legacy_load_2d<
-        kUseCpAsync, kNumInt4s, kNumLoadThreads,
-        kGmemStride, kSmemStride, kLoadThreadOffset>(gmem_ptr, smem_ptr);
+    if constexpr (kIsBlock) {
+      constexpr uint32_t kLoadBytes = CEIL_DIV(BlockShape::N, kGroupSizeN) * 4;
+      using LoadType = typename LoadTypeChooser<kLoadBytes>::Type;
+      constexpr uint32_t kLoadStride = ProblemShape::N / kGroupSizeN * 4 / kLoadBytes;
+
+      if (threadIdx.x < CEIL_DIV(BlockShape::K, kGroupSize) * CEIL_DIV(BlockShape::N, kGroupSizeN * kLoadBytes / 4)) {
+        const LoadType* gmem_ptr_load = reinterpret_cast<const LoadType *>(gmem_ptr_raw);
+        LoadType* smem_ptr_load = reinterpret_cast<LoadType *>(smem_ptr);
+
+        const uint32_t gmem_row = row_offset + threadIdx.x / CEIL_DIV(BlockShape::N, kGroupSizeN);
+        const uint32_t gmem_col = col_offset + threadIdx.x % CEIL_DIV(BlockShape::N, kGroupSizeN);
+        legacy_load<PipelineConfig::kUseCpAsync>(
+          &gmem_ptr_load[gmem_row * kLoadStride + gmem_col],
+          &smem_ptr_load[threadIdx.x]
+        );
+      }
+    } else {
+      legacy_load_2d<
+          kUseCpAsync, kNumInt4s, kNumLoadThreads,
+          kGmemStride, kSmemStride, kLoadThreadOffset>(gmem_ptr, smem_ptr);
+    }
   }
 
   CUDA_INLINE
   void advance() {
-    if (kIsGroupScale && (kLoadsPerGroup == 1 || counter == 0)) {
+    if (kIsGroupOrBlock && (kLoadsPerGroup == 1 || counter == 0)) {
       row_offset += kNumGroups;
       gmem_ptr += kGmemStride * kNumGroups;
     }
@@ -77,16 +98,23 @@ public:
 
   CUDA_INLINE
   void seek(uint32_t expert_id, uint32_t n_block_id, uint32_t k_block_id) {
-    col_offset = n_block_id * (BlockShape::N / 16);
-
     row_offset = kIsMoE ? kProblemNumGroups * expert_id : 0;
 
-    if constexpr (kIsGroupScale) {
+    if constexpr (kIsGroupOrBlock) {
       if constexpr (BlockShape::K >= kGroupSize) {
         row_offset += k_block_id * kNumGroups;
       } else {
         row_offset += (k_block_id * BlockShape::K) / kGroupSize;
       }
+    }
+
+    if constexpr (kIsBlock) {
+      col_offset = (n_block_id * BlockShape::N) / kGroupSizeN;
+      if constexpr (BlockShape::N >= kGroupSizeN) {
+        col_offset = col_offset / (BlockShape::N / kGroupSizeN);
+      }
+    } else {
+      col_offset = n_block_id * (BlockShape::N / 16);
     }
 
     uint32_t gmem_offset = row_offset * kGmemStride + n_block_id * kSmemStride;

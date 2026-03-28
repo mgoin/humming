@@ -24,12 +24,14 @@ private:
   static constexpr bool kIsMoE = MoEConfig::kIsMoE;
   static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
 
-  static constexpr bool kHasInputScale = QuantParamConfig::kHasInputScale;
-  static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
+  static constexpr bool kHasInputScale = ElementA::kBits != 16;
   static constexpr bool kIsChannelInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
   static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
-  static constexpr bool kIsChannelWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
-  static constexpr bool kIsGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
+  static constexpr bool kIsChannelWeightScale = QuantParamConfig::kIsChannelWeightScale;
+  static constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
+  static constexpr bool kIsGroupOrBlockWeightScale = kIsGroupWeightScale || kIsBlockWeightScale;
+
   static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kHasBias = EpilogueConfig::kHasBias;
 
@@ -70,9 +72,9 @@ public:
     loader_b.load(smem.b[stage_id], mma.regs_qb_as_ptr(buffer_id), iter_id);
     if constexpr (kIsGroupInputScale)
       loader_as.load(smem.as[stage_id], mma.arith.regs_as_as_ptr(buffer_id), iter_id);
-    if constexpr (kIsGroupWeightScale)
+    if constexpr (kIsGroupOrBlockWeightScale)
       loader_bs.load(smem.bs[stage_id], mma.arith.regs_bs_as_ptr(buffer_id), iter_id);
-    if constexpr (kHasZeroPoint && (kIsGroupWeightScale || kIsFirst))
+    if constexpr (kHasZeroPoint && (kIsGroupOrBlockWeightScale || kIsFirst))
       loader_bzp.load(smem.bzp[stage_id], mma.arith.regs_zp_as_ptr(buffer_id), iter_id);
   }
 

@@ -10,9 +10,8 @@ template <
 class S2RMemoryLoaderBZP {
 private:
   static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
-  static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
-  static constexpr bool kIsChannelScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
-  static constexpr bool kIsGroupScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
+  static constexpr bool kIsChannelScale = QuantParamConfig::kIsChannelWeightScale;
+  static constexpr bool kIsGroupScale = QuantParamConfig::kIsGroupWeightScale;
   static constexpr uint32_t kGroupSize = kIsChannelScale ? BlockShape::K : QuantParamConfig::kWeightScaleGroupSize;
   static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
 
@@ -26,7 +25,6 @@ private:
   using LoadType = typename LoadTypeChooser<kLoadBytes>::Type;
   static constexpr uint32_t kSmemStride = BlockShape::N * kNumZPBits / 32 / 4;
   static constexpr uint32_t kSmemStrideLoadType = kSmemStride * 16 / sizeof(LoadType);
-  static constexpr uint32_t kNumGroups = CEIL_DIV(kPartMmaShapeK, kGroupSize);
 
 public:
   CUDA_INLINE
@@ -48,10 +46,7 @@ public:
       LoadType *reg_ptr_load = reinterpret_cast<LoadType *>(regs_ptr);
       const LoadType *smem_ptr_load = reinterpret_cast<const LoadType *>(smem_ptr);
 
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < kNumGroups; i++) {
-        reg_ptr_load[i] = smem_ptr_load[kSmemStrideLoadType * i + zp_sh_rd];
-      };
+      reg_ptr_load[0] = smem_ptr_load[zp_sh_rd];
     } else {
       static_assert(ElementA::kBits == 16);
       uint32_t zp_sh_rd = (threadIdx.x % 32) / 4 + (warp_id % N_WARPS / (64 / WarpShape::N)) * 8;

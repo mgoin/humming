@@ -7,6 +7,7 @@
 
 template <class ElementA, class ElementB, bool kHasZeroPoint = false>
 CUDA_INLINE constexpr uint32_t get_dtype_dequant_exp_offset() {
+  if constexpr (ElementA::kBits <= ElementB::kBits) return 0;
 
   if constexpr (ElementA::kIsFloatingPointType && ElementB::kIsFloatingPointType) {
     constexpr uint32_t source_exp_offset = 1 << (ElementB::kExponentBits - 1);
@@ -96,7 +97,7 @@ CUDA_INLINE constexpr uint2 get_mainloop_exp_offset() {
   }
 
   if constexpr (ElementA::kBits != 16 && kIsF16Accum && kIsGroupWeightScale) {
-    offset.y = total_offset;
+    offset.y = MIN(total_offset, 2);
   }
 
   return offset;

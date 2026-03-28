@@ -162,6 +162,7 @@ class HummingKernel(
 
         self.check_shape()
         self.check_dtype()
+        self.check_scale()
         self.check_config()
         self.mma_op_class = self.select_mma_op_class()
 
@@ -254,17 +255,6 @@ class HummingKernel(
             assert self.warp_shape[1] % mma_shape_n == 0
         assert self.warp_shape[2] % mma_shape_k == 0
 
-        input_group_size = self.problem_shape[2]
-        weight_group_size = self.problem_shape[2]
-        scale_config = self.quant_param_config
-        if scale_config.has_input_scale and scale_config.input_scale_group_size > 0:
-            input_group_size = self.quant_param_config.input_scale_group_size
-        if scale_config.has_weight_scale and scale_config.weight_scale_group_size > 0:
-            weight_group_size = self.quant_param_config.weight_scale_group_size
-        assert min(input_group_size, weight_group_size) >= mma_shape_k // 2
-        if min(input_group_size, weight_group_size) == mma_shape_k // 2:
-            mma_shape_k = mma_shape_k // 2
-
         return MmaOpClass.from_config(
             self.mma_config.mma_type,
             mma_shape_m,
@@ -305,6 +295,22 @@ class HummingKernel(
         elif self.a_dtype.num_bits == 4:
             assert self.warp_shape[1] >= 16
             assert self.warp_shape[2] >= 128
+
+    def check_scale(self):
+        if self.input_scale_group_size > 0:
+            assert self.input_scale_group_size >= 256 // self.a_dtype.num_bits
+        if self.weight_scale_group_size > 0:
+            assert self.weight_scale_group_size >= 256 // self.a_dtype.num_bits
+        if self.weight_scale_group_size_n > 1:
+            assert self.weight_scale_group_size_n >= 64
+
+        if self.is_block_weight_scale:
+            assert self.input_scale_group_size > 0
+            assert self.input_scale_group_size == self.weight_scale_group_size
+            assert self.weight_scale_group_size_n > 0
+            assert not self.has_zero_point
+        if self.is_tensor_weight_scale and not self.is_group_weight_scale:
+            self.bs_dtype = self.c_dtype
 
     def check_dtype(self):
         dtype_map = {
@@ -349,14 +355,11 @@ class HummingKernel(
     def check_config(self):
         # 16-bit activation don't support input scale
         # for 8bit/4-bit activation, we enable input scale by default
-        if self.a_dtype.num_bits == 16:
-            assert self.quant_param_config.has_input_scale is not True
-        if self.quant_param_config.has_input_scale is None:
-            self.quant_param_config.has_input_scale = self.a_dtype.num_bits != 16
-
-        if self.pipeline_config.use_warp_spec:
-            assert self.pipeline_config.use_mbarrier
-        if not self.quant_param_config.has_weight_scale:
+        if self.pipeline_config.use_warp_spec or self.pipeline_config.use_tma:
+            assert self.pipeline_config.use_mbarrie
+        is_channel_weight_scale = self.quant_param_config.is_channel_weight_scale
+        is_group_weight_scale = self.quant_param_config.is_group_weight_scale
+        if not (is_channel_weight_scale or is_group_weight_scale):
             self.pipeline_config.use_tma_bs = False
         if not self.quant_param_config.has_zero_point:
             self.pipeline_config.use_tma_bzp = False

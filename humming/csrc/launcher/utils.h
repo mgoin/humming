@@ -49,6 +49,7 @@ ScalarType dtype_id_to_tensor_dtype(uint32_t dtype_id) {
     case 20080800: return ScalarType::Float8_e8m0fnu;
     case 21160510: return ScalarType::Half;
     case 21160807: return ScalarType::BFloat16;
+    case 21320823: return ScalarType::Float;
     default: {
       uint32_t num_bits = get_dtype_num_bits(dtype_id);
       if (num_bits == 4 || num_bits == 8) return ScalarType::Byte;
@@ -76,6 +77,7 @@ struct KernelData {
   uint32_t pad_shape_k;
   uint32_t input_scale_group_size;
   uint32_t weight_scale_group_size;
+  uint32_t weight_scale_group_size_n;
   uint32_t top_k;
   uint32_t num_ctas_per_sm;
   uint32_t multi_cast_size;
@@ -84,11 +86,12 @@ struct KernelData {
   bool is_moe;
   bool is_moe_down;
   bool is_fp_zero_point;
-  bool has_input_scale;
-  bool has_weight_scale;
+  bool is_channel_weight_scale;
+  bool is_group_weight_scale;
+  bool is_block_weight_scale;
+  bool is_tensor_weight_scale;
   bool has_zero_point;
   bool has_bias;
-  bool has_global_scale;
   bool use_tma_a;
   bool use_tma_b;
   bool use_tma_c;

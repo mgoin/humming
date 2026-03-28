@@ -17,10 +17,9 @@ private:
   static constexpr uint32_t kLoadThreadOffset = PipelineConfig::kNumThreads - kNumLoadThreads;
 
   static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
-  static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
-  static constexpr bool kIsChannelScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
-  static constexpr bool kIsGroupScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
-  static constexpr uint32_t kGroupSize = kIsGroupScale ? QuantParamConfig::kWeightScaleGroupSize : ProblemShape::K;
+  static constexpr bool kIsChannel = QuantParamConfig::kIsChannelWeightScale;
+  static constexpr bool kIsGroup = QuantParamConfig::kIsGroupWeightScale;
+  static constexpr uint32_t kGroupSize = kIsGroup ? QuantParamConfig::kWeightScaleGroupSize : ProblemShape::K;
 
   static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementB::kBits));
   static constexpr uint32_t kSmemStride = BlockShape::N * kNumZPBits / 32 / 4;
@@ -29,7 +28,7 @@ private:
   static constexpr uint32_t kGmemExpertStride = kGmemStride * kProblemNumGroups;
   static constexpr uint32_t kNumGroups = CEIL_DIV(BlockShape::K, kGroupSize);
   static constexpr uint32_t kNumInt4s = kSmemStride * kNumGroups;
-  static constexpr uint32_t kLoadsPerGroup = kIsChannelScale ? 1 : CEIL_DIV(kGroupSize, BlockShape::K);
+  static constexpr uint32_t kLoadsPerGroup = kIsChannel ? 1 : CEIL_DIV(kGroupSize, BlockShape::K);
 
 public:
   const CUtensorMap *tensor_map_ptr;
@@ -79,7 +78,7 @@ public:
     row_offset = kIsMoE ? kProblemNumGroups * expert_id : 0;
     col_offset = n_block_id * (BlockShape::N * kNumZPBits / 32);
 
-    if constexpr (kIsGroupScale) {
+    if constexpr (kIsGroup) {
       if constexpr (BlockShape::K >= kGroupSize) {
         row_offset += k_block_id * kNumGroups;
       } else {

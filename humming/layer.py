@@ -49,14 +49,11 @@ class HummingLayerMeta:
     pad_shape_n: int = 0
     pad_shape_k: int = 0
     num_experts: int | None = None
-    has_input_scale: bool | None = None
-    has_weight_scale: bool = True
     use_int_weight_scale: bool | None = None
     input_scale_group_size: int = 0
     weight_scale_group_size: int = 0
     has_zero_point: bool = False
     has_bias: bool = False
-    has_global_scale: bool = False
     is_fp_zero_point: bool = False
     mma_type: MmaType | None = None
     top_k: int = 0
@@ -131,8 +128,6 @@ class HummingLayerMeta:
     def __post_init__(self):
         if self.is_fp_zero_point:
             assert self.has_zero_point
-        if self.a_dtype.num_bits != 16 and self.has_input_scale is None:
-            self.has_input_scale = True
         if isinstance(self.b_dtype, dtypes.InergerType):
             if isinstance(self.b_dtype, dtypes.FloatingPointType):
                 self.b_dtype = dataclasses.replace(self.b_dtype, is_signed=False)
@@ -363,7 +358,7 @@ class HummingMethod:
 
         weight = tensors["weight"]
         zero_point = tensors["zero_point"] if meta.has_zero_point else None
-        weight_scale = tensors["weight_scale"] if meta.has_weight_scale else None
+        weight_scale = tensors["weight_scale"]
         bias = tensors["bias"] if meta.has_bias else None
         global_scale = tensors.get("global_scale", None) if meta.has_global_scale else None
 
@@ -555,7 +550,7 @@ class HummingMethod:
             getattr(layer, meta.weight_name),
             outputs,
             input_scale,
-            getattr(layer, meta.weight_scale_name, None),
+            getattr(layer, meta.weight_scale_name),
             getattr(layer, meta.zero_point_name, None),
             getattr(layer, meta.bias_name, None),
             getattr(layer, meta.global_scale_name, None),

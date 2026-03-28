@@ -88,12 +88,12 @@ private:
 
   static constexpr uint32_t kNumWriteSplits = PipelineConfig::kNumWriteSplits;
   static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
-  static constexpr bool kHasInputScale = QuantParamConfig::kHasInputScale;
-  static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
+  static constexpr bool kHasInputScale = ElementA::kBits != 16;
   static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
-  static constexpr bool kIsGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
+  static constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
   static constexpr bool kUseIntWeightScale = QuantParamConfig::kUseIntWeightScale;
-  static constexpr bool kHasGroupScale = kIsGroupInputScale || kIsGroupWeightScale;
+  static constexpr bool kHasGroupScale = kIsGroupInputScale || kIsGroupWeightScale || kIsBlockWeightScale;
   static constexpr bool kIsIntAccum = std::is_same<ValTypeC, int32_t>::value && (!kHasGroupScale || kUseIntWeightScale);
 
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;

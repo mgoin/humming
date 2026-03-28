@@ -5,6 +5,7 @@
 
 template <
     class ProblemShape, class BlockShape, class PadShape,
+    class ElementA,
     class PipelineConfig, class QuantParamConfig, class MoEConfig>
 class G2SMemoryLoaderAS {
 private:
@@ -14,7 +15,7 @@ private:
   static constexpr uint32_t kNumLoadThreads = PipelineConfig::kNumLoadThreads;
   static constexpr uint32_t kLoadThreadOffset = PipelineConfig::kNumThreads - kNumLoadThreads;
 
-  static constexpr bool kHasInputScale = QuantParamConfig::kHasInputScale;
+  static constexpr bool kHasInputScale = ElementA::kBits != 16;
   static constexpr bool kIsChannelScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
   static constexpr bool kIsGroupScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
   static constexpr uint32_t kGroupSize = kIsGroupScale ? QuantParamConfig::kInputScaleGroupSize : ProblemShape::K;

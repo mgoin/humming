@@ -141,10 +141,8 @@ public:
   template <class T = uint32_t>
   CUDA_INLINE T *final_regs_c_as_ptr() {
     uint32_t index = 0;
-    constexpr bool kHasInputScale = QuantParamConfig::kHasInputScale;
-    constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
-    constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
-    constexpr bool kIsGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
+    constexpr bool kIsGroupInputScale = QuantParamConfig::kInputScaleGroupSize > 0;
+    constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
     if constexpr (ElementA::kBits < 16 && (kIsGroupInputScale || kIsGroupWeightScale)) {
       index = 1;
     }

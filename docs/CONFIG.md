@@ -49,12 +49,6 @@ See support matrix in `README.md`.
 ## Quant Param Config
 
 
-- `has_input_scale`:
-  - For 16-bit activation (`float16` / `bfloat16`), this must be `False`.
-  - For 8-bit/4-bit activation, we enable input scale by default. But you can also disable it.
-
-- `has_weight_scale`🔔: By default, we enable weight scale for all cases. But you can also disable it. For example, if you also want tensor-wise scale, you can set `has_weight_scale` to `False` and set `has_global_scale` to `True`.
-
 - `input_scale_group_size`: 
   - `0`: channelwise scale (also known as token-wise scale)
   - `>0`: must be powers of 2. The minimal value is 8/16/32 for 16/8/4-bit activation + MMA, and 16/32/64 for 16/8/4-bit activation + WGMMA.
@@ -62,8 +56,6 @@ See support matrix in `README.md`.
 - `weight_scale_group_size`🔔: 
   - `0`: channelwise scale
   - `>0`: must be powers of 2. The minimal value is 8/16/32 for 16/8/4-bit activation + MMA, and 16/32/64 for 16/8/4-bit activation + WGMMA.
-
-- `has_global_scale`🔔: Enable global scale or not. Note that this is not conflict with `has_weight_scale`, you can set both to `True` (for example, NVFP4).
 
 - `has_zero_point`🔔: Enable dynamic zero point or not.
   - Must be `False` if `has_weight_scale` is False.

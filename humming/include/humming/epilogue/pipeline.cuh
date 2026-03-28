@@ -85,7 +85,7 @@ public:
   CUDA_INLINE
   void seek(uint32_t expert_id, uint32_t m_block_id, uint32_t n_block_id) {
     gmem_writer.seek(m_block_id, n_block_id);
-    if constexpr (QuantParamConfig::kHasGlobalScale) {
+    if constexpr (QuantParamConfig::kIsTensorWeightScale) {
       arith.gs = GS[MoEConfig::kIsMoE ? expert_id : 0];
     }
   };

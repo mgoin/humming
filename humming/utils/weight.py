@@ -8,6 +8,7 @@ def quantize_weight(
     dtype: dtypes.DataType,
     scale_dtype: dtypes.DataType | None,
     group_size: int,
+    group_size_n: int | None = None,
     has_zero_point: bool = False,
     has_global_scale: bool = False,
     is_fp_zero_point: bool = False,
@@ -23,6 +24,13 @@ def quantize_weight(
     origin_dtype = dtypes.DataType.from_torch_dtype(weight.dtype)
     e, n, k = weight.shape
     group_size = group_size if group_size > 0 else k
+
+    if group_size_n is not None:
+        assert n % group_size_n == 0
+        weight = weight.view(e, n // group_size_n, group_size_n, k // group_size, group_size)
+        weight = weight.permute(0, 1, 3, 2, 4).contiguous()
+        weight = weight.view(e, n * k // group_size_n // group_size, -1)
+        group_size = group_size_n * group_size
 
     quant_group_size = 0
     if scale_dtype is not None:
@@ -51,6 +59,7 @@ def quantize_weight(
     if scale_dtype is None and has_global_scale:
         global_scale = weight_scale.view(-1)
         weight_scale = None
+        quanted_weight = quanted_weight.view(e, n, k)
     elif has_global_scale and scale_dtype == dtypes.float8e8m0:
         assert (weight_scale > 0).all()
         global_scale = weight_scale.view(e, -1).log2().mean(1).exp2()
@@ -73,6 +82,19 @@ def quantize_weight(
             global_scale = global_scale1 if use_scale1 else global_scale2
             weight_scale = weight_scale / global_scale.view(-1, 1, 1)
         weight_scale = weight_scale.to(torch_dtype)
+
+    if group_size_n is not None:
+        group_size = group_size // group_size_n
+        quanted_weight = quanted_weight.view(
+            e,
+            n // group_size_n,
+            k // group_size,
+            group_size_n,
+            group_size,
+        ).permute(0, 1, 3, 2, 4).contiguous()
+        quanted_weight = quanted_weight.view(e, n, k)
+        weight_scale = weight_scale.view(e, n // group_size_n, k // group_size)
+        # weight_scale.fill_(0.2)
 
     if origin_ndim == 2:
         quanted_weight = quanted_weight.squeeze(0)

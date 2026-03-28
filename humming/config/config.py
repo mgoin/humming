@@ -1,12 +1,11 @@
 import dataclasses
 import math
-import re
 from typing import ClassVar
 
 from typing_extensions import Self
 
 from humming.config.base import BaseHummingConfig
-from humming.config.enum import MmaType
+from humming.config.enum import MmaType, WeightScaleType
 
 
 @dataclasses.dataclass
@@ -90,14 +89,47 @@ class PipelineConfig(BaseHummingConfig):
 
 @dataclasses.dataclass
 class QuantParamConfig(BaseHummingConfig):
-    has_input_scale: bool | None = None
-    has_weight_scale: bool = True
     input_scale_group_size: int = 0
     weight_scale_group_size: int = 0
+    weight_scale_group_size_n: int = 0
+    weight_scale_type: WeightScaleType | None = None
     use_int_weight_scale: bool = False
-    has_global_scale: bool = False
     has_zero_point: bool = False
     is_fp_zero_point: bool = False
+
+    _cpp_extra_names: ClassVar[tuple[str, ...]] = (
+        "is_channel_weight_scale",
+        "is_block_weight_scale",
+        "is_group_weight_scale",
+        "is_tensor_weight_scale",
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.weight_scale_type is None:
+            if self.weight_scale_group_size_n > 1:
+                self.weight_scale_type = WeightScaleType.BLOCK
+            elif self.weight_scale_group_size > 0:
+                self.weight_scale_type = WeightScaleType.GROUP
+            elif self.weight_scale_group_size == 0:
+                self.weight_scale_type = WeightScaleType.CHANNEL
+
+        self.is_channel_weight_scale = self.weight_scale_type == WeightScaleType.CHANNEL
+        self.is_tensor_weight_scale = self.weight_scale_type in [
+            WeightScaleType.TENSOR,
+            WeightScaleType.GROUP_TENSOR,
+        ]
+        self.is_block_weight_scale = self.weight_scale_type == WeightScaleType.BLOCK
+        self.is_group_weight_scale = self.weight_scale_type in [
+            WeightScaleType.GROUP,
+            WeightScaleType.GROUP_TENSOR,
+        ]
+
+    @classmethod
+    def from_dict(cls, raw_config) -> Self:
+        config = super().from_dict(raw_config)
+        config.__post_init__()
+        return config
 
 
 @dataclasses.dataclass

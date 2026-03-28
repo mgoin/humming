@@ -79,6 +79,7 @@ def generate_random_weight(
     group_size,
     dtype,
     scale_dtype,
+    group_size_n=None,
     num_experts=None,
     has_global_scale=False,
     has_zero_point=False,
@@ -110,6 +111,7 @@ def generate_random_weight(
         dtype=dtype,
         scale_dtype=scale_dtype,
         group_size=group_size,
+        group_size_n=group_size_n,
         has_zero_point=has_zero_point,
         has_global_scale=has_global_scale,
         is_fp_zero_point=is_fp_zero_point,
@@ -130,7 +132,10 @@ def generate_random_weight(
         )
 
     if weight_scale is not None:
-        weight_ref = weight_ref * weight_scale.float().repeat_interleave(group_size, -1)
+        weight_scale_tmp = weight_scale.float().repeat_interleave(group_size, -1)
+        if group_size_n is not None:
+            weight_scale_tmp = weight_scale_tmp.repeat_interleave(group_size_n, -2)
+        weight_ref = weight_ref * weight_scale_tmp
 
     if has_global_scale:
         weight_ref = weight_ref * global_scale.view(-1, 1, 1)

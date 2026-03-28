@@ -23,23 +23,23 @@ private:
   static constexpr bool kIsF16Accum = MmaOpClass::kCTypeBits == 16;
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
 
-  static constexpr bool kHasInputScale = QuantParamConfig::kHasInputScale;
-  static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
+  static constexpr bool kHasInputScale = ElementA::kBits != 16;
   static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
-  static constexpr bool kIsGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
-  static constexpr bool kIsChannelInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
-  static constexpr bool kIsChannelWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
+  static constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
+  static constexpr bool kIsChannelWeightScale = QuantParamConfig::kIsChannelWeightScale;
+  static constexpr bool kIsTensorWeightScale = QuantParamConfig::kIsTensorWeightScale;
+  static constexpr bool kIsGroupOrBlockWeightScale = kIsGroupWeightScale || kIsBlockWeightScale;
+
   static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
   static constexpr bool kUseIntWeightScale = QuantParamConfig::kUseIntWeightScale;
 
   static constexpr uint32_t kInputScaleGroupSize = kIsGroupInputScale ? QuantParamConfig::kInputScaleGroupSize : 1;
-  static constexpr uint32_t kWeightScaleGroupSize = kIsGroupWeightScale ? QuantParamConfig::kWeightScaleGroupSize : 1;
-  static constexpr uint32_t kNumGroupsA = kIsGroupInputScale ? CEIL_DIV(kPartMmaShapeK, kInputScaleGroupSize) : 1;
-  static constexpr uint32_t kNumGroupsB = kIsGroupWeightScale ? CEIL_DIV(kPartMmaShapeK, kWeightScaleGroupSize) : 1;
+  static constexpr uint32_t kWeightScaleGroupSize = kIsGroupOrBlockWeightScale ? QuantParamConfig::kWeightScaleGroupSize : 1;
   static constexpr uint2 kExpOffset = get_mainloop_exp_offset<
       ElementA, ElementB, ElementBS, kHasZeroPoint,
-      kIsF16Accum, kIsGroupInputScale, kIsGroupWeightScale>();
+      kIsF16Accum, kIsGroupInputScale, kIsGroupOrBlockWeightScale>();
 
   static constexpr uint32_t kDequantBSBits = (ElementA::kBits < 16 && !kIsF16Accum) ? 32 : 16;
   static constexpr uint32_t kNumSubBlocksM = CEIL_DIV(WarpShape::M, 16);
@@ -50,12 +50,11 @@ private:
   static constexpr uint32_t kNumBSPerGroup = kNumSubBlocksN * kNumBSPerSubBlock;
 
 public:
-  uint32_t as[2][kNumASPerGroup][kNumGroupsA];
-  uint32_t q_as[kNumASPerGroup][kNumGroupsA];
-  uint32_t bs[2][kNumGroupsB][MAX(kNumBSPerGroup, 8) * ElementBS::kBits / 32];
-  uint32_t dq_bs[kNumGroupsB][MAX(kNumBSPerGroup, 8) * kDequantBSBits / 32];
-
-  uint32_t zp[2][kNumGroupsB][kIsFpZeroPoint ? 4 : CEIL_DIV(ElementB::kBits, 4)];
+  uint32_t as[2][kNumASPerGroup];
+  uint32_t q_as[kNumASPerGroup];
+  uint32_t bs[2][MAX(kNumBSPerGroup, 8) * ElementBS::kBits / 32];
+  uint32_t dq_bs[MAX(kNumBSPerGroup, 8) * kDequantBSBits / 32];
+  uint32_t zp[2][kIsFpZeroPoint ? 4 : CEIL_DIV(ElementB::kBits, 4)];
 
   uint32_t _dummy;
 
@@ -75,8 +74,7 @@ public:
           uint32_t n_id = 0;
           if (WarpShape::N == 64 && ElementB::kBits > 4 && index >= 2) n_id = 1;
 
-          uint32_t group_id = i % kNumGroupsB;
-          uint32_t dzp_val = zp[buffer_id][group_id][n_id];
+          uint32_t dzp_val = zp[buffer_id][n_id];
           dzp_val = dzp_val >> ((index * 2 + j) % kNumZPsPerInt * kNumZPBits);
           zp_vals[j * 2 + i] = dequant_single_zero_point<ElementB, ElementA>(dzp_val);
         }
@@ -90,34 +88,30 @@ public:
   void may_process_bs_before_apply_on_b(uint32_t j, uint32_t buffer_id) {
     if (j % 2 == 0) {
       if constexpr (ElementA::kBits == 16 && ElementBS::kBits == 8 && kIsGroupWeightScale) {
+        dequant<ElementBS, ElementA>(bs[buffer_id], dq_bs, 0);
+
+        scalar_t *dq_bs_scalar_ptr = reinterpret_cast<scalar_t *>(dq_bs);
+
         PRAGMA_UNROLL
-        for (uint32_t i = 0; i < kNumGroupsB; i++) {
-          dequant<ElementBS, ElementA>(bs[buffer_id][i], dq_bs[i], 0);
+        for (uint32_t j = 0; j < 2; j++) {
+          scalar_t tmp = dq_bs_scalar_ptr[2 + 4 * j];
+          dq_bs_scalar_ptr[2 + 4 * j] = dq_bs_scalar_ptr[1 + 4 * j];
+          dq_bs_scalar_ptr[1 + 4 * j] = tmp;
+        }
 
-          scalar_t *dq_bs_scalar_ptr = reinterpret_cast<scalar_t *>(dq_bs + i);
+        const scalar_t2 scale_factor = prepare_exp_scale_factor<scalar_t2, kExpOffset.y>();
+        scalar_t2 *dq_bs_scalar2_ptr = reinterpret_cast<scalar_t2 *>(dq_bs);
 
-          PRAGMA_UNROLL
-          for (uint32_t j = 0; j < 2; j++) {
-            scalar_t tmp = dq_bs_scalar_ptr[2 + 4 * j];
-            dq_bs_scalar_ptr[2 + 4 * j] = dq_bs_scalar_ptr[1 + 4 * j];
-            dq_bs_scalar_ptr[1 + 4 * j] = tmp;
-          }
-
-          const scalar_t2 scale_factor = prepare_exp_scale_factor<scalar_t2, kExpOffset.y>();
-          scalar_t2 *dq_bs_scalar2_ptr = reinterpret_cast<scalar_t2 *>(dq_bs + i);
-
-          PRAGMA_UNROLL
-          for (uint32_t j = 0; j < 4; j++) {
-            dq_bs_scalar2_ptr[j] = __hmul2(dq_bs_scalar2_ptr[j], scale_factor);
-          }
-        };
+        PRAGMA_UNROLL
+        for (uint32_t j = 0; j < 4; j++) {
+          dq_bs_scalar2_ptr[j] = __hmul2(dq_bs_scalar2_ptr[j], scale_factor);
+        }
       };
     };
   };
 
   CUDA_INLINE
   void may_apply_bs_and_zp_on_b(uint32_t *regs_b, uint32_t j, uint32_t buffer_id) {
-
     may_process_bs_before_apply_on_b(j, buffer_id);
 
     if constexpr (ElementA::kBits == 16 && kExpOffset.x) {
@@ -136,41 +130,35 @@ public:
     if constexpr (ElementA::kBits == 16 && (kIsGroupWeightScale || kIsFpZeroPoint)) {
 
       scalar_t2 *b_f16_ptr = reinterpret_cast<scalar_t2 *>(regs_b);
-      scalar_t2 bs_f16_ptr[kNumGroupsB][2];
-      scalar_t2 bzp_f16_ptr[kNumGroupsB][2];
+      scalar_t2 bs_f16_ptr[2];
+      scalar_t2 bzp_f16_ptr[2];
 
       if constexpr (kIsGroupWeightScale) {
+        scalar_t *bs_half_ptr = reinterpret_cast<scalar_t *>(ElementBS::kBits == 8 ? &dq_bs[j] : &bs[buffer_id][j]);
         PRAGMA_UNROLL
-        for (uint32_t g = 0; g < kNumGroupsB; g++) {
-          scalar_t *bs_half_ptr = reinterpret_cast<scalar_t *>(ElementBS::kBits == 8 ? &dq_bs[g][j] : &bs[buffer_id][g][j]);
-          PRAGMA_UNROLL
-          for (uint32_t i = 0; i < 2; i++) {
-            bs_f16_ptr[g][i] = this->num2num2(bs_half_ptr[i]);
-          }
-        };
+        for (uint32_t i = 0; i < 2; i++) {
+          bs_f16_ptr[i] = this->num2num2(bs_half_ptr[i]);
+        }
       }
 
       if constexpr (kIsFpZeroPoint) {
         static_assert(kHasZeroPoint);
         static_assert(!ElementB::kIsSigned && ElementB::kIsIntegerType);
         uint32_t zp_buffer_id = kIsChannelWeightScale ? 0 : buffer_id;
+        scalar_t2 bzp2_ptr = *reinterpret_cast<scalar_t2 *>(&zp[zp_buffer_id][j]);
+
+        if constexpr (std::is_same<ElementA, BFloat16>::value && ElementB::kNumBits >= 7) {
+          uint32_t exp_val = ((int32_t)kExpOffset.x - 133) + ((1 << (ElementA::kExponentBits - 1)) - 1);
+          uint32_t scale_factor_uint = 0x00010001 * (exp_val << ElementA::kMantissaBits);
+          scalar_t2 scale_factor = *reinterpret_cast<scalar_t2 *>(&scale_factor_uint);
+          bzp2_ptr = __hmul2(bzp2_ptr, scale_factor);
+        }
+
+        scalar_t *bzp_ptr = reinterpret_cast<scalar_t *>(&bzp2_ptr);
         PRAGMA_UNROLL
-        for (uint32_t g = 0; g < kNumGroupsB; g++) {
-          scalar_t2 bzp2_ptr = *reinterpret_cast<scalar_t2 *>(&zp[zp_buffer_id][g][j]);
-
-          if constexpr (std::is_same<ElementA, BFloat16>::value && ElementB::kNumBits >= 7) {
-            uint32_t exp_val = ((int32_t)kExpOffset.x - 133) + ((1 << (ElementA::kExponentBits - 1)) - 1);
-            uint32_t scale_factor_uint = 0x00010001 * (exp_val << ElementA::kMantissaBits);
-            scalar_t2 scale_factor = *reinterpret_cast<scalar_t2 *>(&scale_factor_uint);
-            bzp2_ptr = __hmul2(bzp2_ptr, scale_factor);
-          }
-
-          scalar_t *bzp_ptr = reinterpret_cast<scalar_t *>(&bzp2_ptr);
-          PRAGMA_UNROLL
-          for (uint32_t i = 0; i < 2; i++) {
-            bzp_f16_ptr[g][i] = this->num2num2(bzp_ptr[i]);
-          }
-        };
+        for (uint32_t i = 0; i < 2; i++) {
+          bzp_f16_ptr[i] = this->num2num2(bzp_ptr[i]);
+        }
       }
 
       // Each warp apply bs or/and zp on a 16x16 weight block per time
@@ -181,13 +169,12 @@ public:
       for (uint32_t i = 0; i < 2; i++) {
         PRAGMA_UNROLL
         for (uint32_t k = 0; k < 2; k++) {
-          uint32_t g = k % kNumGroupsB;
           if constexpr (kIsFpZeroPoint) {
-            scalar_t2 bzp_single = bzp_f16_ptr[g][MmaOpClass::kMmaType == MmaType::WGMMA ? k : i];
+            scalar_t2 bzp_single = bzp_f16_ptr[MmaOpClass::kMmaType == MmaType::WGMMA ? k : i];
             b_f16_ptr[i * 2 + k] = __hsub2(b_f16_ptr[i * 2 + k], bzp_single);
           }
           if constexpr (kIsGroupWeightScale) {
-            scalar_t2 bs_single = bs_f16_ptr[g][MmaOpClass::kMmaType == MmaType::WGMMA ? k : i];
+            scalar_t2 bs_single = bs_f16_ptr[MmaOpClass::kMmaType == MmaType::WGMMA ? k : i];
             b_f16_ptr[i * 2 + k] = __hmul2(b_f16_ptr[i * 2 + k], bs_single);
           }
         };
@@ -202,20 +189,27 @@ public:
     uint32_t buffer_id = iter_id % 2;
     bool is_new_as_group = kIsGroupInputScale && k_index % kInputScaleGroupSize == 0;
     if (m == 0 && n == 0 && is_new_as_group) {
+      if constexpr (kIsBlockWeightScale) {
+        static_assert(kIsGroupInputScale);
+        float *as_float_ptr = reinterpret_cast<float *>(as[buffer_id]);
+        float *q_as_float_ptr = reinterpret_cast<float *>(q_as);
+        float &block_bs_float = reinterpret_cast<float *>(&bs[buffer_id])[0];
+        PRAGMA_UNROLL
+        for (uint32_t i = 0; i < WarpShape::M / 8 * (kUseWgmma ? 2 : 1); i++) {
+          q_as_float_ptr[i] = as_float_ptr[i] * block_bs_float;
+        }
+      }
+
       if constexpr (kIsF16Accum) {
         float2 *as_float2_ptr = reinterpret_cast<float2 *>(as[buffer_id]);
         float *as_float_ptr = reinterpret_cast<float *>(as[buffer_id]);
         scalar_t2 *as_scalar2_ptr = reinterpret_cast<scalar_t2 *>(q_as);
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < WarpShape::M / 8; i++) {
-          if constexpr (kNumGroupsA == 1 && kUseWgmma) {
+          if constexpr (kUseWgmma) {
             as_scalar2_ptr[i] = this->float22num2(as_float2_ptr[i]);
-          } else if constexpr (kNumGroupsA == 1) {
+          } else {
             as_scalar2_ptr[i] = this->float2num2(as_float_ptr[i]);
-          } else if constexpr (kNumGroupsA == 2 && kUseWgmma) {
-            as_scalar2_ptr[i] = this->floats2num2(as_float_ptr[i * 4 + k], as_float_ptr[i * 4 + 2 + k]);
-          } else if constexpr (kNumGroupsA == 2) {
-            as_scalar2_ptr[i] = this->float2num2(as_float_ptr[i * 2 + k]);
           }
 
           if constexpr (kExpOffset.y && !kIsGroupWeightScale) {
@@ -229,14 +223,14 @@ public:
     bool is_new_bs_group = kIsGroupWeightScale && k_index % kWeightScaleGroupSize == 0;
     if (m == 0 && n == 0 && is_new_bs_group) {
       if constexpr (kUseIntWeightScale) {
-        int16_t *bs_vals = reinterpret_cast<int16_t *>(bs[buffer_id][k]);
+        int16_t *bs_vals = reinterpret_cast<int16_t *>(bs[buffer_id]);
         int32_t *dq_bs_vals = reinterpret_cast<int32_t *>(dq_bs);
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < kNumBSPerGroup; i++)
           dq_bs_vals[i] = (int32_t)bs_vals[i];
       } else if constexpr (kIsF16Accum && ElementBS::kBits == 16) {
         scalar_t2 *dq_bs_scalar2_ptr = reinterpret_cast<scalar_t2 *>(dq_bs);
-        scalar_t2 *bs_scalar2_ptr = reinterpret_cast<scalar_t2 *>(bs[buffer_id][k]);
+        scalar_t2 *bs_scalar2_ptr = reinterpret_cast<scalar_t2 *>(bs[buffer_id]);
 
         if constexpr (kExpOffset.y) {
           scalar_t2 scale_factor = prepare_exp_scale_factor<scalar_t2, kExpOffset.y>();
@@ -247,7 +241,7 @@ public:
       } else if constexpr (kIsF16Accum && ElementBS::kBits == 8 && kIsGroupWeightScale) {
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < CEIL_DIV(kNumBSPerGroup, 8); i++) {
-          dequant<ElementBS, ElementC>(bs[buffer_id][k], dq_bs[0], i);
+          dequant<ElementBS, ElementC>(bs[buffer_id], dq_bs, i);
 
           scalar_t *dq_bs_scalar_ptr = reinterpret_cast<scalar_t *>(dq_bs);
           PRAGMA_UNROLL
@@ -274,14 +268,14 @@ public:
 
       } else if constexpr (!kIsF16Accum && ElementBS::kBits == 8) {
         using F8x4 = typename F8Conversion<ElementBS>::scalar_t4;
-        F8x4 *bs_vals = reinterpret_cast<F8x4 *>(bs[buffer_id][k]);
+        F8x4 *bs_vals = reinterpret_cast<F8x4 *>(bs[buffer_id]);
         float4 *dq_bs_vals = reinterpret_cast<float4 *>(dq_bs);
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < kNumBSPerGroup / 4; i++)
           dq_bs_vals[i] = F8Conversion<ElementBS>::num42float4(bs_vals[i]);
       } else if constexpr (!kIsF16Accum && ElementBS::kBits == 16) {
         using F16x2 = typename F16Conversion<ElementBS>::scalar_t2;
-        F16x2 *bs_vals = reinterpret_cast<F16x2 *>(bs[buffer_id][k]);
+        F16x2 *bs_vals = reinterpret_cast<F16x2 *>(bs[buffer_id]);
         float2 *dq_bs_vals = reinterpret_cast<float2 *>(dq_bs);
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < kNumBSPerGroup / 2; i++)
@@ -325,12 +319,10 @@ public:
         if constexpr (ElementBS::kBits == 8 || kExpOffset.y) {
           bs_val = reinterpret_cast<scalar_t2 *>(dq_bs)[n * MmaShape::N / 8 + inner_n];
         } else {
-          bs_val = reinterpret_cast<scalar_t2 *>(bs[buffer_id][k])[n * MmaShape::N / 8 + inner_n];
+          bs_val = reinterpret_cast<scalar_t2 *>(bs[buffer_id])[n * MmaShape::N / 8 + inner_n];
         }
 
-        if constexpr (kIsGroupInputScale && kIsGroupWeightScale) {
-          part_regs_c1 = __hfma2(__hmul2(part_regs_c0, as_val), bs_val, part_regs_c1);
-        } else if constexpr (kIsGroupInputScale) {
+        if constexpr (kIsGroupInputScale && kIsBlockWeightScale) {
           part_regs_c1 = __hfma2(part_regs_c0, as_val, part_regs_c1);
         } else if constexpr (kIsGroupWeightScale) {
           part_regs_c1 = __hfma2(part_regs_c0, bs_val, part_regs_c1);
@@ -347,7 +339,6 @@ public:
           static_assert(!kIsGroupInputScale);
           static_assert(kIsGroupWeightScale);
 
-          uint32_t group_id = kPartMmaShapeK > kInputScaleGroupSize ? k : 0;
           int2 &bs_vals = reinterpret_cast<int2 *>(dq_bs)[n * MmaShape::N / 8 + inner_n];
 
           part_int_regs_c1.x += bs_vals.x * part_int_regs_c0.x;
@@ -361,14 +352,15 @@ public:
             part_regs_c0.y = __int2float_rn(part_int_regs_c0.y);
           }
 
-          uint32_t group_id = kPartMmaShapeK > kInputScaleGroupSize ? k : 0;
-          float &as_val = reinterpret_cast<float *>(as[buffer_id][m * MmaShape::M / 8 + inner_m])[group_id];
+          float as_val;
+          if constexpr (kIsGroupInputScale && !kIsBlockWeightScale) {
+            as_val = reinterpret_cast<float *>(as[buffer_id])[m * MmaShape::M / 8 + inner_m];
+          } else if constexpr (kIsGroupInputScale && kIsBlockWeightScale) {
+            as_val = reinterpret_cast<float *>(q_as)[m * MmaShape::M / 8 + inner_m];
+          }
           float2 &bs_vals = reinterpret_cast<float2 *>(dq_bs)[n * MmaShape::N / 8 + inner_n];
 
-          if constexpr (kIsGroupInputScale && kIsGroupWeightScale) {
-            part_regs_c1.x += as_val * bs_vals.x * part_regs_c0.x;
-            part_regs_c1.y += as_val * bs_vals.y * part_regs_c0.y;
-          } else if constexpr (kIsGroupInputScale) {
+          if constexpr (kIsGroupInputScale) {
             part_regs_c1.x += as_val * part_regs_c0.x;
             part_regs_c1.y += as_val * part_regs_c0.y;
           } else if constexpr (kIsGroupWeightScale) {
@@ -421,9 +413,7 @@ public:
           bs_val = this->num2num2(reinterpret_cast<scalar_t *>(bs[buffer_id])[m * 2 + inner_m]);
         }
 
-        if constexpr (kIsGroupInputScale && kIsGroupWeightScale) {
-          part_regs_c1 = __hfma2(__hmul2(part_regs_c0, as_val), bs_val, part_regs_c1);
-        } else if constexpr (kIsGroupInputScale) {
+        if constexpr (kIsGroupInputScale && kIsBlockWeightScale) {
           part_regs_c1 = __hfma2(part_regs_c0, as_val, part_regs_c1);
         } else if constexpr (kIsGroupWeightScale) {
           part_regs_c1 = __hfma2(part_regs_c0, bs_val, part_regs_c1);
@@ -441,14 +431,10 @@ public:
           part_regs_c0.y = __int2float_rn(part_int_regs_c0.y);
         }
 
-        uint32_t group_id = kPartMmaShapeK > kInputScaleGroupSize ? k : 0;
-        float2 &as_vals = reinterpret_cast<float2 *>(as[buffer_id][inner_n * 2])[group_id];
+        float2 &as_vals = *reinterpret_cast<float2 *>(&as[buffer_id][inner_n * 2]);
         float &bs_val = reinterpret_cast<float *>(dq_bs)[m * 2 + inner_m];
 
-        if constexpr (kIsGroupInputScale && kIsGroupWeightScale) {
-          part_regs_c1.x += as_vals.x * bs_val * part_regs_c0.x;
-          part_regs_c1.y += as_vals.y * bs_val * part_regs_c0.y;
-        } else if constexpr (kIsGroupInputScale) {
+        if constexpr (kIsGroupInputScale && kIsBlockWeightScale) {
           part_regs_c1.x += as_vals.x * part_regs_c0.x;
           part_regs_c1.y += as_vals.y * part_regs_c0.y;
         } else if constexpr (kIsGroupWeightScale) {

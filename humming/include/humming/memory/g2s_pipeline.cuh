@@ -32,12 +32,12 @@ private:
   static constexpr bool kUseTmaBZP = PipelineConfig::kUseTmaBZP;
   static constexpr bool kUseTmaBias = PipelineConfig::kUseTmaBias;
 
-  static constexpr bool kHasInputScale = QuantParamConfig::kHasInputScale;
-  static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
+  static constexpr bool kHasInputScale = ElementA::kBits != 16;
   static constexpr bool kIsChannelInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
   static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
-  static constexpr bool kIsChannelWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
-  static constexpr bool kIsGroupWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize > 0;
+  static constexpr bool kIsChannelWeightScale = QuantParamConfig::kIsChannelWeightScale;
+  static constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
   static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kHasBias = EpilogueConfig::kHasBias;
   static constexpr bool kIsMoE = MoEConfig::kIsMoE;
@@ -61,7 +61,7 @@ private:
       legacy_load_bytes += sizeof(smem.as[0]);
     }
 
-    if constexpr (kIsGroupWeightScale) {
+    if constexpr (kIsGroupWeightScale || kIsBlockWeightScale) {
       if constexpr (kUseTmaBS) tma_load_bytes += sizeof(smem.bs[0]);
       else legacy_load_bytes += sizeof(smem.bs[0]);
     }
@@ -107,7 +107,7 @@ public:
 
   using LoaderA = G2SMemoryLoaderA<ProblemShape, BlockShape, PadShape, ElementA, SchedulerConfig, PipelineConfig, MoEConfig>;
   using LoaderB = G2SMemoryLoaderB<ProblemShape, BlockShape, ElementA, ElementB, SchedulerConfig, PipelineConfig, MoEConfig>;
-  using LoaderAS = G2SMemoryLoaderAS<ProblemShape, BlockShape, PadShape, PipelineConfig, QuantParamConfig, MoEConfig>;
+  using LoaderAS = G2SMemoryLoaderAS<ProblemShape, BlockShape, PadShape, ElementA, PipelineConfig, QuantParamConfig, MoEConfig>;
   using LoaderBS = G2SMemoryLoaderBS<ProblemShape, BlockShape, ElementBS, PipelineConfig, QuantParamConfig, MoEConfig>;
   using LoaderBZP = G2SMemoryLoaderBZP<ProblemShape, BlockShape, ElementB, PipelineConfig, QuantParamConfig, MoEConfig>;
   using LoaderBias = G2SMemoryLoaderBias<ProblemShape, BlockShape, PipelineConfig, MoEConfig>;
@@ -191,7 +191,7 @@ public:
       if constexpr (kIsGroupInputScale) {
         loader_as.load<kShouldAdvance>(smem.as[stage_id], &smem.load_mbar[mbar_index]);
       };
-      if constexpr (kIsGroupWeightScale) {
+      if constexpr (kIsGroupWeightScale || kIsBlockWeightScale) {
         loader_bs.load<kShouldAdvance>(smem.bs[stage_id], &smem.load_mbar[mbar_index]);
       };
       if constexpr (kHasZeroPoint && (kIsGroupWeightScale || kIsFirst)) {
@@ -259,7 +259,7 @@ public:
 
 
 template <
-    class SharedStorage,
+    class SharedStorage, class ElementA,
     class PipelineConfig, class EpilogueConfig,
     class QuantParamConfig, class MoEConfig>
 class ConsumerPipeline {
@@ -270,10 +270,9 @@ private:
   static constexpr bool kUseMBarrier = PipelineConfig::kUseMBarrier;
   static constexpr bool kUseCpAsync = PipelineConfig::kUseCpAsync;
 
-  static constexpr bool kHasInputScale = QuantParamConfig::kHasInputScale;
-  static constexpr bool kHasWeightScale = QuantParamConfig::kHasWeightScale;
+  static constexpr bool kHasInputScale = ElementA::kBits != 16;
   static constexpr bool kIsChannelInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
-  static constexpr bool kIsChannelWeightScale = kHasWeightScale && QuantParamConfig::kWeightScaleGroupSize == 0;
+  static constexpr bool kIsChannelWeightScale = QuantParamConfig::kIsChannelWeightScale;
   static constexpr bool kHasBias = EpilogueConfig::kHasBias;
   static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
   static constexpr bool kHasChannelData = kIsChannelInputScale || kIsChannelWeightScale || kHasBias || kIsMoEDown;

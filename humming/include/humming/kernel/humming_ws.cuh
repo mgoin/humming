@@ -56,7 +56,7 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
   using ProducerPipeline = ProducerPipeline<
       SharedStorage, ProblemShape, BlockShape, PadShape, ElementA, ElementB, ElementBS,
       SchedulerConfig, PipelineConfig, EpilogueConfig, QuantParamConfig, MoEConfig>;
-  using ConsumerPipeline = ConsumerPipeline<SharedStorage, PipelineConfig, EpilogueConfig, QuantParamConfig, MoEConfig>;
+  using ConsumerPipeline = ConsumerPipeline<SharedStorage, ElementA, PipelineConfig, EpilogueConfig, QuantParamConfig, MoEConfig>;
   using MainloopArithmetic = MainloopArithmetic<
       MmaOpClass, BlockShape, WarpShape,
       ElementA, ElementB, ElementC, ElementBS, QuantParamConfig>;

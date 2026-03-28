@@ -117,12 +117,12 @@ public:
         if (!pred1 || !pred2) continue;
 
         int4 val = smem_ptr[smem_offset_swizzled];
+        uint32_t gmem_offset = gmem_row * ((ProblemShape::N - PadShape::N) / 8) + gmem_col;
         if (!kUseStreamK || slice_count == 1 || slice_id == 0) {
           gmem_ptr[gmem_offset] = val;
         } else {
           gmem_ptr[gmem_offset] = reduce_add_f162<scalar_t2>(val, gmem_ptr[gmem_offset]);
         }
-
       };
     };
   };
