@@ -4,10 +4,6 @@ import torch
 import triton
 import vllm._custom_ops as vllm_ops
 from tqdm import tqdm
-from vllm.model_executor.layers.fused_moe.activation import (
-    MoEActivation,
-    apply_moe_activation,
-)
 from vllm.scalar_type import scalar_types
 
 from humming import dtypes, ops
@@ -123,7 +119,7 @@ def bench_marlin(
             )
 
         def run_moe():
-            outputs = vllm_ops.moe_wna16_marlin_gemm(
+            return vllm_ops.moe_wna16_marlin_gemm(
                 input=inputs,  # noqa
                 output=None,
                 b_qweight=weight,
@@ -151,17 +147,6 @@ def bench_marlin(
                 use_fp32_reduce=True,
                 is_zp_float=False,
             )
-            if is_moe_down:
-                return outputs
-
-            activation_inputs = outputs
-            activation_outputs = torch.empty(
-                (activation_inputs.size(0), activation_inputs.size(1) // 2),
-                device=activation_inputs.device,
-                dtype=activation_inputs.dtype,
-            )
-            apply_moe_activation(MoEActivation.SILU, activation_outputs, activation_inputs)
-            return activation_outputs
 
         run = run_dense if num_experts is None else run_moe
         outputs = run()

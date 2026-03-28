@@ -165,7 +165,6 @@ public:
         arith.may_apply_on_smem_write(val_uint, row_8x8block, col_8x8block);
         row_8x8block = row_8x8block - BlockShape::M / 8 / 2 * split_idx;
       }
-      arith.may_apply_activation_on_smem_write(val_uint, slice_count);
 
       if constexpr (!kUseWgmma) {
         uint32_t sub_row = laneid / 4;

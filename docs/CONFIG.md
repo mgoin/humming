@@ -92,23 +92,6 @@ See support matrix in `README.md`.
 
 - `has_bias`: Enable bias fusion or not.
 
-- `activation_type`: Humming supports fused activation. The following activation types are supported:
-  - `sigmoid`, `tanh`, `relu`, `gelu`, `fastgelu`, `quickgelu`, `silu`: identity activation
-  - `silu_glu`: glu activation.
-  - `custom`: custom identity activation
-  - `custom_glu`: custom glu activation
-  - Note that `use_tma_c` must be `False` to use activation fusion.
-
-- `custom_activation_func_impl`: CUDA C++ code of custom activation function.
-  - If custom identity activation, the input is `float` type variable `a`, you should return a `float`. Example `return a * 0.5 + 0.123;`
-  - If custom glu activation, the input is `float2` type variable `a`, you should return a `float`. Example `return tanhf(a.y * 0.5) * (1 + a.x);`
-
-
-Notes for GLU activation (`silu_glu` and `custom_glu`)
-
-1. If you use glu activation and stream k is enabled. The `outputs` tensor still need to have shape `(m, n)`, but after kernel execution, you can reshape it to `(m * 2, n // 2)` and only take the `(m, n // 2)`.
-2. The weight `up_proj` and `gate_proj` must be interleaved, that is, `weight[..., ::2]` should be `up_proj`, `weight[..., 1::2]` should be `gate_proj`.
-
 ## MoE Config
 
 - `is_moe`🔔: 

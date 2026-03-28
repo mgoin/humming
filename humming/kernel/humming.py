@@ -26,8 +26,6 @@ CODE_TEMPLATE = jinja2.Template("""
 #include <humming/kernel/humming.cuh>
 #endif
 
-{{custom_activation_func}}
-
 class MmaOpClass {
 public:
 {{mma_op_class}}
@@ -111,8 +109,6 @@ extern "C" __constant__ uint32_t B_DTYPE_ID = {{b_dtype}}::kId;
 extern "C" __constant__ uint32_t C_DTYPE_ID = {{c_dtype}}::kId;
 extern "C" __constant__ uint32_t BS_DTYPE_ID = {{bs_dtype}}::kId;
 
-extern "C" __constant__ uint32_t IS_GLU_ACTIVATION = {{is_glu_activation}};
-
 {{scheduler_config_extern}}
 
 {{pipeline_config_extern}}
@@ -169,8 +165,6 @@ class HummingKernel(
         self.check_config()
         self.mma_op_class = self.select_mma_op_class()
 
-        custom_activation_func = self.epilogue_config.prepare_custom_activation_func()
-        is_glu_activation = "_glu" in str(self.epilogue_config.activation_type).lower()
         assert isinstance(self.pipeline_config.use_warp_spec, bool)
 
         self.code = CODE_TEMPLATE.render(
@@ -194,8 +188,6 @@ class HummingKernel(
             epilogue_config_extern=self.epilogue_config.to_extern_cpp_str(),
             quant_param_config_extern=self.quant_param_config.to_extern_cpp_str(),
             moe_config_extern=self.moe_config.to_extern_cpp_str(),
-            is_glu_activation=int(is_glu_activation),
-            custom_activation_func=custom_activation_func,
         )
 
         self.prepare()

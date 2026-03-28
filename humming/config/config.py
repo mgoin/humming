@@ -6,7 +6,7 @@ from typing import ClassVar
 from typing_extensions import Self
 
 from humming.config.base import BaseHummingConfig
-from humming.config.enum import ActivationType, MmaType
+from humming.config.enum import MmaType
 
 
 @dataclasses.dataclass
@@ -103,36 +103,6 @@ class QuantParamConfig(BaseHummingConfig):
 @dataclasses.dataclass
 class EpilogueConfig(BaseHummingConfig):
     has_bias: bool = False
-    activation_type: ActivationType = ActivationType.NONE
-    custom_activation_func_impl: str | None = None
-
-    _cpp_ignore_names: ClassVar[tuple[str, ...]] = ("custom_activation_func_impl",)
-
-    def prepare_custom_activation_func(self) -> str:
-        impl_text = self.custom_activation_func_impl
-        if self.activation_type == ActivationType.CUSTOM:
-            template = (
-                "template <>\n"
-                "CUDA_INLINE\n"
-                "float activation_func<ActivationType::CUSTOM>(const float a) {{\n"
-                "{impl_text}\n"
-                "}};"
-            )
-        elif self.activation_type == ActivationType.CUSTOM_GLU:
-            template = (
-                "template <>\n"
-                "CUDA_INLINE\n"
-                "float activation_func<ActivationType::CUSTOM_GLU>(const float2 a) {{\n"
-                "{impl_text}\n"
-                "}};"
-            )
-        else:
-            return ""
-
-        assert isinstance(impl_text, str) and impl_text.strip()
-        impl_text = impl_text.strip()
-        impl_text = re.sub("\\s+\n\\s+", "\n  ", impl_text)
-        return template.format(impl_text=impl_text)
 
 
 @dataclasses.dataclass

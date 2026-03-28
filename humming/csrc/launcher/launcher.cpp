@@ -78,7 +78,7 @@ Tensor launch_kernel(
     KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, 1);
     KernelData& kernel_data = kernel_launch_data.kernel_data;
     Tensor c = may_make_tensor_c(c_, a, kernel_data);
-    return may_reshape_tensor_c(c, kernel_data);
+    return c;
   }
 
   int64_t dev = a.get_device();
@@ -168,7 +168,7 @@ Tensor launch_kernel(
   check_curesult(cuFuncSetAttribute(func, SMEM_SIZE_ATTR, kernel_data.smem_size), "cuFuncSetAttribute");
   check_curesult(cuLaunchKernelEx(&config, func, kernel_args, nullptr), "cuLaunchKernelEx");
 
-  return may_reshape_tensor_c(c, kernel_data);
+  return c;
 };
 
 int64_t register_kernel(const std::string &cubin_path, const std::string &func_name) {
@@ -212,7 +212,6 @@ int64_t register_kernel(const std::string &cubin_path, const std::string &func_n
         reader.getBool("USE_STREAM_K"),
         reader.getBool("IS_MOE"),
         reader.getBool("IS_MOE_DOWN"),
-        reader.getBool("IS_GLU_ACTIVATION"),
         reader.getBool("IS_FP_ZERO_POINT"),
         reader.getBool("HAS_INPUT_SCALE"),
         reader.getBool("HAS_WEIGHT_SCALE"),

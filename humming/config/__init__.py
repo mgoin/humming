@@ -6,7 +6,7 @@ from humming.config.config import (
     QuantParamConfig,
     SchedulerConfig,
 )
-from humming.config.enum import ActivationType, MmaType
+from humming.config.enum import MmaType
 from humming.config.mma import MmaOpClass
 
 __all__ = [
@@ -16,7 +16,6 @@ __all__ = [
     "MoEConfig",
     "MmaConfig",
     "EpilogueConfig",
-    "ActivationType",
     "MmaType",
     "MmaOpClass",
 ]

@@ -19,22 +19,6 @@ inline Tensor may_make_tensor_c(std::optional<Tensor> &c, const Tensor &a, Kerne
   return at::empty_symint(sizes, options);
 }
 
-inline Tensor may_reshape_tensor_c(Tensor &c, KernelData& kernel_data) {
-  if (!kernel_data.is_glu_activation) {
-    return c;
-  } else if (c.is_meta()) {
-    auto sizes = c.sym_sizes().vec();
-    sizes.pop_back();
-    sizes.push_back(c.sym_size(-1) / 2);
-    return at::empty_symint(sizes, c.options());
-  } else {
-    Tensor c_new = c.view({-1, c.size(-1) / 2});
-    c_new = c_new.slice(0, 0, c_new.size(0) / 2);
-    if (!kernel_data.is_moe) return c_new;
-    return c_new.view({-1, kernel_data.top_k, c_new.size(-1)});
-  }
-}
-
 inline void check_tensor_common(
     const Tensor &tensor, std::string name,
     int64_t expected_dev,

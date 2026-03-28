@@ -4,10 +4,6 @@ import torch
 import triton
 import triton.language as tl
 from tqdm import tqdm
-from vllm.model_executor.layers.fused_moe.activation import (
-    MoEActivation,
-    apply_moe_activation,
-)
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     get_default_config,
     get_moe_configs,
@@ -165,17 +161,7 @@ def bench_triton_moe(
                 block_shape=block_shape,
             )
 
-            if is_moe_down:
-                return outputs
-            activation_inputs = outputs.view(-1, outputs.size(-1))
-            activation_outputs = torch.empty(
-                (activation_inputs.size(0), activation_inputs.size(1) // 2),
-                device=activation_inputs.device,
-                dtype=activation_inputs.dtype,
-            )
-            apply_moe_activation(MoEActivation.SILU, activation_outputs, activation_inputs)
-
-            return activation_outputs
+            return outputs
 
         torch.cuda.synchronize()
         outputs = run()

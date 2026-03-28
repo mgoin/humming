@@ -40,11 +40,6 @@ private:
   static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
   static constexpr uint32_t kTopK = MoEConfig::kTopK;
 
-  static constexpr bool kHasActivation = EpilogueConfig::kActivationType != ActivationType::NONE;
-  static constexpr bool kHasGLUActivation = EpilogueConfig::kActivationType == ActivationType::SILU_GLU ||
-                                            EpilogueConfig::kActivationType == ActivationType::CUSTOM_GLU;
-  static constexpr bool kHasIndentityActivation = kHasActivation && !kHasGLUActivation;
-
   static constexpr uint32_t kNumMathThreads = PipelineConfig::kNumMathThreads;
   static constexpr uint32_t kNumWriteSplits = PipelineConfig::kNumWriteSplits;
 
@@ -87,7 +82,6 @@ public:
 
   CUDA_INLINE
   void write(uint32_t slice_id, uint32_t slice_count, uint32_t split_idx) {
-    constexpr bool kHasActivation = EpilogueConfig::kActivationType != ActivationType::NONE;
     if constexpr (kUseTmaC && kIsMoE) {
       write_tma_moe(slice_id, slice_count);
     } else if constexpr (kUseTmaC && !kIsMoE) {
@@ -123,41 +117,12 @@ public:
         if (!pred1 || !pred2) continue;
 
         int4 val = smem_ptr[smem_offset_swizzled];
-        bool should_apply_activation = kHasActivation && (kUseStreamK && slice_count > 1);
-        bool should_apply_glu_activation = kHasGLUActivation && should_apply_activation;
-        bool should_apply_identity_activation = kHasIndentityActivation && should_apply_activation;
-
-        uint32_t gmem_offset = gmem_row * ((ProblemShape::N - PadShape::N) / 8) + gmem_col;
-        if (!should_apply_activation && !kHasGLUActivation) {
-          if (!kUseStreamK || slice_count == 1 || slice_id == 0) {
-            gmem_ptr[gmem_offset] = val;
-          } else {
-            gmem_ptr[gmem_offset] = reduce_add_f162<scalar_t2>(val, gmem_ptr[gmem_offset]);
-          }
-        } else if (!should_apply_activation && kHasGLUActivation && slice_count == 1) {
-          int2 *gmem_ptr_int2 = reinterpret_cast<int2 *>(gmem_ptr);
-          scalar_t *val_ptr = reinterpret_cast<scalar_t *>(&val);
-          val_ptr[1] = val_ptr[2];
-          val_ptr[2] = val_ptr[4];
-          val_ptr[3] = val_ptr[6];
-          gmem_ptr_int2[gmem_offset] = reinterpret_cast<int2 *>(&val)[0];
-        } else if (should_apply_identity_activation) {
-          if (slice_id > 0) val = reduce_add_f162<scalar_t2>(val, gmem_ptr[gmem_offset]);
-          if (slice_id == slice_count - 1) arith.apply_activation_on_gmem_write(val);
+        if (!kUseStreamK || slice_count == 1 || slice_id == 0) {
           gmem_ptr[gmem_offset] = val;
-        } else if (should_apply_glu_activation) {
-          int2 *gmem_ptr_int2 = reinterpret_cast<int2 *>(gmem_ptr);
-          int2 *val_int2_ptr = reinterpret_cast<int2 *>(&val);
-          uint32_t gmem_offset2 = gmem_offset + output_shape_m * ((ProblemShape::N - PadShape::N) / 8);
-          if (slice_id > 0) {
-            val_int2_ptr[0] = reduce_add_f162<scalar_t2>(val_int2_ptr[0], gmem_ptr_int2[gmem_offset]);
-            val_int2_ptr[1] = reduce_add_f162<scalar_t2>(val_int2_ptr[1], gmem_ptr_int2[gmem_offset2]);
-          }
-
-          if (slice_id == slice_count - 1) arith.apply_activation_on_gmem_write(val);
-          gmem_ptr_int2[gmem_offset] = val_int2_ptr[0];
-          if (slice_id != slice_count - 1) gmem_ptr_int2[gmem_offset2] = val_int2_ptr[1];
+        } else {
+          gmem_ptr[gmem_offset] = reduce_add_f162<scalar_t2>(val, gmem_ptr[gmem_offset]);
         }
+
       };
     };
   };
@@ -213,18 +178,10 @@ public:
     col_offset = n_block_id * BlockShape::N;
 
     uint32_t offset;
-    if constexpr (kHasGLUActivation) {
-      offset = n_block_id * (BlockShape::N / 2 * 2 / 16);
-    } else {
-      offset = n_block_id * (BlockShape::N * 2 / 16);
-    }
+    offset = n_block_id * (BlockShape::N * 2 / 16);
     if constexpr (!kIsMoE) {
       constexpr uint32_t kShapeN = ProblemShape::N - PadShape::N;
-      if constexpr (kHasGLUActivation) {
-        offset += m_block_id * (kShapeN / 2 * BlockShape::M * 2 / 16);
-      } else {
-        offset += m_block_id * (kShapeN * BlockShape::M * 2 / 16);
-      }
+      offset += m_block_id * (kShapeN * BlockShape::M * 2 / 16);
     }
     gmem_ptr = gmem_ptr_raw + offset;
   };

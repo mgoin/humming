@@ -1,6 +1,5 @@
 #pragma once
 
-#include <humming/arith/activation.cuh>
 #include <humming/arith/exp_offset.cuh>
 #include <humming/datatype/base_conversion.cuh>
 #include <humming/datatype/dequant.cuh>
@@ -30,11 +29,6 @@ private:
   static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
 
-  static constexpr bool kHasActivation = EpilogueConfig::kActivationType != ActivationType::NONE;
-  static constexpr bool kHasGLUActivation = EpilogueConfig::kActivationType == ActivationType::SILU_GLU ||
-                                            EpilogueConfig::kActivationType == ActivationType::CUSTOM_GLU;
-  static constexpr bool kHasIndentityActivation = kHasActivation && !kHasGLUActivation;
-
   static constexpr uint2 kExpOffset = get_epilogue_exp_offset<
       ElementA, ElementB, ElementC, ElementBS, kHasZeroPoint,
       kIsF16Accum, kIsGroupInputScale, kIsGroupWeightScale>();
@@ -52,58 +46,6 @@ public:
   uint32_t topk_weights[kSizeAS];
   uint32_t gs = 0;
   uint32_t _dummy;
-
-  CUDA_INLINE
-  void may_apply_activation_on_smem_write(uint32_t &regs, uint32_t slice_count) {
-    float2 regs_float2 = this->num22float2(*reinterpret_cast<scalar_t2 *>(&regs));
-    float *regs_float_ptr = reinterpret_cast<float *>(&regs_float2);
-
-    if (!kUseStreamK || slice_count == 1) {
-      if constexpr (kHasIndentityActivation) {
-        regs_float_ptr[0] = activation_func<EpilogueConfig::kActivationType>(regs_float_ptr[0]);
-        regs_float_ptr[1] = activation_func<EpilogueConfig::kActivationType>(regs_float_ptr[1]);
-        reinterpret_cast<scalar_t2 *>(&regs)[0] = this->float22num2(regs_float2);
-      } else if constexpr (kHasGLUActivation) {
-        regs_float_ptr[0] = activation_func<EpilogueConfig::kActivationType>(regs_float2);
-        reinterpret_cast<scalar_t2 *>(&regs)[0] = this->float22num2(regs_float2);
-      }
-    }
-  };
-
-  CUDA_INLINE
-  void apply_activation_on_gmem_write(int4 &regs) {
-    float2 regs_float2_ptr[4];
-    float *regs_float_ptr = reinterpret_cast<float *>(regs_float2_ptr);
-    scalar_t2 *regs_f162_ptr = reinterpret_cast<scalar_t2 *>(&regs);
-
-    PRAGMA_UNROLL
-    for (uint32_t i = 0; i < 4; i++) {
-      regs_float2_ptr[i] = this->num22float2(regs_f162_ptr[i]);
-    }
-
-    if constexpr (kHasIndentityActivation) {
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < 8; i++) {
-        regs_float_ptr[i] = activation_func<EpilogueConfig::kActivationType>(regs_float_ptr[i]);
-      }
-
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < 4; i++) {
-        regs_f162_ptr[i] = this->float22num2(regs_float2_ptr[i]);
-      }
-
-    } else if constexpr (kHasGLUActivation) {
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < 4; i++) {
-        regs_float_ptr[i] = activation_func<EpilogueConfig::kActivationType>(regs_float2_ptr[i]);
-      }
-
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < 2; i++) {
-        regs_f162_ptr[i] = this->float22num2(regs_float2_ptr[i]);
-      }
-    }
-  };
 
   CUDA_INLINE
   void may_process_f32_on_smem_write(uint32_t row, uint32_t col) {

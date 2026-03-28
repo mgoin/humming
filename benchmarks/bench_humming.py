@@ -46,7 +46,6 @@ def bench_humming(
         input_config={"dtype": a_dtype, "group_size": input_scale_group_size},
         torch_dtype=torch_dtype,
         is_moe_down=is_moe_down,
-        activation_type=("silu" if num_experts is not None and not is_moe_down else "none"),
     ).to("cuda:0")
 
     for tensor in layer.parameters():

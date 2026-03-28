@@ -9,7 +9,7 @@ from typing import Any, Callable
 import torch
 
 from humming import dtypes, ops
-from humming.config.enum import ActivationType, MmaType
+from humming.config.enum import MmaType
 from humming.jit.utils import make_humming_module
 from humming.kernel.humming import HummingKernel
 from humming.schema import (
@@ -62,8 +62,6 @@ class HummingLayerMeta:
     top_k: int = 0
     is_moe: bool = False
     is_moe_down: bool = False
-    activation_type: ActivationType = ActivationType.NONE
-    custom_activation_func_impl: str | None = None
     sublayer_name: str = ""
 
     @property
@@ -131,8 +129,6 @@ class HummingLayerMeta:
         )
 
     def __post_init__(self):
-        if isinstance(self.activation_type, str):
-            self.activation_type = ActivationType(self.activation_type)
         if self.is_fp_zero_point:
             assert self.has_zero_point
         if self.a_dtype.num_bits != 16 and self.has_input_scale is None:
@@ -198,8 +194,6 @@ class HummingMethod:
         has_bias: bool = False,
         top_k: int = 0,
         is_moe_down: bool = False,
-        activation_type: ActivationType = ActivationType.NONE,
-        custom_activation_func_impl: str | None = None,
         torch_dtype: torch.dtype | None = None,
         sublayer_name: str = "",
     ):
@@ -586,8 +580,6 @@ class HummingLayer(HummingModule):
     top_k: int = 0
     is_moe_down: bool = False
     torch_dtype: torch.dtype | None = None
-    activation_type: str | None = None
-    custom_activation_func_impl: str | None = None
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -835,8 +827,6 @@ class HummingLayer(HummingModule):
             has_bias=self.has_bias,
             top_k=self.top_k,
             is_moe_down=self.is_moe_down,
-            activation_type=ActivationType(self.activation_type or "none"),
-            custom_activation_func_impl=self.custom_activation_func_impl,
         )
 
         HummingMethod.transform_humming_layer(self)
