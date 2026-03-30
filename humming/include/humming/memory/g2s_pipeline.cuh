@@ -26,6 +26,7 @@ private:
 
   static constexpr bool kUseMBarrier = PipelineConfig::kUseMBarrier;
   static constexpr bool kUseCpAsync = PipelineConfig::kUseCpAsync;
+  static constexpr bool kUseTma = PipelineConfig::kUseTma;
   static constexpr bool kUseTmaA = PipelineConfig::kUseTmaA;
   static constexpr bool kUseTmaB = PipelineConfig::kUseTmaB;
   static constexpr bool kUseTmaBS = PipelineConfig::kUseTmaBS;
@@ -201,12 +202,12 @@ public:
         loader_bzp.load<kShouldAdvance>(smem.bzp[stage_id], &smem.load_mbar[mbar_index]);
       }
       load_bytes = get_stage_load_bytes<kIsFirst>();
+    }
 
-      if constexpr (kIsFirst) {
-        commit_load<kHasFirstStageCpAsyncMBarrier, kHasFirstStageTmaMBarrier>(mbar_index, load_bytes);
-      } else {
-        commit_load<kHasStageCpAsyncMBarrier, kHasStageTmaMBarrier>(mbar_index, load_bytes);
-      }
+    if constexpr (kIsFirst) {
+      commit_load<kHasFirstStageCpAsyncMBarrier, kHasFirstStageTmaMBarrier>(mbar_index, load_bytes, pred);
+    } else {
+      commit_load<kHasStageCpAsyncMBarrier, kHasStageTmaMBarrier>(mbar_index, load_bytes, pred);
     }
   }
 
@@ -223,8 +224,9 @@ public:
   }
 
   template <bool kHasCpAsyncMBarrier, bool kHasTmaMBarrier>
-  CUDA_INLINE void commit_load(uint32_t stage_id, uint2 load_bytes) {
+  CUDA_INLINE void commit_load(uint32_t stage_id, uint2 load_bytes, bool pred = true) {
     if constexpr (kUseMBarrier) {
+      if (!pred) return;
       if constexpr (kHasCpAsyncMBarrier) {
         cp_async_commit_mbarrier(&smem.load_mbar[stage_id]);
       }

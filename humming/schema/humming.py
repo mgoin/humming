@@ -59,7 +59,6 @@ class HummingWeightSchema(BaseWeightSchema):
     ) -> dict[str, dict[str, Any]]:
         num_bits = self.b_dtype.num_bits
         group_size = self.weight_scale_group_size or shape_k
-        scale_type = "group" if self.weight_scale_group_size > 0 else "channel"
 
         scale_torch_dtype = param_dtype
         if self.bs_dtype == dtypes.float8e8m0:
@@ -74,12 +73,7 @@ class HummingWeightSchema(BaseWeightSchema):
                 "shape": (shape_n, shape_k * num_bits // 32),
                 "dtype": torch.int32,
                 "extra_attrs": {"input_dim": 1, "output_dim": 0},
-            },
-            "weight_scale": {
-                "shape": (shape_n, shape_k // group_size),
-                "dtype": scale_torch_dtype,
-                "extra_attrs": {"output_dim": 0, "scale_type": scale_type},
-            },
+            }
         }
 
         if "GROUP" in str(self.weight_scale_type):
@@ -92,7 +86,7 @@ class HummingWeightSchema(BaseWeightSchema):
             tensor_meta["weight_scale"] = {
                 "shape": (shape_n, 1),
                 "dtype": scale_torch_dtype,
-                "extra_attrs": {"input_dim": 1, "output_dim": 0, "scale_type": "channel"},
+                "extra_attrs": {"output_dim": 0, "scale_type": "channel"},
             }
         elif self.weight_scale_type == WeightScaleType.BLOCK:
             group_size_n = self.weight_scale_group_size_n

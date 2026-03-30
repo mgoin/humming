@@ -232,6 +232,7 @@ class HummingMethod:
             input_scale_group_size=input_schema.input_scale_group_size,
             weight_scale_group_size=weight_schema.weight_scale_group_size,
             weight_scale_group_size_n=weight_schema.weight_scale_group_size_n,
+            weight_scale_type=weight_schema.weight_scale_type,
             has_zero_point=weight_schema.has_zero_point,
             is_fp_zero_point=weight_schema.is_fp_zero_point,
             sublayer_name=sublayer_name,
@@ -360,9 +361,11 @@ class HummingMethod:
 
         weight = tensors["weight"]
         zero_point = tensors["zero_point"] if meta.has_zero_point else None
-        weight_scale = tensors["weight_scale"]
+        weight_scale: torch.Tensor | None = None
+        if meta.weight_scale_type != WeightScaleType.TENSOR:
+            weight_scale = tensors["weight_scale"]
         bias = tensors["bias"] if meta.has_bias else None
-        if "GROUP" in str(meta.weight_scale_type):
+        if "TENSOR" in str(meta.weight_scale_type):
             global_scale = tensors.get("global_scale", None)
         else:
             global_scale = None
@@ -559,7 +562,7 @@ class HummingMethod:
             getattr(layer, meta.weight_name),
             outputs,
             input_scale,
-            getattr(layer, meta.weight_scale_name),
+            getattr(layer, meta.weight_scale_name, None),
             getattr(layer, meta.zero_point_name, None),
             getattr(layer, meta.bias_name, None),
             getattr(layer, meta.global_scale_name, None),

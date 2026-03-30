@@ -15,6 +15,8 @@ private:
   static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
   static constexpr uint32_t kTopK = MoEConfig::kTopK;
   static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
+  static constexpr uint32_t kNumMathThreads = PipelineConfig::kNumMathThreads;
+  static constexpr uint32_t kNumLoadThreads = PipelineConfig::kNumLoadThreads;
   static constexpr uint32_t kMultiCastSizeA = PipelineConfig::kMultiCastSizeA;
   static constexpr uint32_t kMultiCastSizeB = PipelineConfig::kMultiCastSizeB;
   static constexpr uint32_t kMultiCastSize = kMultiCastSizeA * kMultiCastSizeB;
@@ -125,7 +127,9 @@ public:
       has_next_block = get_streamk_next_block();
     }
 
-    if (kIsMoE && has_next_block) { fetch_moe_block(); }
+    if constexpr (kIsMoE) {
+      if (has_next_block) fetch_moe_block();
+    }
 
     return has_next_block;
   };
@@ -173,7 +177,7 @@ public:
 
   CUDA_INLINE
   void fetch_moe_block() {
-    if (kUseWarpSpec && threadIdx.x < kNumThreads) return;
+    if (kUseWarpSpec && threadIdx.x < kNumMathThreads) return;
 
     expert_id = expert_ids[m_block_id];
 
@@ -181,17 +185,19 @@ public:
     const int4 *gmem_ptr_load = reinterpret_cast<const int4 *>(gmem_ptr);
     int4 *smem_ptr_load = reinterpret_cast<int4 *>(smem.wr_row_index);
 
-    legacy_load_1d<kUseCpAsync, BlockShape::M / 4, kNumThreads>(gmem_ptr_load, smem_ptr_load);
+    legacy_load_1d<kUseCpAsync, BlockShape::M / 4, kNumLoadThreads>(gmem_ptr_load, smem_ptr_load);
     if constexpr (kUseCpAsync) cp_async_commit_group();
     if constexpr (kUseCpAsync) cp_async_wait_group<0>();
 
     if constexpr (kUseWarpSpec) __syncwarp();
     else __syncthreads();
 
-    static_assert(kNumThreads >= BlockShape::M);
-    if (threadIdx.x < BlockShape::M) {
-      uint32_t idx = smem.wr_row_index[threadIdx.x];
-      if constexpr (!kIsMoEDown) { smem.rd_row_index[threadIdx.x] = idx / kTopK; };
+    static_assert(kNumLoadThreads >= BlockShape::M);
+    uint32_t thread_id = threadIdx.x;
+    if constexpr(kUseWarpSpec) thread_id = thread_id - kNumMathThreads;
+    if (thread_id < BlockShape::M) {
+      uint32_t idx = smem.wr_row_index[thread_id];
+      if constexpr (!kIsMoEDown) { smem.rd_row_index[thread_id] = idx / kTopK; };
     };
 
     if constexpr (kUseWarpSpec) __syncwarp();
