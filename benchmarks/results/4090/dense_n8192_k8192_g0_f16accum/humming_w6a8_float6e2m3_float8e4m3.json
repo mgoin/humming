@@ -1,0 +1,100 @@
+{
+    "problem": {
+        "shape_n": 8192,
+        "shape_k": 8192,
+        "a_dtype": "float8e4m3",
+        "b_dtype": "float6e2m3",
+        "bs_dtype": "float16",
+        "c_dtype": "float16",
+        "input_scale_group_size": 0,
+        "weight_scale_group_size": 0,
+        "zero_point": false,
+        "use_fp_zero_point": false,
+        "use_f16_accum": true
+    },
+    "device": {
+        "device_name": "NVIDIA GeForce RTX 4090",
+        "memory_gbps": 1008.096,
+        "compute_tops": 710.1735206931288
+    },
+    "packages": {
+        "torch": "2.10.0+cu128"
+    },
+    "result": {
+        "1": {
+            "time": 0.0786914815554982,
+            "memory_gbps": 640.1799407534496,
+            "compute_tops": 1.7056195327233887
+        },
+        "2": {
+            "time": 0.0781349299924217,
+            "memory_gbps": 645.0544974557271,
+            "compute_tops": 3.435537166617229
+        },
+        "4": {
+            "time": 0.07816724067977995,
+            "memory_gbps": 645.4167700082364,
+            "compute_tops": 6.868234151942835
+        },
+        "8": {
+            "time": 0.0788665920841951,
+            "memory_gbps": 640.9401834687618,
+            "compute_tops": 13.614659840426635
+        },
+        "16": {
+            "time": 0.07849395708001626,
+            "memory_gbps": 646.488085041635,
+            "compute_tops": 27.3585856527894
+        },
+        "32": {
+            "time": 0.07947113821807802,
+            "memory_gbps": 643.487549651919,
+            "compute_tops": 54.0443661976265
+        },
+        "64": {
+            "time": 0.08031206424175359,
+            "memory_gbps": 646.5435609237458,
+            "compute_tops": 106.95696435024718
+        },
+        "128": {
+            "time": 0.08434665277171949,
+            "memory_gbps": 634.26782500535,
+            "compute_tops": 203.68169476145738
+        },
+        "256": {
+            "time": 0.09212082195292207,
+            "memory_gbps": 614.8947306283044,
+            "compute_tops": 372.98558175652613
+        },
+        "512": {
+            "time": 0.13684245941157525,
+            "memory_gbps": 459.9236835601354,
+            "compute_tops": 502.17949188793335
+        },
+        "1024": {
+            "time": 0.25933459167947437,
+            "memory_gbps": 291.2147103512584,
+            "compute_tops": 529.967686076635
+        },
+        "2048": {
+            "time": 0.49815729112097273,
+            "memory_gbps": 202.1288653096275,
+            "compute_tops": 551.7893882983407
+        },
+        "4096": {
+            "time": 1.0052873507542832,
+            "memory_gbps": 150.23744990591837,
+            "compute_tops": 546.8643502531982
+        },
+        "8192": {
+            "time": 2.0427295256397846,
+            "memory_gbps": 123.2231114499428,
+            "compute_tops": 538.2560999756598
+        },
+        "16384": {
+            "time": 4.12884642023897,
+            "memory_gbps": 109.7330348203596,
+            "compute_tops": 532.5999157471022
+        }
+    }
+}
