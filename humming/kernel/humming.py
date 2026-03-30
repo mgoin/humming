@@ -305,8 +305,8 @@ class HummingKernel(
             assert self.weight_scale_group_size_n >= 64
 
         if self.is_block_weight_scale:
-            assert self.input_scale_group_size > 0
-            assert self.input_scale_group_size == self.weight_scale_group_size
+            if self.input_scale_group_size > 0:
+                assert self.input_scale_group_size == self.weight_scale_group_size
             assert self.weight_scale_group_size_n > 0
             assert not self.has_zero_point
         if self.is_tensor_weight_scale and not self.is_group_weight_scale:
@@ -356,7 +356,7 @@ class HummingKernel(
         # 16-bit activation don't support input scale
         # for 8bit/4-bit activation, we enable input scale by default
         if self.pipeline_config.use_warp_spec or self.pipeline_config.use_tma:
-            assert self.pipeline_config.use_mbarrie
+            assert self.pipeline_config.use_mbarrier
         is_channel_weight_scale = self.quant_param_config.is_channel_weight_scale
         is_group_weight_scale = self.quant_param_config.is_group_weight_scale
         if not (is_channel_weight_scale or is_group_weight_scale):

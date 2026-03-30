@@ -151,9 +151,9 @@ Tensor launch_kernel(
   config.blockDimZ = 1;
 
   CUlaunchAttribute attrs[1]; 
-  if (kernel_data.multi_cast_size > 1) {
+  if (kernel_data.multi_cast_size_a * kernel_data.multi_cast_size_b > 1) {
     attrs[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-    attrs[0].value.clusterDim.x = kernel_data.multi_cast_size;
+    attrs[0].value.clusterDim.x = kernel_data.multi_cast_size_a * kernel_data.multi_cast_size_b;
     attrs[0].value.clusterDim.y = 1;
     attrs[0].value.clusterDim.z = 1;
     config.attrs = attrs;
@@ -208,7 +208,8 @@ int64_t register_kernel(const std::string &cubin_path, const std::string &func_n
         reader.getUint32("WEIGHT_SCALE_GROUP_SIZE_N"),
         reader.getUint32("TOP_K"),
         reader.getUint32("NUM_CTAS_PER_SM"),
-        reader.getUint32("MULTI_CAST_SIZE"),
+        reader.getUint32("MULTI_CAST_SIZE_A"),
+        reader.getUint32("MULTI_CAST_SIZE_B"),
 
         reader.getBool("USE_STREAM_K"),
         reader.getBool("IS_MOE"),

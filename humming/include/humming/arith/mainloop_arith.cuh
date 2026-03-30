@@ -184,26 +184,32 @@ public:
 
   CUDA_INLINE
   void may_process_as_and_bs_before_apply_on_c(uint32_t m, uint32_t n, uint32_t k, uint32_t iter_id) {
-
-    uint32_t k_index = (iter_id * kPartMmaShapeK) + k * MmaShape::K;
+    constexpr uint32_t kWarpItersK = WarpShape::K / kPartMmaShapeK;
     uint32_t buffer_id = iter_id % 2;
-    bool is_new_as_group = kIsGroupInputScale && k_index % kInputScaleGroupSize == 0;
-    if (m == 0 && n == 0 && is_new_as_group) {
+    uint32_t k_index = iter_id * kPartMmaShapeK + (k + 1) * MmaShape::K;
+    uint32_t is_last_iter = iter_id == (kWarpItersK - 1);
+    uint32_t is_as_group_end = kIsGroupInputScale && k_index % kInputScaleGroupSize == 0;
+    uint32_t is_bs_group_end = (kIsGroupWeightScale || kIsBlockWeightScale) && k_index % kWeightScaleGroupSize == 0;
+
+    bool should_apply_as = kIsGroupInputScale && (is_last_iter || is_as_group_end);
+    bool should_apply_bs = (kIsGroupWeightScale || kIsBlockWeightScale) && (is_last_iter || is_bs_group_end);
+    if (!should_apply_as && !should_apply_bs) return;
+
+    if (m == 0 && n == 0 && should_apply_as) {
       if constexpr (kIsBlockWeightScale) {
-        static_assert(kIsGroupInputScale);
         float *as_float_ptr = reinterpret_cast<float *>(as[buffer_id]);
         float *q_as_float_ptr = reinterpret_cast<float *>(q_as);
         float &block_bs_float = reinterpret_cast<float *>(&bs[buffer_id])[0];
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < WarpShape::M / 8 * (kUseWgmma ? 2 : 1); i++) {
-          q_as_float_ptr[i] = as_float_ptr[i] * block_bs_float;
+          as_float_ptr[i] = as_float_ptr[i] * block_bs_float;
         }
       }
 
       if constexpr (kIsF16Accum) {
         float2 *as_float2_ptr = reinterpret_cast<float2 *>(as[buffer_id]);
         float *as_float_ptr = reinterpret_cast<float *>(as[buffer_id]);
-        scalar_t2 *as_scalar2_ptr = reinterpret_cast<scalar_t2 *>(q_as);
+        scalar_t2 *as_scalar2_ptr = reinterpret_cast<scalar_t2 *>(as[buffer_id]);
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < WarpShape::M / 8; i++) {
           if constexpr (kUseWgmma) {
@@ -220,8 +226,7 @@ public:
       };
     }
 
-    bool is_new_bs_group = kIsGroupWeightScale && k_index % kWeightScaleGroupSize == 0;
-    if (m == 0 && n == 0 && is_new_bs_group) {
+    if (m == 0 && n == 0 && should_apply_bs) {
       if constexpr (kUseIntWeightScale) {
         int16_t *bs_vals = reinterpret_cast<int16_t *>(bs[buffer_id]);
         int32_t *dq_bs_vals = reinterpret_cast<int32_t *>(dq_bs);
@@ -238,6 +243,11 @@ public:
           for (uint32_t i = 0; i < kNumBSPerGroup / 2; i++)
             dq_bs_scalar2_ptr[i] = __hmul2(bs_scalar2_ptr[i], scale_factor);
         }
+      } else if constexpr (kIsF16Accum && kIsBlockWeightScale) {
+        scalar_t2 *dq_bs_scalar2_ptr = reinterpret_cast<scalar_t2 *>(dq_bs);
+        scalar_t2 scale_factor = prepare_exp_scale_factor<scalar_t2, kExpOffset.y>();
+        dq_bs_scalar2_ptr[0] = this->float2num2(reinterpret_cast<float*>(bs[buffer_id])[0]);
+        dq_bs_scalar2_ptr[0] = __hmul2(dq_bs_scalar2_ptr[0], scale_factor);
       } else if constexpr (kIsF16Accum && ElementBS::kBits == 8 && kIsGroupWeightScale) {
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < CEIL_DIV(kNumBSPerGroup, 8); i++) {
@@ -280,13 +290,14 @@ public:
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < kNumBSPerGroup / 2; i++)
           dq_bs_vals[i] = F16Conversion<ElementBS>::num22float2(bs_vals[i]);
-      };
+      }
     }
   };
 
   CUDA_INLINE
   void may_apply_as_and_bs_on_mma_c(uint32_t *regs_c_ptr, uint32_t m, uint32_t n, uint32_t k, uint32_t iter_id) {
-    if constexpr (ElementA::kBits == 16 || !kIsGroupInputScale && !kIsGroupWeightScale) return;
+    if constexpr (ElementA::kBits == 16) return;
+    if constexpr (!kIsGroupInputScale && !kIsGroupWeightScale && !kIsBlockWeightScale) return;
     if constexpr (kUseWgmma) return;
 
     may_process_as_and_bs_before_apply_on_c(m, n, k, iter_id);
@@ -296,10 +307,10 @@ public:
     uint32_t k_index = iter_id * kPartMmaShapeK + (k + 1) * MmaShape::K;
     uint32_t is_last_iter = iter_id == (kWarpItersK - 1);
     uint32_t is_as_group_end = kIsGroupInputScale && k_index % kInputScaleGroupSize == 0;
-    uint32_t is_bs_group_end = kIsGroupWeightScale && k_index % kWeightScaleGroupSize == 0;
+    uint32_t is_bs_group_end = (kIsGroupWeightScale || kIsBlockWeightScale) && k_index % kWeightScaleGroupSize == 0;
 
     bool should_apply_as = kIsGroupInputScale && (is_last_iter || is_as_group_end);
-    bool should_apply_bs = kIsGroupWeightScale && (is_last_iter || is_bs_group_end);
+    bool should_apply_bs = (kIsGroupWeightScale || kIsBlockWeightScale) && (is_last_iter || is_bs_group_end);
     if (!should_apply_as && !should_apply_bs) return;
 
     using CRegistersArrayType = typename MmaOpClass::CRegisters[2][WarpShape::M / MmaShape::M][WarpShape::N / MmaShape::N];
@@ -314,18 +325,24 @@ public:
         scalar_t2 &part_regs_c0 = reinterpret_cast<scalar_t2 *>(regs_c[0][m][n])[index];
         scalar_t2 &part_regs_c1 = reinterpret_cast<scalar_t2 *>(regs_c[1][m][n])[index];
 
-        scalar_t2 as_val = reinterpret_cast<scalar_t2 *>(q_as)[m * MmaShape::M / 8 + inner_m];
+        scalar_t2 as_val = reinterpret_cast<scalar_t2 *>(as[buffer_id])[m * MmaShape::M / 8 + inner_m];
         scalar_t2 bs_val;
-        if constexpr (ElementBS::kBits == 8 || kExpOffset.y) {
+        if constexpr (!kIsGroupWeightScale && kIsBlockWeightScale) {
+          bs_val = reinterpret_cast<scalar_t2 *>(dq_bs)[0];
+        } else if constexpr (ElementBS::kBits == 8 || kExpOffset.y) {
           bs_val = reinterpret_cast<scalar_t2 *>(dq_bs)[n * MmaShape::N / 8 + inner_n];
         } else {
           bs_val = reinterpret_cast<scalar_t2 *>(bs[buffer_id])[n * MmaShape::N / 8 + inner_n];
         }
 
-        if constexpr (kIsGroupInputScale && kIsBlockWeightScale) {
-          part_regs_c1 = __hfma2(part_regs_c0, as_val, part_regs_c1);
-        } else if constexpr (kIsGroupWeightScale) {
+        if constexpr (kIsGroupInputScale && kIsGroupWeightScale) {
+          part_regs_c1 = __hfma2(part_regs_c0, __hmul2(as_val, bs_val), part_regs_c1);
+        } else if constexpr (!kIsGroupInputScale && kIsGroupWeightScale) {
           part_regs_c1 = __hfma2(part_regs_c0, bs_val, part_regs_c1);
+        } else if constexpr (!kIsGroupInputScale && kIsBlockWeightScale) {
+          part_regs_c1 = __hfma2(part_regs_c0, bs_val, part_regs_c1);
+        } else if constexpr (kIsGroupInputScale && !kIsGroupWeightScale) {
+          part_regs_c1 = __hfma2(part_regs_c0, as_val, part_regs_c1);
         }
         reinterpret_cast<uint32_t *>(&part_regs_c0)[0] = 0;
 
@@ -352,20 +369,22 @@ public:
             part_regs_c0.y = __int2float_rn(part_int_regs_c0.y);
           }
 
-          float as_val;
-          if constexpr (kIsGroupInputScale && !kIsBlockWeightScale) {
-            as_val = reinterpret_cast<float *>(as[buffer_id])[m * MmaShape::M / 8 + inner_m];
-          } else if constexpr (kIsGroupInputScale && kIsBlockWeightScale) {
-            as_val = reinterpret_cast<float *>(q_as)[m * MmaShape::M / 8 + inner_m];
-          }
+          float &as_val = reinterpret_cast<float *>(as[buffer_id])[m * MmaShape::M / 8 + inner_m];
           float2 &bs_vals = reinterpret_cast<float2 *>(dq_bs)[n * MmaShape::N / 8 + inner_n];
+          float &block_bs_float = reinterpret_cast<float *>(&bs[buffer_id])[0];
 
-          if constexpr (kIsGroupInputScale) {
-            part_regs_c1.x += as_val * part_regs_c0.x;
-            part_regs_c1.y += as_val * part_regs_c0.y;
-          } else if constexpr (kIsGroupWeightScale) {
+          if constexpr (kIsGroupInputScale && kIsGroupWeightScale) {
+            part_regs_c1.x += as_val * bs_vals.x * part_regs_c0.x;
+            part_regs_c1.y += as_val * bs_vals.y * part_regs_c0.y;
+          } else if constexpr (!kIsGroupInputScale && kIsGroupWeightScale) {
             part_regs_c1.x += bs_vals.x * part_regs_c0.x;
             part_regs_c1.y += bs_vals.y * part_regs_c0.y;
+          } else if constexpr (!kIsGroupInputScale && kIsBlockWeightScale) {
+            part_regs_c1.x += block_bs_float * part_regs_c0.x;
+            part_regs_c1.y += block_bs_float * part_regs_c0.y;
+          } else if constexpr (kIsGroupInputScale && !kIsGroupWeightScale) {
+            part_regs_c1.x += as_val * part_regs_c0.x;
+            part_regs_c1.y += as_val * part_regs_c0.y;
           }
 
           part_regs_c0.x = 0;
@@ -377,7 +396,8 @@ public:
 
   CUDA_INLINE
   void may_apply_as_and_bs_on_wgmma_c(uint32_t *regs_c_ptr, uint32_t m, uint32_t k, uint32_t iter_id) {
-    if constexpr (ElementA::kBits == 16 || !kIsGroupInputScale && !kIsGroupWeightScale) return;
+    if constexpr (ElementA::kBits == 16) return;
+    if constexpr (!kIsGroupInputScale && !kIsGroupWeightScale && !kIsBlockWeightScale) return;
     if constexpr (!kUseWgmma) return;
 
     may_process_as_and_bs_before_apply_on_c(m, 0, k, iter_id);
@@ -387,10 +407,10 @@ public:
     uint32_t k_index = iter_id * kPartMmaShapeK + (k + 1) * MmaShape::K;
     uint32_t is_last_iter = iter_id == (kWarpItersK - 1);
     uint32_t is_as_group_end = kIsGroupInputScale && k_index % kInputScaleGroupSize == 0;
-    uint32_t is_bs_group_end = kIsGroupWeightScale && k_index % kWeightScaleGroupSize == 0;
+    uint32_t is_bs_group_end = (kIsGroupWeightScale || kIsBlockWeightScale) && k_index % kWeightScaleGroupSize == 0;
 
     bool should_apply_as = kIsGroupInputScale && (is_last_iter || is_as_group_end);
-    bool should_apply_bs = kIsGroupWeightScale && (is_last_iter || is_bs_group_end);
+    bool should_apply_bs = (kIsGroupWeightScale || kIsBlockWeightScale) && (is_last_iter || is_bs_group_end);
     if (!should_apply_as && !should_apply_bs) return;
 
     using CRegistersArrayType = typename MmaOpClass::CRegisters[2][WarpShape::N * 4 / MmaShape::M][WarpShape::M / MmaShape::N];
@@ -405,22 +425,27 @@ public:
         scalar_t2 &part_regs_c0 = reinterpret_cast<scalar_t2 *>(regs_c[0][m][0])[index];
         scalar_t2 &part_regs_c1 = reinterpret_cast<scalar_t2 *>(regs_c[1][m][0])[index];
 
-        scalar_t2 as_val = reinterpret_cast<scalar_t2 *>(q_as)[inner_n];
+        scalar_t2 as_val = reinterpret_cast<scalar_t2 *>(as[buffer_id])[inner_n];
         scalar_t2 bs_val;
-        if constexpr (ElementBS::kBits == 8 || kExpOffset.y) {
+        if constexpr (!kIsGroupWeightScale && kIsBlockWeightScale) {
+          bs_val = reinterpret_cast<scalar_t2 *>(dq_bs)[0];
+        } else if constexpr (ElementBS::kBits == 8 || kExpOffset.y) {
           bs_val = this->num2num2(reinterpret_cast<scalar_t *>(dq_bs)[m * 2 + inner_m]);
         } else {
           bs_val = this->num2num2(reinterpret_cast<scalar_t *>(bs[buffer_id])[m * 2 + inner_m]);
         }
 
-        if constexpr (kIsGroupInputScale && kIsBlockWeightScale) {
-          part_regs_c1 = __hfma2(part_regs_c0, as_val, part_regs_c1);
-        } else if constexpr (kIsGroupWeightScale) {
+        float &block_bs_float = reinterpret_cast<float *>(&bs[buffer_id])[0];
+
+        if constexpr (kIsGroupInputScale && kIsGroupWeightScale) {
+          part_regs_c1 = __hfma2(part_regs_c0, __hmul2(as_val, bs_val), part_regs_c1);
+        } else if constexpr (!kIsGroupInputScale && kIsGroupWeightScale) {
           part_regs_c1 = __hfma2(part_regs_c0, bs_val, part_regs_c1);
+        } else if constexpr (!kIsGroupInputScale && kIsBlockWeightScale) {
+          part_regs_c1 = __hfma2(part_regs_c0, bs_val, part_regs_c1);
+        } else if constexpr (kIsGroupInputScale && !kIsGroupWeightScale) {
+          part_regs_c1 = __hfma2(part_regs_c0, as_val, part_regs_c1);
         }
-
-        reinterpret_cast<uint32_t *>(&part_regs_c0)[0] = 0;
-
       } else {
         int2 &part_int_regs_c0 = reinterpret_cast<int2 *>(regs_c[0][m][0])[index];
         float2 &part_regs_c0 = reinterpret_cast<float2 *>(regs_c[0][m][0])[index];
@@ -433,17 +458,21 @@ public:
 
         float2 &as_vals = *reinterpret_cast<float2 *>(&as[buffer_id][inner_n * 2]);
         float &bs_val = reinterpret_cast<float *>(dq_bs)[m * 2 + inner_m];
+        float &block_bs_float = reinterpret_cast<float *>(&bs[buffer_id])[0];
 
-        if constexpr (kIsGroupInputScale && kIsBlockWeightScale) {
-          part_regs_c1.x += as_vals.x * part_regs_c0.x;
-          part_regs_c1.y += as_vals.y * part_regs_c0.y;
-        } else if constexpr (kIsGroupWeightScale) {
+        if constexpr (kIsGroupInputScale && kIsGroupWeightScale) {
+          part_regs_c1.x += as_vals.x * bs_val * part_regs_c0.x;
+          part_regs_c1.y += as_vals.y * bs_val * part_regs_c0.y;
+        } else if constexpr (!kIsGroupInputScale && kIsGroupWeightScale) {
           part_regs_c1.x += bs_val * part_regs_c0.x;
           part_regs_c1.y += bs_val * part_regs_c0.y;
+        } else if constexpr (!kIsGroupInputScale && kIsBlockWeightScale) {
+          part_regs_c1.x += block_bs_float * part_regs_c0.x;
+          part_regs_c1.y += block_bs_float * part_regs_c0.y;
+        } else if constexpr (kIsGroupInputScale && !kIsGroupWeightScale) {
+          part_regs_c1.x += as_vals.x * part_regs_c0.x;
+          part_regs_c1.y += as_vals.y * part_regs_c0.y;
         }
-
-        part_regs_c0.x = 0;
-        part_regs_c0.y = 0;
       }
     }
   }

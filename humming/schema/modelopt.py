@@ -4,6 +4,7 @@ from typing import Any
 import torch
 
 from humming import dtypes
+from humming.config.enum import WeightScaleType
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
 from humming.schema.humming import HummingInputSchema, HummingWeightSchema
 
@@ -107,8 +108,10 @@ class ModeloptNvfp4WeightSchema(ModeloptWeightSchema):
         output_tensors = {"weight": weight, "weight_scale": weight_scale}
         has_global_scale = global_scale.nelement() == (num_experts or 1)
         if has_global_scale:
+            weight_scale_type = WeightScaleType.GROUP_TENSOR
             output_tensors["global_scale"] = global_scale.view((num_experts or 1))
         else:
+            weight_scale_type = WeightScaleType.GROUP
             weight_scale = weight_scale.float() * global_scale.float()
             output_tensors["weight_scale"] = weight_scale.to(param_dtype)
 
@@ -119,7 +122,7 @@ class ModeloptNvfp4WeightSchema(ModeloptWeightSchema):
             b_dtype=dtypes.float4e2m1,
             bs_dtype=dtypes.float8e4m3 if has_global_scale else None,
             weight_scale_group_size=16,
-            has_global_scale=has_global_scale,
+            weight_scale_type=weight_scale_type,
         )
 
         return schema, output_tensors

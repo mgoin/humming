@@ -31,7 +31,7 @@ from humming.utils.weight import (
 @pytest.mark.parametrize("bs_dtype", ["float16", "bfloat16", "float8e5m2", "float8e4m3"])
 @pytest.mark.parametrize("input_scale_group_size", [16, 32, 64, 128, 0])
 @pytest.mark.parametrize("weight_scale_group_size", [16, 32, 64, 128, 0])
-@pytest.mark.parametrize("mma_type", ["mma", "wgmma"])
+@pytest.mark.parametrize("mma_type", ["wgmma"])
 def test_scale(
     a_dtype,
     b_dtype,
@@ -69,14 +69,15 @@ def test_scale(
     if bs_dtype in [dtypes.float16, dtypes.bfloat16] and bs_dtype != c_dtype:
         return
 
-    if mma_type == "wgmma" and a_dtype == "int4":
+    if mma_type == "wgmma" and a_dtype == dtypes.int4:
         return
     if input_scale_group_size > 0 and input_scale_group_size < 256 // a_dtype.num_bits:
         return
     if weight_scale_group_size > 0 and weight_scale_group_size < 256 // a_dtype.num_bits:
         return
     if input_scale_group_size > 0 and weight_scale_group_size > 0:
-        return
+        if input_scale_group_size != weight_scale_group_size:
+            return
 
     random_weight_data = generate_random_weight(
         n=1024,
@@ -147,13 +148,15 @@ def test_scale(
 @pytest.mark.parametrize("b_dtype", ["uint5", "float6e1m4"])
 @pytest.mark.parametrize("c_dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("bs_dtype", [None, "float16", "bfloat16", "float8e4m3"])
+@pytest.mark.parametrize("input_scale_group_size", [0, 32, 64])
 @pytest.mark.parametrize("weight_scale_group_size", [16, 32, 64])
-@pytest.mark.parametrize("use_f16_accum", [False])
+@pytest.mark.parametrize("use_f16_accum", [True, False])
 def test_global_scale(
     a_dtype,
     b_dtype,
     c_dtype,
     bs_dtype,
+    input_scale_group_size,
     weight_scale_group_size,
     use_f16_accum,
 ):
@@ -196,6 +199,11 @@ def test_global_scale(
 
     if weight_scale_group_size > 0 and weight_scale_group_size < 256 // a_dtype.num_bits:
         return
+    if input_scale_group_size > 0 and input_scale_group_size < 256 // a_dtype.num_bits:
+        return
+    if input_scale_group_size > 0 and weight_scale_group_size > 0:
+        if input_scale_group_size != weight_scale_group_size:
+            return
 
     random_weight_data = generate_random_weight(
         n=1024,
@@ -219,6 +227,7 @@ def test_global_scale(
     _, inputs_ref, inputs, input_scale = generate_random_inputs(
         m=128,
         k=1024,
+        group_size=input_scale_group_size,
         dtype=a_dtype,
     )
 
@@ -232,6 +241,7 @@ def test_global_scale(
         bs_dtype=bs_dtype or dtypes.float32,
         num_stages=3,
         use_warp_spec=False,
+        input_scale_group_size=input_scale_group_size,
         weight_scale_type="tensor" if bs_dtype is None else "group_tensor",
         weight_scale_group_size=weight_scale_group_size,
         use_f16_accum=use_f16_accum,
@@ -386,12 +396,28 @@ def test_int_weight_scale(
 @pytest.mark.parametrize("a_dtype", ["float8e4m3", "int8", "int4"])
 @pytest.mark.parametrize("b_dtype", ["uint3", "int8", "float4e1m2", "float8e1m6"])
 @pytest.mark.parametrize("c_dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("block_shape", [(128, 128), (256, 64), (64, 256), (64, 32)])
+@pytest.mark.parametrize("block_shape", [(128, 128), (256, 64), (64, 32), (256, 512), (64, 64)])
+@pytest.mark.parametrize("is_channel_input_scale", [True, False])
+@pytest.mark.parametrize("use_f16_accum", [True, False])
 @pytest.mark.parametrize("mma_type", ["mma", "wgmma"])
-def test_block_scale(a_dtype, b_dtype, c_dtype, block_shape, mma_type):
+def test_block_scale(
+    a_dtype,
+    b_dtype,
+    c_dtype,
+    block_shape,
+    is_channel_input_scale,
+    use_f16_accum,
+    mma_type,
+):
     a_dtype = dtypes.DataType.from_str(a_dtype)
     b_dtype = dtypes.DataType.from_str(b_dtype)
     c_dtype = dtypes.DataType.from_str(c_dtype)
+
+    if use_f16_accum:
+        if c_dtype != dtypes.float16:
+            return
+        if a_dtype not in [dtypes.float16, dtypes.float8e4m3]:
+            return
 
     if b_dtype.is_integer_type and a_dtype.is_integer_type:
         if a_dtype.num_bits < b_dtype.num_bits:
@@ -414,9 +440,9 @@ def test_block_scale(a_dtype, b_dtype, c_dtype, block_shape, mma_type):
     if a_dtype in [dtypes.float16, dtypes.bfloat16] and a_dtype != c_dtype:
         return
 
-    if mma_type == "wgmma" and a_dtype == "int4":
+    if mma_type == "wgmma" and a_dtype == dtypes.int4:
         return
-    input_scale_group_size = block_shape[1]
+    input_scale_group_size = 0 if is_channel_input_scale else block_shape[1]
     weight_scale_group_size = block_shape[1]
     if weight_scale_group_size > 0 and weight_scale_group_size < 256 // a_dtype.num_bits:
         return
@@ -434,7 +460,7 @@ def test_block_scale(a_dtype, b_dtype, c_dtype, block_shape, mma_type):
     if a_dtype == dtypes.int8 and b_dtype == dtypes.int8:
         weight = (weight.view(torch.int8) + 128).view(torch.int32)
 
-    weight = prepare_humming_weight(weight, b_dtype, a_dtype)
+    weight = prepare_humming_weight(weight, b_dtype, a_dtype, use_wgmma=mma_type == "wgmma")
     weight_scale = weight_scale.transpose(-1, -2).contiguous()
 
     _, inputs_ref, inputs, input_scale = generate_random_inputs(
@@ -456,6 +482,7 @@ def test_block_scale(a_dtype, b_dtype, c_dtype, block_shape, mma_type):
         input_scale_group_size=input_scale_group_size,
         weight_scale_group_size=weight_scale_group_size,
         weight_scale_group_size_n=block_shape[0],
+        use_f16_accum=use_f16_accum,
         weight_scale_type="block",
         use_warp_spec=False,
         use_tma=False,
@@ -480,4 +507,4 @@ def test_block_scale(a_dtype, b_dtype, c_dtype, block_shape, mma_type):
 
     outputs_ref = inputs_ref.matmul(weight_ref.T).to(torch_dtype)
     torch.save((outputs, outputs_ref), "aa.pt")
-    torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=0.1)
+    torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=0.2)

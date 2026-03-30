@@ -85,7 +85,9 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
   auto pbias = [&]() {if constexpr (PipelineConfig::kUseTmaBias) return &Bias; else return Bias; };
 
   if (threadIdx.x >= PipelineConfig::kNumMathThreads) {
-    if constexpr (PipelineConfig::kNumCtasPerSm == 1 && ElementA::kBits != 16) {
+    if constexpr (PipelineConfig::kNumMathThreads > 256) {
+      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(40));
+    } if constexpr (PipelineConfig::kNumCtasPerSm == 1 && ElementA::kBits != 16) {
       asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(40));
     } else {
       asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(24));
@@ -122,8 +124,8 @@ __global__ __launch_bounds__(PipelineConfig::kNumThreads, PipelineConfig::kNumCt
       }
     }
   } else {
-    if constexpr (PipelineConfig::kNumCtasPerSm == 2) {
-      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(232));
+    if constexpr (PipelineConfig::kNumMathThreads > 256) {
+      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(96));
     } else {
       asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(232));
     }

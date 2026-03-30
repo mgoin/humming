@@ -204,6 +204,58 @@ def generate_random_moe_tensors(shape_m, num_experts, top_k, block_size_config: 
     return topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_padded
 
 
+def generate_uniform_moe_tensors(shape_m, num_experts, top_k, block_size_config: int | list[int]):
+    if isinstance(block_size_config, int):
+        block_size = block_size_config
+    else:
+        for i in range(len(block_size_config) // 3):
+            if shape_m > block_size_config[i * 3] and shape_m <= block_size_config[i * 3 + 1]:
+                block_size = block_size_config[i * 3 + 2]
+                break
+
+    num_tokens_per_expert = math.ceil(shape_m * top_k / num_experts)
+    expert_tensor = torch.randn(
+        (num_tokens_per_expert, num_experts),
+        dtype=torch.float32,
+        device="cuda:0",
+    )
+
+    expert_index = torch.argsort(expert_tensor, dim=1).view(-1)[: shape_m * top_k]
+    expert_index = expert_index.view(shape_m, top_k)
+    tensor = torch.randn((shape_m, num_experts), dtype=torch.float32, device="cuda:0") - 100
+    tensor.scatter_(1, expert_index, 1000).topk(4, 1)
+
+    topk_weights, topk_ids = tensor.topk(top_k, 1)
+    topk_ids = topk_ids.int()
+    topk_weights = torch.randn_like(topk_weights)
+
+    # TODO: moe_align_block_size cuda kernel
+    part_token_ids_list = []
+    expert_id_list = []
+    for expert_id in range(num_experts):
+        part_token_ids = torch.where(topk_ids.view(-1) == expert_id)[0]
+        num_blocks = math.ceil(part_token_ids.size(0) / block_size)
+        padded_size = num_blocks * block_size
+        pad_size = padded_size - part_token_ids.size(0)
+        part_token_ids = torch.nn.functional.pad(
+            part_token_ids,
+            pad=(0, pad_size),
+            value=topk_ids.nelement(),
+        )
+        part_token_ids_list.append(part_token_ids)
+        expert_id_list += [expert_id] * num_blocks
+
+    sorted_token_ids = torch.cat(part_token_ids_list, dim=0).to(torch.int32)
+    expert_ids = torch.tensor(expert_id_list, dtype=torch.int32, device=tensor.device)
+    num_tokens_padded = torch.tensor(
+        num_experts * num_tokens_per_expert,
+        dtype=torch.int32,
+        device=tensor.device,
+    )
+
+    return topk_ids, topk_weights, sorted_token_ids, expert_ids, num_tokens_padded
+
+
 def random_fill_tensor(tensor: torch.Tensor):
     if tensor.dtype == torch.int32:
         min_value = 2**31 * -1

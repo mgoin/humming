@@ -66,20 +66,15 @@ public:
   CUDA_INLINE
   void load_legacy(int4 *smem_ptr) {
     if constexpr (kIsBlock) {
-      constexpr uint32_t kLoadBytes = CEIL_DIV(BlockShape::N, kGroupSizeN) * 4;
-      using LoadType = typename LoadTypeChooser<kLoadBytes>::Type;
-      constexpr uint32_t kLoadStride = ProblemShape::N / kGroupSizeN * 4 / kLoadBytes;
-
-      if (threadIdx.x < CEIL_DIV(BlockShape::K, kGroupSize) * CEIL_DIV(BlockShape::N, kGroupSizeN * kLoadBytes / 4)) {
-        const LoadType* gmem_ptr_load = reinterpret_cast<const LoadType *>(gmem_ptr_raw);
-        LoadType* smem_ptr_load = reinterpret_cast<LoadType *>(smem_ptr);
+      constexpr uint32_t kLoadStride = ProblemShape::N / kGroupSizeN;
+      if (threadIdx.x < CEIL_DIV(BlockShape::K, kGroupSize) * CEIL_DIV(BlockShape::N, kGroupSizeN)) {
+        const uint32_t* gmem_ptr_load = reinterpret_cast<const uint32_t *>(gmem_ptr_raw);
+        uint32_t* smem_ptr_load = reinterpret_cast<uint32_t *>(smem_ptr);
 
         const uint32_t gmem_row = row_offset + threadIdx.x / CEIL_DIV(BlockShape::N, kGroupSizeN);
         const uint32_t gmem_col = col_offset + threadIdx.x % CEIL_DIV(BlockShape::N, kGroupSizeN);
-        legacy_load<PipelineConfig::kUseCpAsync>(
-          &gmem_ptr_load[gmem_row * kLoadStride + gmem_col],
-          &smem_ptr_load[threadIdx.x]
-        );
+        uint32_t gmem_index = gmem_row * kLoadStride + gmem_col;
+        legacy_load<PipelineConfig::kUseCpAsync>(&gmem_ptr_load[gmem_index], &smem_ptr_load[threadIdx.x]);
       }
     } else {
       legacy_load_2d<
@@ -110,9 +105,6 @@ public:
 
     if constexpr (kIsBlock) {
       col_offset = (n_block_id * BlockShape::N) / kGroupSizeN;
-      if constexpr (BlockShape::N >= kGroupSizeN) {
-        col_offset = col_offset / (BlockShape::N / kGroupSizeN);
-      }
     } else {
       col_offset = n_block_id * (BlockShape::N / 16);
     }

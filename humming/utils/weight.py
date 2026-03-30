@@ -91,10 +91,11 @@ def quantize_weight(
             k // group_size,
             group_size_n,
             group_size,
-        ).permute(0, 1, 3, 2, 4).contiguous()
+        )
+        quanted_weight.permute(0, 1, 3, 2, 4).contiguous()
         quanted_weight = quanted_weight.view(e, n, k)
+        assert weight_scale is not None
         weight_scale = weight_scale.view(e, n // group_size_n, k // group_size)
-        # weight_scale.fill_(0.2)
 
     if origin_ndim == 2:
         quanted_weight = quanted_weight.squeeze(0)
@@ -244,9 +245,12 @@ def prepare_humming_weight(
 def prepare_humming_weight_scale(
     weight_scale: torch.Tensor | None,
     to_apply_on_c: bool = False,
+    is_blockwise: bool = False,
 ) -> torch.Tensor | None:
     if weight_scale is None:
         return None
+    if is_blockwise:
+        return weight_scale.transpose(-1, -2).contiguous()
 
     if to_apply_on_c:
         perm = [0, 1, 8, 9, 16, 17, 24, 25]
@@ -302,20 +306,3 @@ def prepare_humming_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
     bias = prepare_humming_weight_scale(bias.unsqueeze(-1), True)
     assert bias is not None
     return bias.squeeze(-2)
-
-
-def prepare_humming_tensor_for_glu(
-    tensor: torch.Tensor | None,
-    shape_n: int,
-    pad_shape_n: int = 0,
-    is_moe: bool = False,
-) -> torch.Tensor | None:
-    if tensor is None or tensor.nelement() == 0:
-        return tensor
-    tensor = tensor.unsqueeze(0) if not is_moe else tensor
-    actual_shape_n = shape_n - pad_shape_n
-    index = torch.arange(actual_shape_n, device=tensor.device)
-    index = index.view(2, -1).flip(0).T.contiguous().view(-1)
-    index = torch.cat([index, torch.arange(actual_shape_n, shape_n, device=tensor.device)])
-    tensor = tensor[:, index].contiguous()
-    return tensor.squeeze(0) if not is_moe else tensor

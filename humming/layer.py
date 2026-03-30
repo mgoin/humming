@@ -9,7 +9,7 @@ from typing import Any, Callable
 import torch
 
 from humming import dtypes, ops
-from humming.config.enum import MmaType
+from humming.config.enum import MmaType, WeightScaleType
 from humming.jit.utils import make_humming_module
 from humming.kernel.humming import HummingKernel
 from humming.schema import (
@@ -21,7 +21,6 @@ from humming.schema import (
 from humming.utils.device import estimate_compute_bound_threshold
 from humming.utils.weight import (
     prepare_humming_bias,
-    prepare_humming_tensor_for_glu,
     prepare_humming_weight,
     prepare_humming_weight_scale,
     prepare_humming_zero_point,
@@ -51,7 +50,9 @@ class HummingLayerMeta:
     num_experts: int | None = None
     use_int_weight_scale: bool | None = None
     input_scale_group_size: int = 0
+    weight_scale_type: WeightScaleType | None = None
     weight_scale_group_size: int = 0
+    weight_scale_group_size_n: int = 0
     has_zero_point: bool = False
     has_bias: bool = False
     is_fp_zero_point: bool = False
@@ -135,6 +136,17 @@ class HummingLayerMeta:
                 self.b_dtype = dataclasses.replace(self.b_dtype, is_signed=True)
             else:
                 self.b_dtype = dataclasses.replace(self.b_dtype, is_signed=False)
+        if self.weight_scale_type is None:
+            if self.weight_scale_group_size_n > 1:
+                self.weight_scale_type = WeightScaleType.BLOCK
+            elif self.weight_scale_group_size == 0:
+                self.weight_scale_type = WeightScaleType.CHANNEL
+            elif self.weight_scale_group_size > 0:
+                self.weight_scale_type = WeightScaleType.GROUP
+
+        if isinstance(self.weight_scale_type, str):
+            self.weight_scale_type = WeightScaleType(self.weight_scale_type)
+
         self.is_moe = self.num_experts is not None
         if self.is_moe:
             assert self.top_k > 0
@@ -154,7 +166,7 @@ class HummingLayerMeta:
             )
 
         if self.use_int_weight_scale:
-            self.has_global_scale = True
+            self.weight_scale_type = WeightScaleType.GROUP_TENSOR
             self.bs_dtype = self.c_dtype
 
 
@@ -219,9 +231,9 @@ class HummingMethod:
             is_moe_down=is_moe_down,
             input_scale_group_size=input_schema.input_scale_group_size,
             weight_scale_group_size=weight_schema.weight_scale_group_size,
+            weight_scale_group_size_n=weight_schema.weight_scale_group_size_n,
             has_zero_point=weight_schema.has_zero_point,
             is_fp_zero_point=weight_schema.is_fp_zero_point,
-            has_global_scale=weight_schema.has_global_scale,
             sublayer_name=sublayer_name,
         )
 
@@ -250,7 +262,8 @@ class HummingMethod:
             b_dtype=meta.b_dtype,
             bs_dtype=meta.bs_dtype,
             weight_scale_group_size=meta.weight_scale_group_size,
-            has_global_scale=meta.has_global_scale,
+            weight_scale_group_size_n=meta.weight_scale_group_size_n,
+            weight_scale_type=meta.weight_scale_type,
             has_zero_point=meta.has_zero_point,
             is_fp_zero_point=meta.is_fp_zero_point,
         )
@@ -258,7 +271,7 @@ class HummingMethod:
         if meta.use_int_weight_scale:
             dtype = dtypes.torch_dtype_map[meta.bs_dtype]
             tensors["weight_scale"] = tensors["weight_scale"].to(dtype)
-            if "has_global_scale" not in tensors:
+            if "global_scale" not in tensors:
                 tensors["global_scale"] = torch.ones(
                     (meta.num_experts or 1),
                     device=tensors["weight_scale"].device,
@@ -317,7 +330,7 @@ class HummingMethod:
             assert global_scale is not None
             out_global_scale = global_scale * scale_factor
         else:
-            meta.has_global_scale = True
+            meta.weight_scale_type = WeightScaleType.GROUP_TENSOR
             out_global_scale = torch.full(
                 (meta.num_experts or 1,),
                 fill_value=scale_factor.item(),
@@ -331,7 +344,6 @@ class HummingMethod:
         cls,
         layer: HummingModule | torch.nn.Module,
         sublayer_name: str = "",
-        should_prepare_for_glu: bool = False,
         already_padded: bool = False,
     ):
         assert isinstance(layer.humming_metas, dict)
@@ -346,21 +358,14 @@ class HummingMethod:
         if not already_padded:
             tensors = cls.check_and_pad_tensors(tensors, meta)
 
-        for key in ["weight", "weight_scale", "zero_point", "bias"]:
-            if not should_prepare_for_glu or key not in tensors:
-                continue
-            tensors[key] = prepare_humming_tensor_for_glu(
-                tensor=tensors[key],
-                is_moe=meta.is_moe,
-                shape_n=meta.shape_n,
-                pad_shape_n=meta.pad_shape_n,
-            )
-
         weight = tensors["weight"]
         zero_point = tensors["zero_point"] if meta.has_zero_point else None
         weight_scale = tensors["weight_scale"]
         bias = tensors["bias"] if meta.has_bias else None
-        global_scale = tensors.get("global_scale", None) if meta.has_global_scale else None
+        if "GROUP" in str(meta.weight_scale_type):
+            global_scale = tensors.get("global_scale", None)
+        else:
+            global_scale = None
 
         weight = prepare_humming_weight(
             weight=weight,
@@ -371,7 +376,11 @@ class HummingMethod:
             packed=True,
         )
 
-        weight_scale = prepare_humming_weight_scale(weight_scale, meta.should_apply_bs_on_c)
+        weight_scale = prepare_humming_weight_scale(
+            weight_scale,
+            to_apply_on_c=meta.should_apply_bs_on_c,
+            is_blockwise=meta.weight_scale_type == WeightScaleType.BLOCK,
+        )
         zero_point = prepare_humming_zero_point(zero_point, meta.b_dtype, packed=True)
         bias = prepare_humming_bias(bias)
 
@@ -652,7 +661,7 @@ class HummingLayer(HummingModule):
             scale_dtype=self.weight_schema.bs_dtype or f16_dtype,
             group_size=self.weight_schema.weight_scale_group_size,
             has_zero_point=self.weight_schema.has_zero_point,
-            has_global_scale=self.weight_schema.has_global_scale,
+            has_global_scale="TENSOR" in str(self.weight_schema),
             is_fp_zero_point=self.weight_schema.is_fp_zero_point,
             pack=True,
         )

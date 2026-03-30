@@ -21,7 +21,7 @@ from humming.utils.weight import (
 @pytest.mark.parametrize("weight_scale_group_size", [64, 0])
 @pytest.mark.parametrize("mma_type", ["mma", "wgmma"])
 @pytest.mark.parametrize("shape_m", [123, 64, 950])
-@pytest.mark.parametrize("use_m_major_scheduler", [True, False])
+@pytest.mark.parametrize("cast_type", ["a", "b"])
 def test_multi_cast(
     a_dtype,
     b_dtype,
@@ -31,7 +31,7 @@ def test_multi_cast(
     weight_scale_group_size,
     mma_type,
     shape_m,
-    use_m_major_scheduler,
+    cast_type,
 ):
     a_dtype = dtypes.DataType.from_str(a_dtype)
     b_dtype = dtypes.DataType.from_str(b_dtype)
@@ -105,8 +105,8 @@ def test_multi_cast(
         use_tma=True,
         use_warp_spec=True,
         use_stream_k=True,
-        multi_cast_size=2,
-        use_m_major_scheduler=use_m_major_scheduler,
+        multi_cast_size_a=2 if cast_type == "a" else 1,
+        multi_cast_size_b=2 if cast_type == "b" else 1,
     )
 
     torch_dtype = dtypes.torch_dtype_map[c_dtype]

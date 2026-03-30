@@ -107,6 +107,5 @@ def test_zeropoint(a_dtype, b_dtype, c_dtype, is_fp_zero_point, warp_shape_n_spl
     )
 
     outputs_ref = inputs_ref.matmul(weight_ref.T).to(torch_dtype)
-    torch.save((outputs, outputs_ref, weight_ref), "aa.pt")
 
     torch.testing.assert_close(outputs, outputs_ref, rtol=0.03, atol=0.1)

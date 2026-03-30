@@ -105,12 +105,23 @@ public:
 
       constexpr uint32_t kNumIters = WarpShape::N / (MmaShape::M / 4);
 
+      bool scale_d = true;
+      constexpr bool kApplyScaleOnC = ElementA::kBits != 16 && (QuantParamConfig::kInputScaleGroupSize > 0 || QuantParamConfig::kWeightScaleGroupSize > 0);
+      if constexpr (ElementA::kBits != 16 && QuantParamConfig::kInputScaleGroupSize > 0) {
+        scale_d = (iter_id * kPartMmaShapeK) % QuantParamConfig::kInputScaleGroupSize > 0;
+      }
+      if constexpr (ElementA::kBits != 16 && QuantParamConfig::kWeightScaleGroupSize > 0) {
+        scale_d = scale_d && (iter_id * kPartMmaShapeK) % QuantParamConfig::kWeightScaleGroupSize > 0;
+      }
+
       wgmma_fence();
       PRAGMA_UNROLL
       for (uint32_t j = 0; j < kNumIters; j++) {
-        MmaOpClass::fma(regs_b[buffer_id][j][k], desc, regs_c[0][j][0]);
+        if constexpr (kApplyScaleOnC) fence_regs(regs_c[0][j][0]);
+        MmaOpClass::fma(regs_b[buffer_id][j][k], desc, regs_c[0][j][0], scale_d);
         wgmma_commit();
         wgmma_wait<0>();
+        if constexpr (kApplyScaleOnC) fence_regs(regs_c[0][j][0]);
         arith.may_apply_as_and_bs_on_wgmma_c(regs_c_as_ptr(), j, k, iter_id);
       }
     }
@@ -143,7 +154,9 @@ public:
     uint32_t index = 0;
     constexpr bool kIsGroupInputScale = QuantParamConfig::kInputScaleGroupSize > 0;
     constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
-    if constexpr (ElementA::kBits < 16 && (kIsGroupInputScale || kIsGroupWeightScale)) {
+    constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
+
+    if constexpr (ElementA::kBits < 16 && (kIsGroupInputScale || kIsGroupWeightScale || kIsBlockWeightScale)) {
       index = 1;
     }
 

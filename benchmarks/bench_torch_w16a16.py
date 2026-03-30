@@ -13,7 +13,6 @@ def bench_torch_w16a16(
     dtype: str,
     shape_m_list: list[int] | None = None,
 ) -> list[dict[str, int | float]]:
-
     assert dtype in ["float16", "bfloat16"]
     torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
 

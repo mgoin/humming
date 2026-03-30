@@ -59,7 +59,7 @@ from humming.utils.weight import (
         [(96, 128, 128), (48, 16, 128), dtypes.int4],
     ],
 )
-@pytest.mark.parametrize("b_dtype", ["uint3"])
+@pytest.mark.parametrize("b_dtype", ["uint6", "uint4", "uint3"])
 @pytest.mark.parametrize("input_scale_group_size", [0, 64])
 @pytest.mark.parametrize("weight_scale_group_size", [0, 64])
 @pytest.mark.parametrize("mma_type", ["mma", "wgmma"])
@@ -77,7 +77,7 @@ def test_shape(
     bs_dtype = dtypes.bfloat16
     if b_dtype.num_bits >= a_dtype.num_bits:
         return
-    
+
     if warp_shape[0] % 16 != 0 and mma_type == "mma" and a_dtype.num_bits == 16:
         return
 
@@ -85,7 +85,7 @@ def test_shape(
         return
     if mma_type and block_shape[1] // warp_shape[1] < 4:
         return
-    
+
     if input_scale_group_size > 0 and a_dtype.num_bits == 16:
         return
 

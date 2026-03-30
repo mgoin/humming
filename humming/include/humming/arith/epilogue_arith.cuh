@@ -94,7 +94,8 @@ public:
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < kSizeAS; i++) {
           reinterpret_cast<scalar_t2 *>(as)[i] = this->float2num2(reinterpret_cast<float *>(as)[i]);
-          reinterpret_cast<scalar_t2 *>(as)[i] = __hmul2(reinterpret_cast<scalar_t2 *>(as)[i], gs_scalar2);
+          if constexpr (kIsTensorWeightScale)
+            reinterpret_cast<scalar_t2 *>(as)[i] = __hmul2(reinterpret_cast<scalar_t2 *>(as)[i], gs_scalar2);
         };
       };
     }

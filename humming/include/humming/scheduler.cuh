@@ -15,13 +15,15 @@ private:
   static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
   static constexpr uint32_t kTopK = MoEConfig::kTopK;
   static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
-  static constexpr uint32_t kMultiCastSize = PipelineConfig::kMultiCastSize;
+  static constexpr uint32_t kMultiCastSizeA = PipelineConfig::kMultiCastSizeA;
+  static constexpr uint32_t kMultiCastSizeB = PipelineConfig::kMultiCastSizeB;
+  static constexpr uint32_t kMultiCastSize = kMultiCastSizeA * kMultiCastSizeB;
 
   static constexpr uint32_t kInputScaleGroupSize = QuantParamConfig::kInputScaleGroupSize > 0 ? QuantParamConfig::kInputScaleGroupSize : 1;
   static constexpr uint32_t kWeightScaleGroupSize = QuantParamConfig::kWeightScaleGroupSize > 0 ? QuantParamConfig::kWeightScaleGroupSize : 1;
   static constexpr uint32_t kMaxGroupSize = MAX(kInputScaleGroupSize, kWeightScaleGroupSize);
 
-  static constexpr uint32_t N_BLOCKS = ProblemShape::N / BlockShape::N;
+  static constexpr uint32_t N_BLOCKS = ProblemShape::N / BlockShape::N / kMultiCastSizeA;
   static constexpr uint32_t K_BLOCKS = ProblemShape::K / BlockShape::K;
   static constexpr bool kUseMMajorScheduler = SchedulerConfig::kUseMMajorScheduler;
 
@@ -56,7 +58,7 @@ public:
   CUDA_INLINE
   Scheduler(SharedStorage &smem, const uint32_t *row_index_blocks, const uint32_t *expert_ids, uint32_t shape_m)
       : smem(smem), row_index_blocks(row_index_blocks), expert_ids(expert_ids), shape_m(shape_m) {
-    m_blocks = CEIL_DIV(shape_m, BlockShape::M * kMultiCastSize);
+    m_blocks = CEIL_DIV(shape_m, BlockShape::M * kMultiCastSizeB);
     mn_blocks = m_blocks * N_BLOCKS;
     mnk_blocks = mn_blocks * K_BLOCKS;
     uint32_t kNumCtaGroups = gridDim.x / kMultiCastSize;
@@ -101,21 +103,19 @@ public:
     if (dp_mn_iters) { dp_mn_next_index = blockIdx.x / kMultiCastSize; };
   };
 
-
   CUDA_INLINE
   bool get_next_block() {
     bool has_next_block = false;
     if (dp_mn_iters) {
       slice_iters = K_BLOCKS;
 
-      if constexpr (!kUseMMajorScheduler) {
-        m_block_id = dp_mn_next_index / N_BLOCKS;
-        n_block_id = dp_mn_next_index % N_BLOCKS;
-        m_block_id = m_block_id * kMultiCastSize + cluster_rank;
-      } else {
-        m_block_id = dp_mn_next_index % m_blocks;
-        n_block_id = dp_mn_next_index / m_blocks;
-        n_block_id = n_block_id * kMultiCastSize + cluster_rank;
+      m_block_id = dp_mn_next_index / N_BLOCKS;
+      n_block_id = dp_mn_next_index % N_BLOCKS;
+
+      if constexpr (kMultiCastSizeB > 1) {
+        m_block_id = m_block_id * kMultiCastSizeB + cluster_rank;
+      } else if constexpr (kMultiCastSizeA > 1) {
+        n_block_id = n_block_id * kMultiCastSizeA + cluster_rank;
       }
       k_block_id = 0;
       dp_mn_next_index += gridDim.x / kMultiCastSize;
@@ -135,14 +135,12 @@ public:
     if (!streamk_mnk_iters) return false;
     uint32_t streamk_mn_index = streamk_mnk_next_index / K_BLOCKS;
 
-    if constexpr (!kUseMMajorScheduler) {
-      m_block_id = streamk_mn_index / N_BLOCKS;
-      n_block_id = streamk_mn_index % N_BLOCKS;
-      m_block_id = m_block_id * kMultiCastSize + cluster_rank;
-    } else {
-      m_block_id = streamk_mn_index % m_blocks;
-      n_block_id = streamk_mn_index / m_blocks;
-      n_block_id = n_block_id * kMultiCastSize + cluster_rank;
+    m_block_id = streamk_mn_index / N_BLOCKS;
+    n_block_id = streamk_mn_index % N_BLOCKS;
+    if constexpr (kMultiCastSizeB > 1) {
+      m_block_id = m_block_id * kMultiCastSizeB + cluster_rank;
+    } else if constexpr (kMultiCastSizeA > 1) {
+      n_block_id = n_block_id * kMultiCastSizeA + cluster_rank;
     }
     k_block_id = streamk_mnk_next_index - streamk_mn_index * K_BLOCKS;
 

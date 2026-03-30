@@ -29,11 +29,40 @@ CUDA_INLINE void barrier_acquire(int *lock, int count) {
 }
 
 template <uint32_t kNumSyncThreads = 0, uint32_t kNumThreads = 0>
+CUDA_INLINE void barrier_acquire2(int *lock, int count) {
+  if (threadIdx.x == 0) {
+    int state = 1;
+    do {
+      asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
+                   : "=r"(state)
+                   : "l"(lock));
+    } while (state > count);
+  }
+  sync_part_threads<kNumSyncThreads, kNumThreads>();
+}
+
+template <uint32_t kNumSyncThreads = 0, uint32_t kNumThreads = 0>
 CUDA_INLINE void barrier_release(int *lock, bool reset = false) {
   sync_part_threads<kNumSyncThreads, kNumThreads>();
   if (threadIdx.x == 0) {
     if (reset) {
       lock[0] = 0;
+    } else {
+      int32_t val = 1;
+      asm volatile("fence.acq_rel.gpu;\n");
+      asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n"
+                   :
+                   : "l"(lock), "r"(val));
+    }
+  }
+}
+
+template <uint32_t kNumSyncThreads = 0, uint32_t kNumThreads = 0>
+CUDA_INLINE void barrier_release2(int *lock, int32_t val) {
+  sync_part_threads<kNumSyncThreads, kNumThreads>();
+  if (threadIdx.x == 0) {
+    if (val < 0) {
+      lock[0] = val;
     } else {
       int32_t val = 1;
       asm volatile("fence.acq_rel.gpu;\n");

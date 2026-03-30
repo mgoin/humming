@@ -204,7 +204,7 @@ def main():
     parser.add_argument("--is_moe_down", default=False, action="store_true")
     parser.add_argument("--shape_m_list", type=int, default=None, nargs="+")
     parser.add_argument("--output_file", type=str, default=None)
-    parser.add_argument("--block_shape", type=str, default= None)
+    parser.add_argument("--block_shape", type=str, default=None)
 
     args = parser.parse_args()
     benchmark_result = bench_triton_moe(

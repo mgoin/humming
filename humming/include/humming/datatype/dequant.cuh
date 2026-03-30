@@ -52,7 +52,7 @@ CUDA_INLINE void dequant_b3567(const uint32_t *qb, uint32_t *res, uint32_t j, ui
     uint32_t zp_val = zp_vals[i];
     uint32_t index;
 
-    if constexpr (kNumWarpShapeNSplits == 1) {
+    if constexpr (kNumWarpShapeNSplits == 1 || SourceType::kBits == 6) {
       index = j * 4 + i;
       if (index * kPaddedNumBits % TargetType::kBits == 0) {
         const uint32_t idx1 = index / TargetType::kBits;

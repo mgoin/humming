@@ -4,6 +4,7 @@ from typing import Any
 import torch
 
 from humming import dtypes
+from humming.config.enum import WeightScaleType
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
 from humming.schema.humming import HummingInputSchema, HummingWeightSchema
 
@@ -196,7 +197,7 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
 
         output_tensors = {"weight": weight, "weight_scale": weight_scale}
 
-        has_global_scale = False
+        weight_scale_type = None
         if self.format == "nvfp4-pack-quantized":
             global_scale = tensors["weight_global_scale"]
             target_group_size = 16 if len(shape_k_stacks) > 1 else None
@@ -209,8 +210,10 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
             )
             has_global_scale = global_scale.nelement() == (num_experts or 1)
             if has_global_scale:
+                weight_scale_type = WeightScaleType.GROUP_TENSOR
                 output_tensors["global_scale"] = global_scale
             else:
+                weight_scale_type = WeightScaleType.GROUP
                 weight_scale = weight_scale.float() * global_scale.float()
                 output_tensors["weight_scale"] = weight_scale.to(param_dtype)
 
@@ -240,7 +243,7 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
             b_dtype=b_dtype,
             bs_dtype=bs_dtype,
             weight_scale_group_size=group_size,
-            has_global_scale=has_global_scale,
+            weight_scale_type=weight_scale_type,
             has_zero_point=not self.symmetric,
         )
 

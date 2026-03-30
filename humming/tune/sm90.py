@@ -2,11 +2,9 @@ import math
 
 import numpy as np
 
-import torch
 from humming import dtypes
 from humming.layer import HummingLayerMeta
 from humming.tune.base import DeviceHeuristics
-from humming.utils.smem import estimate_smem_size_layer
 
 
 class Sm90Heuristics(DeviceHeuristics):
@@ -17,88 +15,130 @@ class Sm90Heuristics(DeviceHeuristics):
     sm_version: int = 90
 
     @classmethod
-    def get_base_config_h20(
+    def get_config1(
         cls,
-        a_dtype: dtypes.DataType,
-        b_dtype: dtypes.DataType,
-        group_size: int,
+        meta: HummingLayerMeta,
+        shape_m: int,
+        use_stream_k: bool,
         use_f16_accum: bool,
-        is_moe: bool,
+        use_batch_invariance: bool,
     ):
-        if a_dtype.num_bits == 16:
-            return {
-                "block_shape": (64, 256, 512 // a_dtype.num_bits),
-                "warp_shape": (64, 64, 512 // a_dtype.num_bits),
-                "num_ctas_per_sm": 2,
-            }
-        elif group_size == 0 and not is_moe:
-            return {
-                "block_shape": (64, 256, 512 // a_dtype.num_bits),
-                "warp_shape": (64, 64, 512 // a_dtype.num_bits),
-                "num_ctas_per_sm": 2,
-            }
-        elif group_size == 0 and is_moe:
-            return {
-                "block_shape": (64, 128, 512 // a_dtype.num_bits),
-                "warp_shape": (64, 32, 512 // a_dtype.num_bits),
-                "num_ctas_per_sm": 3,
-            }
-        elif group_size >= 128:
-            return {
-                "block_shape": (64, 128, 1024 // a_dtype.num_bits),
-                "warp_shape": (64, 32, 1024 // a_dtype.num_bits),
-                "num_ctas_per_sm": 2,
-            }
+        if use_f16_accum:
+            max_block_m = 256
         else:
-            return {
-                "block_shape": (64, 128, 512 // a_dtype.num_bits),
-                "warp_shape": (64, 32, 512 // a_dtype.num_bits),
-                "num_ctas_per_sm": 3 if is_moe else 2,
-            }
+            max_block_m = 176
+
+        num_blocks_list = cls.calc_num_block_list(meta, shape_m, max_block_m)
+        block_shape_m = np.argmin(num_blocks_list).item() * 8 + 8
+        warp_shape_n = 32
+        warp_shape_k = 1024 // meta.a_dtype.num_bits
+
+        if meta.shape_n <= 4096 and not use_batch_invariance:
+            block_shape_n = 128
+            block_shape_k = warp_shape_k * 2
+            if block_shape_m <= 32:
+                block_shape_k = block_shape_k * 2
+            if block_shape_k > 256:
+                block_shape_k = block_shape_k // 2
+                warp_shape_k = warp_shape_k // 2
+        else:
+            block_shape_n = 256
+            block_shape_k = warp_shape_k
+            if block_shape_m <= 32 and meta.b_dtype.num_bits <= 6:
+                block_shape_k = block_shape_k * 2
+            elif block_shape_m <= 32:
+                warp_shape_k = warp_shape_k // 2
+
+        if use_batch_invariance:
+            use_stream_k = False
+
+        config = {
+            "block_shape": (block_shape_m, block_shape_n, block_shape_k),
+            "warp_shape": (block_shape_m, warp_shape_n, warp_shape_k),
+            "use_stream_k": use_stream_k,
+            "use_f16_accum": use_f16_accum,
+            "num_stages": 4,
+        }
+
+        if meta.num_experts is None:
+            config["use_warp_spec"] = True
+            config["use_tma"] = True
+            config["use_mbarrier"] = True
+
+            if meta.shape_n % (block_shape_n * 2) == 0 and shape_m / block_shape_m >= 4:
+                config["multi_cast_size_a"] = 2
+
+        return config
 
     @classmethod
-    def get_base_config(
+    def get_config2(
         cls,
-        a_dtype: dtypes.DataType,
-        b_dtype: dtypes.DataType,
-        group_size: int,
+        meta: HummingLayerMeta,
+        shape_m: int,
+        use_stream_k: bool,
         use_f16_accum: bool,
-        is_moe: bool,
+        use_batch_invariance: bool,
     ):
-        gpu_name = torch.cuda.get_device_name()
-        if "H20" in gpu_name and "H200" not in gpu_name or is_moe:
-            return cls.get_base_config_h20(
-                a_dtype=a_dtype,
-                b_dtype=b_dtype,
-                group_size=group_size,
-                use_f16_accum=use_f16_accum,
-                is_moe=is_moe,
-            )
-
-        if a_dtype.num_bits == 16 and use_f16_accum:
-            return {
-                "block_shape": (128, 256, 64),
-                "warp_shape": (128, 64, 64),
-                "num_ctas_per_sm": 2,
-            }
-        elif group_size == 0 or a_dtype.num_bits == 16:
-            return {
-                "block_shape": (128, 128, 1024 // a_dtype.num_bits),
-                "warp_shape": (128, 32, 1024 // a_dtype.num_bits),
-                "num_ctas_per_sm": 2,
-            }
-        elif group_size >= 128:
-            return {
-                "block_shape": (64, 128, 1024 // a_dtype.num_bits),
-                "warp_shape": (64, 32, 1024 // a_dtype.num_bits),
-                "num_ctas_per_sm": 2,
-            }
+        if use_f16_accum:
+            max_block_m = 256
+        elif meta.input_scale_group_size > 0:
+            max_block_m = 160
+        elif meta.weight_scale_group_size < 128:
+            max_block_m = 192
         else:
-            return {
-                "block_shape": (64, 128, 512 // a_dtype.num_bits),
-                "warp_shape": (64, 32, 512 // a_dtype.num_bits),
-                "num_ctas_per_sm": 2,
-            }
+            max_block_m = 200
+
+        num_blocks_list = cls.calc_num_block_list(meta, shape_m, max_block_m)
+        block_shape_m = np.argmin(num_blocks_list).item() * 8 + 8
+
+        if use_batch_invariance:
+            use_stream_k = False
+
+        block_shape_k = 256 if block_shape_m <= 32 else 128
+
+        config = {
+            "block_shape": (block_shape_m, 128, block_shape_k),
+            "warp_shape": (block_shape_m, 16, 128),
+            "use_stream_k": use_stream_k,
+            "use_f16_accum": use_f16_accum,
+            "num_stages": 4,
+        }
+
+        if meta.num_experts is None:
+            config["use_warp_spec"] = True
+            config["use_tma"] = True
+            config["use_mbarrier"] = True
+
+            if shape_m / block_shape_m >= 4:
+                config["multi_cast_size_a"] = 2
+
+        return config
+
+    @classmethod
+    def calc_num_block_list(
+        cls,
+        meta: HummingLayerMeta,
+        shape_m: int,
+        max_block_m: int,
+    ):
+        num_blocks_list = []
+        if meta.num_experts is None:
+            for i in range(max_block_m // 8):
+                block_m = i * 8 + 8
+                num_blocks_list.append(math.ceil(shape_m / block_m))
+        else:
+            samples = np.random.randint(0, meta.num_experts, size=shape_m)
+            counts = np.bincount(samples)
+            for i in range(max_block_m // 8):
+                block_m = i * 8 + 8
+                num_blocks = np.ceil(counts * 1.1 / block_m) * block_m
+                num_blocks_list.append(num_blocks)
+
+        for i in range(max_block_m // 8):
+            if meta.a_dtype == dtypes.int8 and num_blocks % 16 == 8 and block_m > 32:
+                num_blocks_list[i] = 10000
+
+        return num_blocks_list
 
     @classmethod
     def get_config(
@@ -109,116 +149,11 @@ class Sm90Heuristics(DeviceHeuristics):
         use_f16_accum: bool,
         use_batch_invariance: bool,
     ):
-        # 1. base config
-        group_size = meta.input_scale_group_size or meta.weight_scale_group_size
-        is_moe = meta.num_experts is not None
-        config = cls.get_base_config(meta.a_dtype, meta.b_dtype, group_size, use_f16_accum, is_moe)
-        block_shape_m, block_shape_n, block_shape_k = config["block_shape"]
-        num_ctas_per_sm = config.get("num_ctas_per_sm", 1)
-        warp_shape_m, warp_shape_n, warp_shape_k = config["warp_shape"]
-        num_stages = 3
-        assert meta.shape_n % block_shape_n == 0
-
-        # 2. block_shape_m and warp_shape_m
-        if meta.num_experts is None:
-            if shape_m <= block_shape_m:
-                block_shape_m = math.ceil(shape_m / 8) * 8
-            else:
-                blocks = [math.ceil(shape_m / ((i + 1) * 8)) for i in range(block_shape_m // 8)]
-                block_shape_m = np.argmin(blocks).item() * 8 + 8
-            if meta.a_dtype == dtypes.int8 and block_shape_m > 32 and block_shape_m % 16 != 0:
-                block_shape_m = math.ceil(block_shape_m / 16) * 16
+        if meta.b_dtype.num_bits == 16:
+            func = cls.get_config1
+        elif meta.input_scale_group_size == 0 and meta.weight_scale_group_size == 0:
+            func = cls.get_config1
         else:
-            for moe_block_size in [8, 16, 32, 48, 64]:
-                if shape_m * meta.top_k / meta.num_experts / moe_block_size < 0.9:
-                    break
+            func = cls.get_config2
 
-            shape_m = int(meta.top_k * shape_m / meta.num_experts / 0.9)
-            shape_m = max(shape_m, 1)
-            if block_shape_m == 128:
-                if np.ceil(shape_m / 96) * 96 < np.ceil(shape_m / 64) * 64:
-                    block_shape_m = 96
-                elif np.ceil(shape_m / 128) * 128 < np.ceil(shape_m / 64) * 64 * 1.05:
-                    block_shape_m = 128
-                else:
-                    block_shape_m = moe_block_size
-            elif shape_m >= 64 and shape_m < 96:
-                block_shape_m = 48
-            else:
-                block_shape_m = moe_block_size
-
-        warp_shape_m = block_shape_m
-        num_blocks_n = meta.shape_n // block_shape_n
-        num_blocks_m = cls.estimate_num_blocks_m(meta, shape_m, block_shape_m)
-
-        num_sms = cls.get_num_sms()
-        while num_blocks_n * num_blocks_m * 2 < num_sms * num_ctas_per_sm:
-            if meta.a_dtype.num_bits != 16 and warp_shape_n == 64:
-                warp_shape_n = warp_shape_n // 2
-                block_shape_n = block_shape_n // 2
-                num_blocks_n = num_blocks_n * 2
-                if num_ctas_per_sm == 2:
-                    num_ctas_per_sm = 3
-                continue
-            elif num_ctas_per_sm > 1:
-                num_ctas_per_sm = num_ctas_per_sm - 1
-                continue
-            else:
-                break
-
-        num_warps_m = block_shape_m // warp_shape_m
-        num_warps_n = block_shape_n // warp_shape_n
-        num_warps_k = block_shape_k // warp_shape_k
-        num_warps = num_warps_m * num_warps_n * num_warps_k * num_ctas_per_sm
-
-        if num_warps == 4:
-            warp_shape_k = 512 // meta.a_dtype.num_bits
-            block_shape_k = warp_shape_k * 2
-
-        if num_warps <= 8 and block_shape_m <= 16:
-            num_warps_k = block_shape_k // warp_shape_k
-            warp_shape_k = 512 // meta.a_dtype.num_bits
-            block_shape_k = warp_shape_k * num_warps_k * 2
-
-        max_num_stages = 4
-        for num_stages_new in range(num_stages + 1, max_num_stages + 1):
-            block_shape = (block_shape_m, block_shape_n, block_shape_k)
-            smem_size = estimate_smem_size_layer(meta, block_shape, num_stages_new)
-            if smem_size * num_ctas_per_sm < cls.max_smem_size:
-                num_stages = num_stages_new
-
-        if num_ctas_per_sm == 1:
-            factor = min(4.5, meta.shape_k / (3 * block_shape_k))
-            num_sms = min(num_sms, math.ceil(num_blocks_n * num_blocks_m * factor))
-
-        config = {
-            "block_shape": (block_shape_m, block_shape_n, block_shape_k),
-            "warp_shape": (warp_shape_m, warp_shape_n, warp_shape_k),
-            "use_stream_k": use_stream_k,
-            "use_f16_accum": use_f16_accum,
-            "num_sms": num_sms,
-            "num_stages": num_stages,
-            "num_ctas_per_sm": num_ctas_per_sm,
-        }
-
-        if block_shape_m >= 48 and num_ctas_per_sm <= 2 and num_warps <= 8 and not is_moe:
-            config["use_tma"] = True
-            config["use_warp_spec"] = True
-            config["use_mbarrier"] = True
-            config["num_stages"] = 3
-        elif config["num_stages"] == 4 and block_shape_m <= 32:
-            block_shape = (block_shape_m, block_shape_n, block_shape_k)
-            smem_size = estimate_smem_size_layer(meta, block_shape, 5)
-            if smem_size * num_ctas_per_sm < cls.max_smem_size:
-                config["num_stages"] = 5
-
-        if use_batch_invariance:
-            warp_shape_k = 512 // meta.a_dtype.num_bits
-            block_shape_k = 512 // meta.a_dtype.num_bits
-            # TODO: check if TMA / cp.async affect batch invariance
-            config["use_tma"] = False
-            config["use_warp_spec"] = False
-            config["use_mbarrier"] = False
-            config["use_stream_k"] = False
-
-        return config
+        return func(meta, shape_m, use_stream_k, use_f16_accum, use_batch_invariance)

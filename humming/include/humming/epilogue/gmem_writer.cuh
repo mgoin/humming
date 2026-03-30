@@ -4,7 +4,7 @@
 
 
 template <typename scalar_t2, typename T>
-CUDA_INLINE T reduce_add_f162(T a, T b) {
+CUDA_INLINE T reduce_add_f162(T &a, T &b) {
   scalar_t2 *a_half2_ptr = reinterpret_cast<scalar_t2 *>(&a);
   scalar_t2 *b_half2_ptr = reinterpret_cast<scalar_t2 *>(&b);
 
@@ -17,7 +17,7 @@ CUDA_INLINE T reduce_add_f162(T a, T b) {
 
 
 template <typename scalar_t2, typename T>
-CUDA_INLINE T atomic_reduce_add_f162(T a, T b) {
+CUDA_INLINE T atomic_reduce_add_f162(T &a, T &b) {
   scalar_t2 *a_half2_ptr = reinterpret_cast<scalar_t2 *>(&a);
   scalar_t2 *b_half2_ptr = reinterpret_cast<scalar_t2 *>(&b);
 
@@ -120,6 +120,8 @@ public:
         uint32_t gmem_offset = gmem_row * ((ProblemShape::N - PadShape::N) / 8) + gmem_col;
         if (!kUseStreamK || slice_count == 1 || slice_id == 0) {
           gmem_ptr[gmem_offset] = val;
+        } else if (slice_count > 3) {
+          atomic_reduce_add_f162<scalar_t2>(val, gmem_ptr[gmem_offset]);
         } else {
           gmem_ptr[gmem_offset] = reduce_add_f162<scalar_t2>(val, gmem_ptr[gmem_offset]);
         }

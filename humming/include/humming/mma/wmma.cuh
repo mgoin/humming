@@ -103,7 +103,9 @@ public:
     uint32_t index = 0;
     constexpr bool kIsGroupInputScale = QuantParamConfig::kInputScaleGroupSize > 0;
     constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
-    if constexpr (ElementA::kBits < 16 && (kIsGroupInputScale || kIsGroupWeightScale)) {
+    constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
+
+    if constexpr (ElementA::kBits < 16 && (kIsGroupInputScale || kIsGroupWeightScale || kIsBlockWeightScale)) {
       index = 1;
     }
 

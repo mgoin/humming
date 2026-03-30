@@ -74,12 +74,22 @@ public:
 
   CUDA_INLINE
   void acquire_gmem_barrier() {
-    barrier_acquire<PipelineConfig::kNumMathThreads, PipelineConfig::kNumThreads>(&locks[locks_offset], slice_id);
+    if (PipelineConfig::kUseTmaC || slice_count > 3) {
+      int32_t val = slice_id == 0 ? 0 : -1;
+      barrier_acquire2<PipelineConfig::kNumMathThreads, PipelineConfig::kNumThreads>(&locks[locks_offset], val);
+    } else {
+      barrier_acquire<PipelineConfig::kNumMathThreads, PipelineConfig::kNumThreads>(&locks[locks_offset], slice_id);
+    }
   }
 
   CUDA_INLINE
   void release_gmem_barrier() {
-    barrier_release<PipelineConfig::kNumMathThreads, PipelineConfig::kNumThreads>(&locks[locks_offset], slice_id == slice_count - 1);
+    if (PipelineConfig::kUseTmaC || slice_count > 3) {
+      uint32_t val = slice_id == 0 ? 1 - slice_count : 0;
+      barrier_release2<PipelineConfig::kNumMathThreads, PipelineConfig::kNumThreads>(&locks[locks_offset], val);
+    } else {
+      barrier_release<PipelineConfig::kNumMathThreads, PipelineConfig::kNumThreads>(&locks[locks_offset], slice_id == slice_count - 1);
+    }
   }
 
   CUDA_INLINE

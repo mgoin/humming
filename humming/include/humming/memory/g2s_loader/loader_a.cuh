@@ -14,7 +14,7 @@ private:
   static constexpr bool kIsMoE = MoEConfig::kIsMoE;
   static constexpr uint32_t kNumLoadThreads = PipelineConfig::kNumLoadThreads;
   static constexpr uint32_t kLoadThreadOffset = PipelineConfig::kNumThreads - kNumLoadThreads;
-  static constexpr uint32_t kMultiCastSize = PipelineConfig::kMultiCastSize;
+  static constexpr uint32_t kMultiCastSizeA = PipelineConfig::kMultiCastSizeA;
   static constexpr bool kUseMMajorScheduler = SchedulerConfig::kUseMMajorScheduler;
 
   static constexpr uint32_t kSmemStride = BlockShape::K * ElementA::kBits / 32 / 4;
@@ -38,7 +38,7 @@ public:
   uint32_t load_row_index[kUseTma ? CEIL_DIV(BlockShape::M, kNumLoadThreads) : kLoadIters];
   uint32_t row_offset;
   uint32_t col_offset;
-  uint32_t cluster_rank = blockIdx.x % kMultiCastSize;
+  uint32_t cluster_rank = blockIdx.x % kMultiCastSizeA;
 
   CUDA_INLINE
   G2SMemoryLoaderA(const void *ptr, const uint32_t *row_index, uint32_t shape_m)
@@ -72,10 +72,10 @@ public:
       const uint32_t block_idx = thread_id;
       const uint32_t smem_offset = BlockShape::M * 8 * block_idx;
       const uint32_t col_offset2 = col_offset + (1024 / ElementA::kBits) * block_idx;
-      if constexpr (!kUseMMajorScheduler || kMultiCastSize == 1) {
+      if constexpr (kMultiCastSizeA == 1) {
         tma_load_2d(tensor_map_ptr, smem_ptr + smem_offset, mbar_ptr, col_offset2, row_offset);
       } else if (cluster_rank == 0) {
-        tma_load_2d<kMultiCastSize>(tensor_map_ptr, smem_ptr + smem_offset, mbar_ptr, col_offset2, row_offset);
+        tma_load_2d<kMultiCastSizeA>(tensor_map_ptr, smem_ptr + smem_offset, mbar_ptr, col_offset2, row_offset);
       }
     }
   }

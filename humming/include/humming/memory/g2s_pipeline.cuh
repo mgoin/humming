@@ -104,6 +104,9 @@ public:
   static constexpr bool kHasStageCpAsyncMBarrier = get_stage_load_bytes().y > 0;
   static constexpr bool kHasChannelTmaMBarrier = get_channel_load_bytes().x > 0;
   static constexpr bool kHasChannelCpAsyncMBarrier = get_channel_load_bytes().y > 0;
+  static constexpr uint32_t kMultiCastSizeA = PipelineConfig::kMultiCastSizeA;
+  static constexpr uint32_t kMultiCastSizeB = PipelineConfig::kMultiCastSizeB;
+  static constexpr uint32_t kMultiCastSize = kMultiCastSizeA * kMultiCastSizeB;
 
   using LoaderA = G2SMemoryLoaderA<ProblemShape, BlockShape, PadShape, ElementA, SchedulerConfig, PipelineConfig, MoEConfig>;
   using LoaderB = G2SMemoryLoaderB<ProblemShape, BlockShape, ElementA, ElementB, SchedulerConfig, PipelineConfig, MoEConfig>;
@@ -123,7 +126,7 @@ public:
   LoaderTopkWeights loader_topk_weights;
   uint32_t phases[PipelineConfig::kNumStages + 1] = {0};
   const uint32_t thread_id = threadIdx.x - kLoadThreadOffset;
-  uint32_t cluster_rank = blockIdx.x % PipelineConfig::kMultiCastSize;
+  uint32_t cluster_rank = blockIdx.x % kMultiCastSize;
 
   CUDA_INLINE
   ProducerPipeline(
@@ -173,8 +176,8 @@ public:
       }
 
       if (thread_id < kNumStages + 2) __mbarrier_init(&smem.load_mbar[thread_id], count);
-      uint32_t factor = (PipelineConfig::kMultiCastSize > 1 && cluster_rank == 0) ? PipelineConfig::kMultiCastSize : 1;
-      if (thread_id < kNumStages + 1) __mbarrier_init(&smem.math_mbar[thread_id], PipelineConfig::kNumMathThreads * factor);
+      uint32_t factor = (kMultiCastSize > 1 && cluster_rank == 0) ? kMultiCastSize : 1;
+      if (thread_id < kNumStages + 1) __mbarrier_init(&smem.math_mbar[thread_id], PipelineConfig::kNumMathThreads * factor / 32);
     }
   }
 
@@ -278,11 +281,14 @@ private:
   static constexpr bool kHasChannelData = kIsChannelInputScale || kIsChannelWeightScale || kHasBias || kIsMoEDown;
 
   static constexpr uint32_t kNumStages = PipelineConfig::kNumStages;
+  static constexpr uint32_t kMultiCastSizeA = PipelineConfig::kMultiCastSizeA;
+  static constexpr uint32_t kMultiCastSizeB = PipelineConfig::kMultiCastSizeB;
+  static constexpr uint32_t kMultiCastSize = kMultiCastSizeA * kMultiCastSizeB;
 
 public:
   SharedStorage &smem;
   uint32_t phases[PipelineConfig::kNumStages + 2] = {0};
-  uint32_t cluster_rank = blockIdx.x % PipelineConfig::kMultiCastSize;
+  uint32_t cluster_rank = blockIdx.x % kMultiCastSize;
   const uint32_t lane_id = threadIdx.x % 32;
 
   CUDA_INLINE
@@ -322,11 +328,13 @@ public:
   }
 
   CUDA_INLINE void arrive(uint32_t stage_id) {
-    mbarrier_arrive(&smem.math_mbar[stage_id]);
-    if constexpr (PipelineConfig::kMultiCastSize > 1) {
-      if (cluster_rank >= 1) {
-        void* aa = __cluster_map_shared_rank(&smem.math_mbar[stage_id], 0);
-        mbarrier_arrive<true>(aa);
+    if (lane_id == 0) {
+      mbarrier_arrive(&smem.math_mbar[stage_id]);
+      if constexpr (kMultiCastSize > 1) {
+        if (cluster_rank >= 1) {
+          void* aa = __cluster_map_shared_rank(&smem.math_mbar[stage_id], 0);
+          mbarrier_arrive<true>(aa);
+        }
       }
     }
   }
