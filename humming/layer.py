@@ -661,7 +661,7 @@ class HummingLayer(HummingModule):
             scale_dtype=self.weight_schema.bs_dtype or f16_dtype,
             group_size=self.weight_schema.weight_scale_group_size,
             has_zero_point=self.weight_schema.has_zero_point,
-            has_global_scale="TENSOR" in str(self.weight_schema),
+            has_global_scale="TENSOR" in str(self.weight_schema.weight_scale_type),
             is_fp_zero_point=self.weight_schema.is_fp_zero_point,
             pack=True,
         )

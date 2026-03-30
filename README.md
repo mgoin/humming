@@ -16,7 +16,7 @@ Humming is a high-performance, lightweight, and highly flexible JIT (Just-In-Tim
     * Delivers State-of-the-Art (SOTA) throughput and efficiency across a wide range of computational scenarios.
 - **Ultra-Lightweight**
     * Minimal dependencies: Requires only **PyTorch** and **NVCC**.
-    * Compact footprint: The package size is less than **100KB**.
+    * Compact footprint: The package size is only **100+KB**.
 
 
 ## Support Matrix
@@ -46,60 +46,48 @@ pip install git+https://github.com/inclusionAI/humming.git
 
 
 ```python
+from humming.layer import HummingLayer
 import torch
 
-from humming import dtypes
-from humming.layer import HummingLayer
-from humming.utils.test import generate_random_inputs, generate_random_weight
 
 layer = HummingLayer(
-    shape_n=1024,
-    shape_k=1024,
-    a_dtype=dtypes.float16,
-    b_dtype=dtypes.uint4,
-    c_dtype=dtypes.float16,
-    bs_dtype=dtypes.float16,
-    weight_scale_group_size=128,
+    shape_n=8192,
+    shape_k=8192,
+    weight_config={"dtype": "int6"},
+    torch_dtype=torch.float16,
 ).cuda()
 
-
-random_weight_data = generate_random_weight(
-    n=layer.meta.shape_n,
-    k=layer.meta.shape_k,
-    group_size=layer.meta.weight_scale_group_size,
-    dtype=layer.meta.b_dtype,
-    scale_dtype=layer.meta.bs_dtype,
+torch.cuda.manual_seed(0)
+inputs = torch.randn((8192, 8192), dtype=torch.float16, device="cuda:0")
+weight = torch.randn((8192, 8192), dtype=torch.float16, device="cuda:0")
+# load unquantized weight and quantize to layer quantization format
+layer.load_from_unquantized(weight)
+# transform weight to humming format
+layer.transform()
+# you can add a kernel for a shape_m range (min_shape_m, max_shape_m]
+layer.add_kernel_config(
+    # min_shape_m (not included)
+    min_shape_m=64,
+    # max_shape_m (included)
+    max_shape_m=128,
+    # block_shape and warp_shape are required
+    block_shape=(64, 128, 128),
+    warp_shape=(64, 64, 32),
+    # other args are optional
+    num_stages=3,
+    use_stream_k=False,
+    use_f16_accum=True,
 )
+# or use default kernels
+layer.prepare_default_kernel_configs()
 
-_, weight_ref, weight, weight_scale, _, _ = random_weight_data
-_, inputs_ref, inputs, _ = generate_random_inputs(1234, layer.meta.shape_k, dtype=dtypes.float16)
 
-# Tensors can be loaded simultaneously or sequentially.
-# For MoE models, you have the flexibility to load only a specific expert
-layer.load_weight(weight=weight, weight_scale=weight_scale)
-# Run `layer.finish_load()` after all weights are loaded, this would do some preprocessing.
-# Note that you shouldn't load weight again after `finish_load`
-layer.finish_load()
-
-# Currently, you need to manually input block_shape and warp_shape to run.
-# Auto-tuning features is coming soon.
-outputs = layer(inputs=inputs)
-outputs_ref = inputs_ref.matmul(weight_ref.T).to(torch.float16)
-torch.testing.assert_close(outputs, outputs_ref, atol=0.1, rtol=0.01)
+print("\n\nQuantized GEMM Output:\n")
+print(layer(inputs))
+print("\n\nUnquantized GEMM Output:\n")
+print(inputs.matmul(weight.T))
 ```
 
-For more config options, see [Config Options](./docs/CONFIG.md).
-
-For performance tuning example, see `examples` dir.
-
-## Roadmap
-
-- [ ] Technical Analysis
-- [ ] Config Tuning
-- [ ] Kernel Bench
-- [ ] NVCC-free Runtime
-- [ ] UMMA Support
-- [ ] MMA with Block Scaling Support
 
 ## Acknowledgement
 
