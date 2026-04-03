@@ -28,7 +28,7 @@ template <
 struct WGMMA {
 public:
   using MmaOpClass = MmaOpClass_;
-  using MmaShape = class MmaOpClass::MmaShape;
+  using MmaShape = typename MmaOpClass::MmaShape;
 
   static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;

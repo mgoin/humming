@@ -35,7 +35,7 @@ private:
   static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
   static constexpr bool kHasBias = EpilogueConfig::kHasBias;
 
-  using MmaOpClass = class MMA::MmaOpClass;
+  using MmaOpClass = typename MMA::MmaOpClass;
   using LoaderA = S2RMemoryLoaderA<MmaOpClass, BlockShape, WarpShape, ElementA, PipelineConfig>;
   using LoaderB = S2RMemoryLoaderB<BlockShape, WarpShape, ElementA, ElementB, PipelineConfig>;
   using LoaderAS = S2RMemoryLoaderAS<MmaOpClass, BlockShape, WarpShape, ElementA, PipelineConfig, QuantParamConfig>;

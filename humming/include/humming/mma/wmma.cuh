@@ -17,7 +17,7 @@ public:
   static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
 
   using MmaOpClass = MmaOpClass_;
-  using MmaShape = class MmaOpClass::MmaShape;
+  using MmaShape = typename MmaOpClass::MmaShape;
 
   SharedStorage &smem;
   ArithClass &arith;

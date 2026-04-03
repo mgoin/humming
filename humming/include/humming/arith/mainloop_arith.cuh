@@ -17,7 +17,7 @@ private:
   using scalar_t = typename F16Conversion<ElementC>::scalar_t;
   using scalar_t2 = typename F16Conversion<ElementC>::scalar_t2;
   using ValTypeC = typename MmaOpClass::ValTypeC;
-  using MmaShape = class MmaOpClass::MmaShape;
+  using MmaShape = typename MmaOpClass::MmaShape;
 
   static constexpr bool kUseWgmma = MmaOpClass::kMmaType == MmaType::WGMMA;
   static constexpr bool kIsF16Accum = MmaOpClass::kCTypeBits == 16;

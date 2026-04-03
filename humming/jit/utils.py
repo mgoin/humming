@@ -42,7 +42,9 @@ def find_kernel_name_in_cubin(filename, func_keyword):
 
         func_symbol_names = []
         for symbol in symbol_table.iter_symbols():
-            if symbol["st_info"]["type"] == "STT_FUNC" and func_keyword in symbol.name:
+            if symbol["st_info"]["type"] != "STT_FUNC":
+                continue
+            if re.findall(f"^_Z\\d+{func_keyword}", symbol.name):
                 func_symbol_names.append(symbol.name)
 
         assert len(func_symbol_names) == 1

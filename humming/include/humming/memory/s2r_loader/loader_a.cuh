@@ -6,7 +6,7 @@
 template <class MmaOpClass, class BlockShape, class WarpShape, class ElementA, class PipelineConfig>
 class S2RMemoryLoaderA {
 private:
-  using MmaShape = class MmaOpClass::MmaShape;
+  using MmaShape = typename MmaOpClass::MmaShape;
   static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
