@@ -1,13 +1,10 @@
-import random
-
 import pytest
 import torch
 
 from humming import dtypes, ops
 from humming.kernel.humming import HummingKernel
-from humming.utils.test import generate_random_bias, generate_random_inputs, generate_random_weight
+from humming.utils.test import generate_random_inputs, generate_random_weight
 from humming.utils.weight import (
-    prepare_humming_bias,
     prepare_humming_weight,
     prepare_humming_weight_scale,
 )

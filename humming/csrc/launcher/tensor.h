@@ -196,7 +196,7 @@ inline void check_tensor_moe(
   check_tensor_common(topk_weights.value(), "topk_weights", dev, ScalarType::Float);
 };
 
-inline CUtensorMap make_tma_desc_a(const Tensor &tensor, KernelData &kernel_data) {
+inline CUtensorMap make_tma_desc_a(Tensor tensor, KernelData &kernel_data) {
   if (!kernel_data.use_tma_a) return CUtensorMap();
 
   uint32_t tma_block_shape_m = kernel_data.is_moe ? 1 : kernel_data.block_shape_m;
@@ -210,6 +210,7 @@ inline CUtensorMap make_tma_desc_a(const Tensor &tensor, KernelData &kernel_data
     tma_block_shape_k = 1024 / a_dtype_num_bits;
   }
 
+  tensor = tensor.view({-1, tensor.size(-1)});
   return make_tma_desc(tensor, {tma_block_shape_k, tma_block_shape_m}, swizzle_bytes);
 }
 
@@ -227,9 +228,10 @@ inline CUtensorMap make_tma_desc_b(Tensor &tensor, KernelData &kernel_data) {
   return make_tma_desc(tensor, {num_bits * pack_size_k, block_shape_n / 32, block_shape_k / pack_size_k});
 }
 
-inline CUtensorMap make_tma_desc_c(Tensor &tensor, KernelData &kernel_data) {
+inline CUtensorMap make_tma_desc_c(Tensor tensor, KernelData &kernel_data) {
   if (!kernel_data.use_tma_c) return CUtensorMap();
   uint32_t tma_block_shape_m = kernel_data.is_moe ? 1 : kernel_data.block_shape_m;
+  tensor = tensor.view({-1, tensor.size(-1)});
   return make_tma_desc(tensor, {64, tma_block_shape_m}, 128);
 }
 
