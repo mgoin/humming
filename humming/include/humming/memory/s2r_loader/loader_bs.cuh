@@ -7,17 +7,17 @@ template <
     class MmaOpClass,
     class BlockShape, class WarpShape,
     class ElementA, class ElementBS,
-    class PipelineConfig, class QuantParamConfig>
+    class LayerConfig, class TuningConfig>
 class S2RMemoryLoaderBS {
 private:
-  static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
+  static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
   static constexpr bool kUseWgmma = MmaOpClass::kMmaType == MmaType::WGMMA;
 
-  static constexpr bool kIsChannel = QuantParamConfig::kIsChannelWeightScale;
-  static constexpr bool kIsGroup = QuantParamConfig::kIsGroupWeightScale;
-  static constexpr bool kIsBlock = QuantParamConfig::kIsBlockWeightScale;
-  static constexpr uint32_t kGroupSize = kIsChannel ? BlockShape::K : QuantParamConfig::kWeightScaleGroupSize;
-  static constexpr uint32_t kGroupSizeN = QuantParamConfig::kWeightScaleGroupSizeN;
+  static constexpr bool kIsChannel = LayerConfig::kIsChannelWeightScale;
+  static constexpr bool kIsGroup = LayerConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlock = LayerConfig::kIsBlockWeightScale;
+  static constexpr uint32_t kGroupSize = kIsChannel ? BlockShape::K : LayerConfig::kWeightScaleGroupSize;
+  static constexpr uint32_t kGroupSizeN = LayerConfig::kWeightScaleGroupSizeN;
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;

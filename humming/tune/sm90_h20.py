@@ -1,11 +1,15 @@
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from humming import dtypes
-from humming.layer import HummingLayerMeta
+from humming.config import GemmType
 from humming.tune.base import DeviceHeuristics
 from humming.utils.smem import estimate_smem_size_layer
+
+if TYPE_CHECKING:
+    from humming.layer import HummingLayerMeta
 
 
 class Sm90H20Heuristics(DeviceHeuristics):
@@ -22,8 +26,9 @@ class Sm90H20Heuristics(DeviceHeuristics):
         b_dtype: dtypes.DataType,
         group_size: int,
         use_f16_accum: bool,
-        is_moe: bool,
+        gemm_type: GemmType,
     ):
+        is_moe = gemm_type != GemmType.DENSE
         if a_dtype.num_bits == 16:
             return {
                 "block_shape": (64, 256, 512 // a_dtype.num_bits),
@@ -58,21 +63,21 @@ class Sm90H20Heuristics(DeviceHeuristics):
     @classmethod
     def get_config(
         cls,
-        meta: HummingLayerMeta,
+        meta: "HummingLayerMeta",
         shape_m: int,
-        use_stream_k: bool,
-        use_f16_accum: bool,
-        use_batch_invariance: bool,
+        use_f16_accum: bool = False,
+        use_batch_invariance: bool = False,
+        gemm_type: GemmType = GemmType.DENSE,
     ):
         # 1. base config
         group_size = meta.input_scale_group_size or meta.weight_scale_group_size
-        is_moe = meta.num_experts is not None
-        config = cls.get_base_config_h20(
+        is_moe = gemm_type != GemmType.DENSE
+        config = cls.get_base_config(
             meta.a_dtype,
             meta.b_dtype,
             group_size,
             use_f16_accum,
-            is_moe,
+            gemm_type,
         )
         block_shape_m, block_shape_n, block_shape_k = config["block_shape"]
         num_ctas_per_sm = config.get("num_ctas_per_sm", 1)
@@ -81,7 +86,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
         assert meta.shape_n % block_shape_n == 0
 
         # 2. block_shape_m and warp_shape_m
-        if meta.num_experts is None:
+        if not meta.num_experts:
             if shape_m <= block_shape_m:
                 block_shape_m = math.ceil(shape_m / 8) * 8
             else:
@@ -91,10 +96,10 @@ class Sm90H20Heuristics(DeviceHeuristics):
                 block_shape_m = math.ceil(block_shape_m / 16) * 16
         else:
             for moe_block_size in [8, 16, 32, 48, 64]:
-                if shape_m * meta.top_k / meta.num_experts / moe_block_size < 0.9:
+                if shape_m / meta.num_experts / moe_block_size < 0.9:
                     break
 
-            shape_m = int(meta.top_k * shape_m / meta.num_experts / 0.9)
+            shape_m = int(shape_m / meta.num_experts / 0.9)
             shape_m = max(shape_m, 1)
             if block_shape_m == 128:
                 if np.ceil(shape_m / 96) * 96 < np.ceil(shape_m / 64) * 64:
@@ -144,7 +149,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
         max_num_stages = 4
         for num_stages_new in range(num_stages + 1, max_num_stages + 1):
             block_shape = (block_shape_m, block_shape_n, block_shape_k)
-            smem_size = estimate_smem_size_layer(meta, block_shape, num_stages_new)
+            smem_size = estimate_smem_size_layer(meta, block_shape, gemm_type, num_stages_new)
             if smem_size * num_ctas_per_sm < cls.max_smem_size:
                 num_stages = num_stages_new
 
@@ -155,7 +160,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
         config = {
             "block_shape": (block_shape_m, block_shape_n, block_shape_k),
             "warp_shape": (warp_shape_m, warp_shape_n, warp_shape_k),
-            "use_stream_k": use_stream_k,
+            "use_stream_k": True,
             "use_f16_accum": use_f16_accum,
             "num_sms": num_sms,
             "num_stages": num_stages,
@@ -169,7 +174,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
             config["num_stages"] = 3
         elif config["num_stages"] == 4 and block_shape_m <= 32:
             block_shape = (block_shape_m, block_shape_n, block_shape_k)
-            smem_size = estimate_smem_size_layer(meta, block_shape, 5)
+            smem_size = estimate_smem_size_layer(meta, block_shape, gemm_type, 5)
             if smem_size * num_ctas_per_sm < cls.max_smem_size:
                 config["num_stages"] = 5
 

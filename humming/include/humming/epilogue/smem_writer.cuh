@@ -72,7 +72,7 @@ template <
     class MmaOpClass, class ArithClass,
     class BlockShape, class WarpShape,
     class ElementA, class ElementC,
-    class PipelineConfig, class QuantParamConfig>
+    class LayerConfig, class TuningConfig>
 class EpilogueSmemWriter : F16Conversion<ElementC> {
 private:
   static constexpr bool kUseWgmma = MmaOpClass::kMmaType == MmaType::WGMMA;
@@ -86,13 +86,13 @@ private:
   using WGMMA_CRegistersArrayType = CRegistersType[WarpShape::N * 4 / MmaShape::M][WarpShape::M / MmaShape::N];
   using CRegistersArrayType = std::conditional_t<kUseWgmma, WGMMA_CRegistersArrayType, MMA_CRegistersArrayType>;
 
-  static constexpr uint32_t kNumWriteSplits = PipelineConfig::kNumWriteSplits;
-  static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
+  static constexpr uint32_t kNumWriteSplits = TuningConfig::kNumWriteSplits;
+  static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
   static constexpr bool kHasInputScale = ElementA::kBits != 16;
-  static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
-  static constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
-  static constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
-  static constexpr bool kUseIntWeightScale = QuantParamConfig::kUseIntWeightScale;
+  static constexpr bool kIsGroupInputScale = kHasInputScale && LayerConfig::kInputScaleGroupSize > 0;
+  static constexpr bool kIsGroupWeightScale = LayerConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlockWeightScale = LayerConfig::kIsBlockWeightScale;
+  static constexpr bool kUseIntWeightScale = LayerConfig::kUseIntWeightScale;
   static constexpr bool kHasGroupScale = kIsGroupInputScale || kIsGroupWeightScale || kIsBlockWeightScale;
   static constexpr bool kIsIntAccum = std::is_same<ValTypeC, int32_t>::value && (!kHasGroupScale || kUseIntWeightScale);
 

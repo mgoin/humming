@@ -1,7 +1,11 @@
 import math
+from typing import TYPE_CHECKING
 
 from humming import dtypes
-from humming.layer import HummingLayerMeta
+from humming.config import GemmType
+
+if TYPE_CHECKING:
+    from humming.layer import HummingLayerMeta
 
 
 def estimate_smem_size(
@@ -13,7 +17,8 @@ def estimate_smem_size(
     has_zero_point: bool,
     is_fp_zero_point: bool,
     has_bias: bool,
-    is_moe: bool,
+    num_experts: int,
+    gemm_type: GemmType,
     block_shape: tuple[int, int, int],
     num_stages: int,
 ):
@@ -51,7 +56,13 @@ def estimate_smem_size(
 
     stage_size = a_stage_size + b_stage_size + as_stage_size + bs_stage_size + bzp_stage_size
     all_stages_size = stage_size * num_stages
-    moe_tensor_size = block_m * 4 * 2 if is_moe else 0
+    moe_tensor_size = 0
+    if gemm_type == GemmType.INDEXED:
+        moe_tensor_size = block_m * 4 * 2
+    elif gemm_type == GemmType.GROUPED_CONTIGUOUS:
+        moe_tensor_size = num_experts * 4 * 2
+    elif gemm_type == GemmType.GROUPED_MASKED:
+        moe_tensor_size = num_experts * 4
     size = all_stages_size + moe_tensor_size
     size += as_channel_size + bs_channel_size + bzp_channel_size + bias_size
 
@@ -59,20 +70,22 @@ def estimate_smem_size(
 
 
 def estimate_smem_size_layer(
-    meta: HummingLayerMeta,
+    meta: "HummingLayerMeta",
     block_shape: tuple[int, int, int],
+    gemm_type: GemmType,
     num_stages: int,
 ):
     return estimate_smem_size(
         a_dtype=meta.a_dtype,
         b_dtype=meta.b_dtype,
-        bs_dtype=meta.bs_dtype,
+        bs_dtype=meta.bs_dtype or meta.c_dtype,
         input_scale_group_size=meta.input_scale_group_size,
         weight_scale_group_size=meta.weight_scale_group_size,
         has_zero_point=meta.has_zero_point,
         is_fp_zero_point=meta.is_fp_zero_point,
         has_bias=meta.has_bias,
-        is_moe=meta.num_experts is not None,
+        num_experts=meta.num_experts,
+        gemm_type=gemm_type,
         block_shape=block_shape,
         num_stages=num_stages,
     )

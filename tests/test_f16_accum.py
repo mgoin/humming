@@ -13,7 +13,7 @@ from humming.utils.weight import (
 )
 
 
-@pytest.mark.parametrize("a_dtype", ["float8e4m3"])
+@pytest.mark.parametrize("a_dtype", ["float16", "float8e4m3"])
 @pytest.mark.parametrize(
     "b_dtype",
     [
@@ -29,10 +29,10 @@ from humming.utils.weight import (
 )
 @pytest.mark.parametrize("c_dtype", ["float16"])
 @pytest.mark.parametrize("bs_dtype", ["float16", "float8e5m2", "float8e4m3"])
-@pytest.mark.parametrize("input_scale_group_size", [64, 0])
-@pytest.mark.parametrize("weight_scale_group_size", [8, 16, 32, 0])
+@pytest.mark.parametrize("input_scale_group_size", [16, 32, 64, 0])
+@pytest.mark.parametrize("weight_scale_group_size", [16, 32, 64, 0])
 @pytest.mark.parametrize("mma_type", ["mma", "wgmma"])
-def test_scale(
+def test_f16_accum(
     a_dtype,
     b_dtype,
     c_dtype,
@@ -72,14 +72,14 @@ def test_scale(
     if mma_type == "wgmma" and a_dtype == "int4":
         return
     if weight_scale_group_size > 0:
-        if mma_type == "mma" and weight_scale_group_size < 128 // a_dtype.num_bits:
-            return
-        if mma_type == "wgmma" and weight_scale_group_size < 256 // a_dtype.num_bits:
+        if weight_scale_group_size < 256 // a_dtype.num_bits:
             return
     if input_scale_group_size > 0:
-        if mma_type == "mma" and input_scale_group_size < 128 // a_dtype.num_bits:
+        if input_scale_group_size < 256 // a_dtype.num_bits:
             return
-        if mma_type == "wgmma" and input_scale_group_size < 256 // a_dtype.num_bits:
+
+    if weight_scale_group_size > 0 and input_scale_group_size > 0:
+        if weight_scale_group_size != input_scale_group_size:
             return
 
     if a_dtype == dtypes.float16:
@@ -113,7 +113,8 @@ def test_scale(
     )
 
     humming_kernel = HummingKernel(
-        problem_shape=(0, 1024, 1024),
+        shape_n=1024,
+        shape_k=1024,
         block_shape=(16, a_dtype.num_bits * 16, 512 // a_dtype.num_bits),
         warp_shape=(16, a_dtype.num_bits * 4, 512 // a_dtype.num_bits),
         a_dtype=a_dtype,

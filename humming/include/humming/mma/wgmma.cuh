@@ -14,7 +14,7 @@ CUDA_INLINE uint64_t make_wgmma_smem_desc(void *smem_ptr, uint32_t iter_id) {
   uint32_t addr = cast_smem_ptr_to_uint(smem_ptr);
   uint64_t desc = desc_base;
 
-  reinterpret_cast<uint32_t*>(&desc)[0] = (addr >> 4);
+  reinterpret_cast<uint32_t *>(&desc)[0] = (addr >> 4);
 
   return desc;
 };
@@ -24,14 +24,14 @@ template <
     class MmaOpClass_, class SharedStorage, class ArithClass,
     class BlockShape, class WarpShape,
     class ElementA, class ElementB,
-    class QuantParamConfig>
+    class LayerConfig>
 struct WGMMA {
 public:
   using MmaOpClass = MmaOpClass_;
   using MmaShape = typename MmaOpClass::MmaShape;
 
-  static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
-  static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
+  static constexpr bool kHasZeroPoint = LayerConfig::kHasZeroPoint;
+  static constexpr bool kIsFpZeroPoint = LayerConfig::kIsFpZeroPoint;
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
@@ -106,12 +106,12 @@ public:
       constexpr uint32_t kNumIters = WarpShape::N / (MmaShape::M / 4);
 
       bool scale_d = true;
-      constexpr bool kApplyScaleOnC = ElementA::kBits != 16 && (QuantParamConfig::kInputScaleGroupSize > 0 || QuantParamConfig::kWeightScaleGroupSize > 0);
-      if constexpr (ElementA::kBits != 16 && QuantParamConfig::kInputScaleGroupSize > 0) {
-        scale_d = (iter_id * kPartMmaShapeK) % QuantParamConfig::kInputScaleGroupSize > 0;
+      constexpr bool kApplyScaleOnC = ElementA::kBits != 16 && (LayerConfig::kInputScaleGroupSize > 0 || LayerConfig::kWeightScaleGroupSize > 0);
+      if constexpr (ElementA::kBits != 16 && LayerConfig::kInputScaleGroupSize > 0) {
+        scale_d = (iter_id * kPartMmaShapeK) % LayerConfig::kInputScaleGroupSize > 0;
       }
-      if constexpr (ElementA::kBits != 16 && QuantParamConfig::kWeightScaleGroupSize > 0) {
-        scale_d = scale_d && (iter_id * kPartMmaShapeK) % QuantParamConfig::kWeightScaleGroupSize > 0;
+      if constexpr (ElementA::kBits != 16 && LayerConfig::kWeightScaleGroupSize > 0) {
+        scale_d = scale_d && (iter_id * kPartMmaShapeK) % LayerConfig::kWeightScaleGroupSize > 0;
       }
 
       wgmma_fence();
@@ -128,10 +128,10 @@ public:
   };
 
   template <class T>
-  CUDA_INLINE void fence_regs(T & regs) {
+  CUDA_INLINE void fence_regs(T &regs) {
     PRAGMA_UNROLL
     for (uint32_t r = 0; r < sizeof(T) / 4; r++) {
-      warpgroup_fence_operand(reinterpret_cast<uint32_t*>(regs)[r]);
+      warpgroup_fence_operand(reinterpret_cast<uint32_t *>(regs)[r]);
     }
   };
 
@@ -152,9 +152,9 @@ public:
   template <class T = uint32_t>
   CUDA_INLINE T *final_regs_c_as_ptr() {
     uint32_t index = 0;
-    constexpr bool kIsGroupInputScale = QuantParamConfig::kInputScaleGroupSize > 0;
-    constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
-    constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
+    constexpr bool kIsGroupInputScale = LayerConfig::kInputScaleGroupSize > 0;
+    constexpr bool kIsGroupWeightScale = LayerConfig::kIsGroupWeightScale;
+    constexpr bool kIsBlockWeightScale = LayerConfig::kIsBlockWeightScale;
 
     if constexpr (ElementA::kBits < 16 && (kIsGroupInputScale || kIsGroupWeightScale || kIsBlockWeightScale)) {
       index = 1;

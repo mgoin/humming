@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "./torch_api.h"
+
 #define SHT_NOBITS 8
 typedef uint64_t Elf64_Addr;
 typedef uint64_t Elf64_Off;
@@ -79,7 +81,7 @@ public:
 
   uint32_t getUint32(const std::string &name) {
     auto it = symbolOffsets.find(name);
-    if (it == symbolOffsets.end()) return 0;
+    STD_TORCH_CHECK(it != symbolOffsets.end(), name);
     if (it->second == 0ULL) return 0;
 
     std::ifstream fs(cubinPath, std::ios::binary);

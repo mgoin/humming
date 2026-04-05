@@ -63,14 +63,16 @@ def test_datatype(a_dtype, b_dtype, c_dtype, a_swizzle_bytes):
     )
 
     humming_kernel = HummingKernel(
-        problem_shape=(0, 1024, 1024),
+        shape_n=1024,
+        shape_k=1024,
+        pad_shape_n=8,
+        pad_shape_k=32,
         block_shape=(
             16,
             a_dtype.num_bits * 16,
             a_swizzle_bytes * 8 // a_dtype.num_bits,
         ),
         warp_shape=(16, a_dtype.num_bits * 4, a_swizzle_bytes * 8 // a_dtype.num_bits),
-        pad_shape=(0, 8, 32),
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         c_dtype=c_dtype,

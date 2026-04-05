@@ -6,23 +6,22 @@
 template <
     class ProblemShape, class BlockShape,
     class ElementA, class ElementB,
-    class SchedulerConfig, class PipelineConfig, class MoEConfig>
+    class ComputeConfig, class TuningConfig>
 class G2SMemoryLoaderB {
 private:
-  static constexpr bool kUseWarpSpec = PipelineConfig::kUseWarpSpec;
-  static constexpr bool kUseTma = PipelineConfig::kUseTmaB;
-  static constexpr bool kUseCpAsync = PipelineConfig::kUseCpAsync;
-  static constexpr bool kIsMoE = MoEConfig::kIsMoE;
-  static constexpr uint32_t kNumLoadThreads = PipelineConfig::kNumLoadThreads;
-  static constexpr uint32_t kLoadThreadOffset = PipelineConfig::kNumThreads - kNumLoadThreads;
-  static constexpr uint32_t kMultiCastSizeB = PipelineConfig::kMultiCastSizeB;
+  static constexpr bool kUseWarpSpec = TuningConfig::kUseWarpSpec;
+  static constexpr bool kUseTma = TuningConfig::kUseTmaB;
+  static constexpr bool kUseCpAsync = TuningConfig::kUseCpAsync;
+  static constexpr uint32_t kNumLoadThreads = TuningConfig::kNumLoadThreads;
+  static constexpr uint32_t kLoadThreadOffset = TuningConfig::kNumThreads - kNumLoadThreads;
+  static constexpr uint32_t kMultiCastSizeB = TuningConfig::kMultiCastSizeB;
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kSmemStride = BlockShape::N * kPartMmaShapeK * ElementB::kBits / 32 / 4;
   static constexpr uint32_t kGmemStride = ProblemShape::N * kPartMmaShapeK * ElementB::kBits / 32 / 4;
   static constexpr uint32_t kGmemExpertStride = ProblemShape::N * ProblemShape::K * ElementB::kBits / 32 / 4;
   static constexpr uint32_t kNumInt4s = kSmemStride * BlockShape::K / kPartMmaShapeK;
-  static constexpr bool kUseMMajorScheduler = SchedulerConfig::kUseMMajorScheduler;
+  static constexpr bool kUseMMajorScheduler = TuningConfig::kUseMMajorScheduler;
 
 public:
   const CUtensorMap *tensor_map_ptr;

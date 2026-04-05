@@ -1,12 +1,21 @@
 import functools
+from typing import TYPE_CHECKING
 
 import torch
 
-from humming.layer import HummingLayerMeta
+from humming.config import GemmType
 from humming.tune.base import DeviceHeuristics
-from humming.tune.sm8x import Sm80Heuristics, Sm86Heuristics, Sm87Heuristics, Sm89Heuristics
+from humming.tune.sm8x import (
+    Sm80Heuristics,
+    Sm86Heuristics,
+    Sm87Heuristics,
+    Sm89Heuristics,
+)
 from humming.tune.sm75 import Sm75Heuristics
 from humming.tune.sm90 import Sm90Heuristics
+
+if TYPE_CHECKING:
+    from humming.layer import HummingLayerMeta
 
 heuristics_map: dict[int, type[DeviceHeuristics]] = {
     75: Sm75Heuristics,
@@ -33,10 +42,32 @@ def get_heuristics_class(
 
 @functools.lru_cache(maxsize=1024)
 def get_heuristics_config(
-    meta: HummingLayerMeta,
-    use_stream_k: bool,
-    use_f16_accum: bool,
-    use_batch_invariance: bool,
+    meta: "HummingLayerMeta | dict",
+    shape_m: int | None = None,
+    use_f16_accum: bool = False,
+    use_batch_invariance: bool = False,
+    gemm_type: str | GemmType = "dense",
 ):
+    from humming.layer import HummingLayerMeta
+
+    if isinstance(gemm_type, str):
+        gemm_type = GemmType(gemm_type)
+
+    if isinstance(meta, dict):
+        meta = HummingLayerMeta(**meta)
     heuristics_cls = get_heuristics_class()
-    return heuristics_cls.get_configs(meta, use_stream_k, use_f16_accum, use_batch_invariance)
+    if isinstance(shape_m, int):
+        return heuristics_cls.get_config(
+            meta=meta,
+            shape_m=shape_m,
+            use_f16_accum=use_f16_accum,
+            use_batch_invariance=use_batch_invariance,
+            gemm_type=gemm_type,
+        )
+    else:
+        return heuristics_cls.get_configs(
+            meta=meta,
+            use_f16_accum=use_f16_accum,
+            use_batch_invariance=use_batch_invariance,
+            gemm_type=gemm_type,
+        )

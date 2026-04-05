@@ -7,23 +7,23 @@ template <
     class MmaOpClass,
     class BlockShape, class WarpShape,
     class ElementA, class ElementB, class ElementBS,
-    class PipelineConfig, class EpilogueConfig,
-    class QuantParamConfig, class MoEConfig>
+    class LayerConfig, class ComputeConfig, class TuningConfig>
 struct SharedStorage {
 private:
   static constexpr bool kHasInputScale = ElementA::kBits != 16;
-  static constexpr bool kIsChannelInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
-  static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
-  static constexpr bool kIsChannelWeightScale = QuantParamConfig::kIsChannelWeightScale;
-  static constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
-  static constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
+  static constexpr bool kIsChannelInputScale = kHasInputScale && LayerConfig::kInputScaleGroupSize == 0;
+  static constexpr bool kIsGroupInputScale = kHasInputScale && LayerConfig::kInputScaleGroupSize > 0;
+  static constexpr bool kIsChannelWeightScale = LayerConfig::kIsChannelWeightScale;
+  static constexpr bool kIsGroupWeightScale = LayerConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlockWeightScale = LayerConfig::kIsBlockWeightScale;
   static constexpr bool kIsGroupOrBlockWeightScale = kIsGroupWeightScale || kIsBlockWeightScale;
-  static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
-  static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
+  static constexpr bool kHasZeroPoint = LayerConfig::kHasZeroPoint;
+  static constexpr bool kIsFpZeroPoint = LayerConfig::kIsFpZeroPoint;
 
 public:
-  static constexpr uint32_t kNumStages = PipelineConfig::kNumStages;
-  static constexpr uint32_t kNumWriteSplits = PipelineConfig::kNumWriteSplits;
+  static constexpr uint32_t kNumExperts = LayerConfig::kNumExperts;
+  static constexpr uint32_t kNumStages = TuningConfig::kNumStages;
+  static constexpr uint32_t kNumWriteSplits = TuningConfig::kNumWriteSplits;
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kNumWarpsDimK = BlockShape::K / WarpShape::K;
   static constexpr uint32_t kMmaCTypeBits = MmaOpClass::kCTypeBits;
@@ -38,8 +38,8 @@ public:
   static constexpr uint32_t kSmemStrideBZP = BlockShape::N * kNumZPBits / 32 / 4;
   static constexpr uint32_t kSmemStrideBias = BlockShape::N * 16 / 32 / 4;
 
-  static constexpr uint32_t kGroupSzieA = QuantParamConfig::kInputScaleGroupSize;
-  static constexpr uint32_t kGroupSzieB = QuantParamConfig::kWeightScaleGroupSize;
+  static constexpr uint32_t kGroupSzieA = LayerConfig::kInputScaleGroupSize;
+  static constexpr uint32_t kGroupSzieB = LayerConfig::kWeightScaleGroupSize;
   static constexpr uint32_t kNumGroupsA = kIsGroupInputScale ? CEIL_DIV(BlockShape::K, kGroupSzieA) : 0;
   static constexpr uint32_t kNumGroupsB = kIsGroupOrBlockWeightScale ? CEIL_DIV(BlockShape::K, kGroupSzieB) : 0;
 
@@ -52,12 +52,12 @@ public:
   static constexpr uint32_t kChannelSizeAS = kIsChannelInputScale ? BlockShape::M / 4 : 0;
   static constexpr uint32_t kChannelSizeBS = kIsChannelWeightScale ? kSmemStrideBS : 0;
   static constexpr uint32_t kChannelSizeBZP = (kIsChannelWeightScale && kHasZeroPoint) ? kSmemStrideBZP : 0;
-  static constexpr uint32_t kBiasSize = EpilogueConfig::kHasBias ? kSmemStrideBias : 0;
+  static constexpr uint32_t kBiasSize = LayerConfig::kHasBias ? kSmemStrideBias : 0;
 
-  static constexpr bool kUseWarpSpec = PipelineConfig::kUseWarpSpec;
-  static constexpr bool kUseMBarrier = PipelineConfig::kUseMBarrier;
-  static constexpr bool kIsMoE = MoEConfig::kIsMoE;
-  static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
+  static constexpr bool kUseWarpSpec = TuningConfig::kUseWarpSpec;
+  static constexpr bool kUseMBarrier = TuningConfig::kUseMBarrier;
+  static constexpr bool kIsIndexedGemm = ComputeConfig::kGemmType == GemmType::INDEXED;
+  static constexpr bool kIsGroupedGemm = ComputeConfig::kGemmType == GemmType::GROUPED_CONTIGUOUS || ComputeConfig::kGemmType == GemmType::GROUPED_MASKED;
 
   union alignas(128) {
     struct {
@@ -73,9 +73,12 @@ public:
     int4 reduce[MAX(kWarpReduceSize, kBlockOutputSize)];
   };
 
-  uint32_t rd_row_index[(kIsMoE && !kIsMoEDown) ? BlockShape::M : 0];
-  uint32_t wr_row_index[kIsMoE ? BlockShape::M : 0];
-  uint32_t topk_weights[kIsMoE ? BlockShape::M : 0];
+  uint32_t rd_row_index[kIsIndexedGemm ? BlockShape::M : 0];
+  uint32_t wr_row_index[kIsIndexedGemm ? BlockShape::M : 0];
+
+  uint32_t expert_offset[kIsGroupedGemm ? kNumExperts : 0];
+  uint32_t expert_tokens[kIsGroupedGemm ? kNumExperts : 0];
+  uint32_t total_m_blocks[1];
 
   uint64_t load_mbar[kUseMBarrier ? (kNumStages + 2) : 0];
   uint64_t math_mbar[kUseWarpSpec ? (kNumStages + 1) : 0];

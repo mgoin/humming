@@ -31,17 +31,18 @@ CUDA_INLINE T atomic_reduce_add_f162(T &a, T &b) {
 template <
     class ArithClass,
     class ProblemShape, class BlockShape, class PadShape, class ElementC,
-    class SchedulerConfig, class PipelineConfig, class EpilogueConfig, class MoEConfig>
+    class ComputeConfig, class TuningConfig>
 class EpilogueGmemWriter : F16Conversion<ElementC> {
 private:
-  static constexpr bool kUseStreamK = SchedulerConfig::kUseStreamK;
-  static constexpr bool kUseTmaC = PipelineConfig::kUseTmaC;
-  static constexpr bool kIsMoE = MoEConfig::kIsMoE;
-  static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
-  static constexpr uint32_t kTopK = MoEConfig::kTopK;
+  static constexpr bool kUseStreamK = TuningConfig::kUseStreamK;
+  static constexpr bool kUseTmaC = TuningConfig::kUseTmaC;
 
-  static constexpr uint32_t kNumMathThreads = PipelineConfig::kNumMathThreads;
-  static constexpr uint32_t kNumWriteSplits = PipelineConfig::kNumWriteSplits;
+  static constexpr bool kIsDenseGemm = ComputeConfig::kGemmType == GemmType::DENSE;
+  static constexpr bool kIsIndexedGemm = ComputeConfig::kGemmType == GemmType::INDEXED;
+  static constexpr bool kIsGroupedGemm = ComputeConfig::kGemmType == GemmType::GROUPED_CONTIGUOUS || ComputeConfig::kGemmType == GemmType::GROUPED_MASKED;
+
+  static constexpr uint32_t kNumMathThreads = TuningConfig::kNumMathThreads;
+  static constexpr uint32_t kNumWriteSplits = TuningConfig::kNumWriteSplits;
 
   using scalar_t = typename F16Conversion<ElementC>::scalar_t;
   using scalar_t2 = typename F16Conversion<ElementC>::scalar_t2;
@@ -64,7 +65,7 @@ public:
   EpilogueGmemWriter(
       ArithClass &arith,
       int4 *smem_ptr, OutputPtrType output_ptr,
-      const uint32_t *moe_row_index, uint32_t shape_m)
+      const uint32_t *moe_row_index, uint32_t shape_m, uint32_t top_k)
       : arith(arith), smem_ptr(smem_ptr), moe_row_index(moe_row_index) {
 
     if constexpr (kUseTmaC) {
@@ -73,18 +74,12 @@ public:
       gmem_ptr_raw = reinterpret_cast<int4 *>(output_ptr);
     }
 
-    if constexpr (kIsMoE && !kIsMoEDown) {
-      output_shape_m = shape_m * kTopK;
-    } else {
-      output_shape_m = shape_m;
-    }
+    output_shape_m = shape_m * (kIsIndexedGemm ? top_k : 1);
   }
 
   CUDA_INLINE
   void write(uint32_t slice_id, uint32_t slice_count, uint32_t split_idx) {
-    if constexpr (kUseTmaC && kIsMoE) {
-      write_tma_moe(slice_id, slice_count);
-    } else if constexpr (kUseTmaC && !kIsMoE) {
+    if constexpr (kUseTmaC) {
       write_tma(slice_id, slice_count);
     } else {
       write_legacy(slice_id, slice_count, split_idx);
@@ -109,9 +104,9 @@ public:
         uint32_t smem_offset_swizzled = smem_row * 8 + smem_col_swizzled;
         uint32_t gmem_row = smem_row % (BlockShape::M / kNumWriteSplits);
         if constexpr (kNumWriteSplits == 2) gmem_row += BlockShape::M / 2 * split_idx;
-        gmem_row = kIsMoE ? moe_row_index[gmem_row] : gmem_row;
+        if constexpr (ComputeConfig::kGemmType == GemmType::INDEXED) gmem_row = moe_row_index[gmem_row];
         uint32_t gmem_col = smem_row / (BlockShape::M / kNumWriteSplits) * 8 + smem_col;
-        bool pred1 = gmem_row < (kIsMoE ? output_shape_m : block_output_shape_m);
+        bool pred1 = gmem_row < (kIsIndexedGemm ? output_shape_m : block_output_shape_m);
         bool pred2 = PadShape::N == 0 || (col_offset + gmem_col * 8 < ProblemShape::N - PadShape::N);
 
         if (!pred1 || !pred2) continue;
@@ -131,6 +126,7 @@ public:
 
   CUDA_INLINE
   void write_tma(uint32_t slice_id, uint32_t slice_count) {
+    static_assert(!kIsIndexedGemm);
     constexpr uint32_t count = BlockShape::N / 64;
     const uint32_t block_idx = threadIdx.x;
     const uint32_t smem_offset = BlockShape::M * 64 / 8 * block_idx;
@@ -149,41 +145,21 @@ public:
   }
 
   CUDA_INLINE
-  void write_tma_moe(uint32_t slice_id, uint32_t slice_count) {
-    PRAGMA_UNROLL
-    for (uint32_t i = 0; i < CEIL_DIV(BlockShape::M, kNumMathThreads); i++) {
-      uint32_t row = threadIdx.x + kNumMathThreads * i;
-      if (row >= BlockShape::M) break;
-      uint32_t gmem_row = moe_row_index[row];
-
-      PRAGMA_UNROLL
-      for (uint32_t block_idx = 0; block_idx < (BlockShape::N / 64); block_idx++) {
-        uint32_t col_offset2 = col_offset + 64 * block_idx;
-        const uint32_t smem_offset = row * 8 + BlockShape::M * 64 / 8 * block_idx;
-        if constexpr (!kUseStreamK) {
-          tma_store_2d(smem_ptr + smem_offset, tensor_map_ptr, col_offset2, gmem_row);
-        } else if (slice_count == 1 || slice_id == 0) {
-          tma_store_2d(smem_ptr + smem_offset, tensor_map_ptr, col_offset2, gmem_row);
-          if (slice_count > 1) tma_wait_store_group<0>();
-        } else {
-          tma_reduce_add_2d(smem_ptr + smem_offset, tensor_map_ptr, col_offset2, gmem_row);
-          if (slice_id != slice_count - 1) tma_wait_store_group<0>();
-        }
-      }
+  void seek(uint32_t m_block_id, uint32_t n_block_id, uint32_t current_shape_m, uint32_t m_offset) {
+    if constexpr (kIsGroupedGemm) {
+      output_shape_m = current_shape_m;
+      row_offset = m_offset;
+    } else {
+      row_offset = m_block_id * BlockShape::M;
     }
-  }
-
-  CUDA_INLINE
-  void seek(uint32_t m_block_id, uint32_t n_block_id) {
-    row_offset = m_block_id * BlockShape::M;
-    block_output_shape_m = output_shape_m - row_offset;
+    block_output_shape_m = MIN(output_shape_m - row_offset, BlockShape::M);
     col_offset = n_block_id * BlockShape::N;
 
     uint32_t offset;
     offset = n_block_id * (BlockShape::N * 2 / 16);
-    if constexpr (!kIsMoE) {
+    if constexpr (!kIsIndexedGemm) {
       constexpr uint32_t kShapeN = ProblemShape::N - PadShape::N;
-      offset += m_block_id * (kShapeN * BlockShape::M * 2 / 16);
+      offset += row_offset * (kShapeN / 8);
     }
     gmem_ptr = gmem_ptr_raw + offset;
   };

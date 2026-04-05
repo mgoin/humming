@@ -15,6 +15,6 @@ CUDA_INLINE void wgmma_wait() {
   asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
 
-CUDA_INLINE void warpgroup_fence_operand(uint32_t& reg) {
-    asm volatile("" : "+r"(reg) :: "memory");
+CUDA_INLINE void warpgroup_fence_operand(uint32_t &reg) {
+  asm volatile("" : "+r"(reg)::"memory");
 }

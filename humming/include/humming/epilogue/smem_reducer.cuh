@@ -2,17 +2,18 @@
 
 #include <humming/utils/all.cuh>
 
-template <class MmaOpClass, class BlockShape, class WarpShape, class ElementC, class PipelineConfig, class QuantParamConfig>
+template <class MmaOpClass, class BlockShape, class WarpShape, class ElementC, class LayerConfig, class TuningConfig>
 class EpilogueSmemReducer {
 private:
-  static constexpr bool kForceFloatAccum = (QuantParamConfig::kWeightScaleGroupSize > 0 || QuantParamConfig::kInputScaleGroupSize > 0) && !QuantParamConfig::kUseIntWeightScale;
+  static constexpr bool kHasGroupScale = LayerConfig::kWeightScaleGroupSize > 0 || LayerConfig::kInputScaleGroupSize > 0;
+  static constexpr bool kForceFloatAccum = std::is_same<typename MmaOpClass::ValTypeC, int32_t>::value && kHasGroupScale && !LayerConfig::kUseIntWeightScale;
   using MmaTypeC = std::conditional_t<kForceFloatAccum, float, typename MmaOpClass::ValTypeC>;
   using MmaShape = typename MmaOpClass::MmaShape;
   using OutputType32 = std::conditional_t<std::is_same<ElementC, Float16>::value, half2, nv_bfloat162>;
   using ValTypeC32 = std::conditional_t<sizeof(MmaTypeC) == 2, OutputType32, MmaTypeC>;
 
   static constexpr bool kUseWgmma = MmaOpClass::kMmaType == MmaType::WGMMA;
-  static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
+  static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
   using CRegistersType = typename MmaOpClass::CRegisters;
   using MMA_CRegistersArrayType = CRegistersType[WarpShape::M / MmaShape::M][WarpShape::N / MmaShape::N];
   using WGMMA_CRegistersArrayType = CRegistersType[WarpShape::N * 4 / MmaShape::M][WarpShape::M / MmaShape::N];
@@ -75,16 +76,16 @@ public:
       for (uint32_t i = 1; i < group_num_warps; i *= 2) {
         uint32_t buffer_id = group_warp_id % (group_num_warps / (2 * i));
         if (group_warp_id >= group_num_warps / i) {
-          sync_part_threads<PipelineConfig::kNumMathThreads, PipelineConfig::kNumThreads>();
+          sync_part_threads<TuningConfig::kNumMathThreads, TuningConfig::kNumThreads>();
         } else if (group_warp_id >= group_num_warps / (2 * i)) {
           write_to_smem(buffer_id, m);
-          sync_part_threads<PipelineConfig::kNumMathThreads, PipelineConfig::kNumThreads>();
+          sync_part_threads<TuningConfig::kNumMathThreads, TuningConfig::kNumThreads>();
         } else {
-          sync_part_threads<PipelineConfig::kNumMathThreads, PipelineConfig::kNumThreads>();
+          sync_part_threads<TuningConfig::kNumMathThreads, TuningConfig::kNumThreads>();
           read_from_smem_and_reduce(buffer_id, m);
         };
 
-        sync_part_threads<PipelineConfig::kNumMathThreads, PipelineConfig::kNumThreads>();
+        sync_part_threads<TuningConfig::kNumMathThreads, TuningConfig::kNumThreads>();
       };
     };
   };

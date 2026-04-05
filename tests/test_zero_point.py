@@ -76,7 +76,8 @@ def test_zeropoint(a_dtype, b_dtype, c_dtype, is_fp_zero_point, warp_shape_n_spl
         return
 
     humming_kernel = HummingKernel(
-        problem_shape=(0, 1024, 1024),
+        shape_n=1024,
+        shape_k=1024,
         block_shape=(16, a_dtype.num_bits * 16, 512 // a_dtype.num_bits),
         warp_shape=(16, warp_shape_n, 512 // a_dtype.num_bits),
         a_dtype=a_dtype,

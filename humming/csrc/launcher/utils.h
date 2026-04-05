@@ -75,17 +75,16 @@ struct KernelData {
   uint32_t block_shape_k;
   uint32_t pad_shape_n;
   uint32_t pad_shape_k;
+  uint32_t num_experts;
   uint32_t input_scale_group_size;
   uint32_t weight_scale_group_size;
   uint32_t weight_scale_group_size_n;
-  uint32_t top_k;
   uint32_t num_ctas_per_sm;
   uint32_t multi_cast_size_a;
   uint32_t multi_cast_size_b;
+  uint32_t gemm_type_id;
 
   bool use_stream_k;
-  bool is_moe;
-  bool is_moe_down;
   bool is_fp_zero_point;
   bool is_channel_weight_scale;
   bool is_group_weight_scale;

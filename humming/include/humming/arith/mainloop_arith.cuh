@@ -11,7 +11,7 @@ template <
     class MmaOpClass,
     class BlockShape, class WarpShape,
     class ElementA, class ElementB, class ElementC, class ElementBS,
-    class QuantParamConfig>
+    class LayerConfig>
 class MainloopArithmetic : F16Conversion<ElementC> {
 private:
   using scalar_t = typename F16Conversion<ElementC>::scalar_t;
@@ -24,19 +24,19 @@ private:
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
 
   static constexpr bool kHasInputScale = ElementA::kBits != 16;
-  static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
-  static constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
-  static constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
-  static constexpr bool kIsChannelWeightScale = QuantParamConfig::kIsChannelWeightScale;
-  static constexpr bool kIsTensorWeightScale = QuantParamConfig::kIsTensorWeightScale;
+  static constexpr bool kIsGroupInputScale = kHasInputScale && LayerConfig::kInputScaleGroupSize > 0;
+  static constexpr bool kIsGroupWeightScale = LayerConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlockWeightScale = LayerConfig::kIsBlockWeightScale;
+  static constexpr bool kIsChannelWeightScale = LayerConfig::kIsChannelWeightScale;
+  static constexpr bool kIsTensorWeightScale = LayerConfig::kIsTensorWeightScale;
   static constexpr bool kIsGroupOrBlockWeightScale = kIsGroupWeightScale || kIsBlockWeightScale;
 
-  static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
-  static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
-  static constexpr bool kUseIntWeightScale = QuantParamConfig::kUseIntWeightScale;
+  static constexpr bool kHasZeroPoint = LayerConfig::kHasZeroPoint;
+  static constexpr bool kIsFpZeroPoint = LayerConfig::kIsFpZeroPoint;
+  static constexpr bool kUseIntWeightScale = LayerConfig::kUseIntWeightScale;
 
-  static constexpr uint32_t kInputScaleGroupSize = kIsGroupInputScale ? QuantParamConfig::kInputScaleGroupSize : 1;
-  static constexpr uint32_t kWeightScaleGroupSize = kIsGroupOrBlockWeightScale ? QuantParamConfig::kWeightScaleGroupSize : 1;
+  static constexpr uint32_t kInputScaleGroupSize = kIsGroupInputScale ? LayerConfig::kInputScaleGroupSize : 1;
+  static constexpr uint32_t kWeightScaleGroupSize = kIsGroupOrBlockWeightScale ? LayerConfig::kWeightScaleGroupSize : 1;
   static constexpr uint2 kExpOffset = get_mainloop_exp_offset<
       ElementA, ElementB, ElementBS, kHasZeroPoint,
       kIsF16Accum, kIsGroupInputScale, kIsGroupOrBlockWeightScale>();
@@ -246,7 +246,7 @@ public:
       } else if constexpr (kIsF16Accum && kIsBlockWeightScale) {
         scalar_t2 *dq_bs_scalar2_ptr = reinterpret_cast<scalar_t2 *>(dq_bs);
         scalar_t2 scale_factor = prepare_exp_scale_factor<scalar_t2, kExpOffset.y>();
-        dq_bs_scalar2_ptr[0] = this->float2num2(reinterpret_cast<float*>(bs[buffer_id])[0]);
+        dq_bs_scalar2_ptr[0] = this->float2num2(reinterpret_cast<float *>(bs[buffer_id])[0]);
         dq_bs_scalar2_ptr[0] = __hmul2(dq_bs_scalar2_ptr[0], scale_factor);
       } else if constexpr (kIsF16Accum && ElementBS::kBits == 8 && kIsGroupWeightScale) {
         PRAGMA_UNROLL

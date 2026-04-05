@@ -6,17 +6,16 @@
 #include "./utils.h"
 #include <ATen/EmptyTensor.h>
 
-inline Tensor may_make_tensor_c(std::optional<Tensor> &c, const Tensor &a, KernelData& kernel_data) {
+inline Tensor may_make_tensor_c(std::optional<Tensor> &c, const Tensor &a, KernelData& kernel_data, at::SymInt top_k) {
   if (c.has_value()) return c.value();
 
-  auto sizes = a.sym_sizes().vec();
-  sizes.pop_back();
-  if (kernel_data.is_moe && !kernel_data.is_moe_down) sizes.push_back(kernel_data.top_k);
-  sizes.push_back(kernel_data.problem_shape_n - kernel_data.pad_shape_n);
+  at::SymInt shape_m = a.size(0);
+  at::SymInt shape_n = kernel_data.problem_shape_n - kernel_data.pad_shape_n;
+  if (kernel_data.gemm_type_id == 1) shape_m = shape_m * top_k;
 
   auto c_dtype = dtype_id_to_tensor_dtype(kernel_data.c_dtype_id);
   auto options = a.options().dtype(c_dtype);
-  return at::empty_symint(sizes, options);
+  return at::empty_symint({shape_m, shape_n}, options);
 }
 
 inline void check_tensor_common(
@@ -58,7 +57,6 @@ inline void check_tensor_common(
 
 inline void check_tensor_a(const Tensor &tensor, KernelData &kernel_data, int64_t dev) {
   std::vector<int64_t> expected_shape = {tensor.size(0)};
-  if (kernel_data.is_moe && kernel_data.is_moe_down) expected_shape.push_back(kernel_data.top_k);
 
   int64_t shape_k = kernel_data.problem_shape_k - kernel_data.pad_shape_k;
   if (get_dtype_num_bits(kernel_data.a_dtype_id) == 4) {
@@ -79,21 +77,20 @@ inline void check_tensor_b(Tensor &tensor, KernelData &kernel_data, int64_t dev)
   uint32_t tensor_shape_k = problem_shape_k / pack_size_k;
 
   std::vector<int64_t> expected_shape = {};
-  if (kernel_data.is_moe) expected_shape.push_back(tensor.size(0));
+  if (kernel_data.gemm_type_id != 0) expected_shape.push_back(kernel_data.num_experts);
   expected_shape.push_back(problem_shape_k / pack_size_k);
   expected_shape.push_back(problem_shape_n * pack_size_k * num_bits / 32);
   check_tensor_common(tensor, "b", dev, ScalarType::Int, expected_shape);
 };
 
-inline void check_tensor_c(Tensor &tensor, KernelData &kernel_data, int64_t dev, int64_t shape_m) {
-  std::vector<int64_t> expected_shape = {shape_m};
-  if (kernel_data.is_moe) expected_shape.push_back(kernel_data.top_k);
+inline void check_tensor_c(Tensor &tensor, KernelData &kernel_data, int64_t dev, int64_t shape_m, int64_t top_k) {
+  std::vector<int64_t> expected_shape = {shape_m * (kernel_data.gemm_type_id == 1 ? top_k : 1)};
   expected_shape.push_back(kernel_data.problem_shape_n - kernel_data.pad_shape_n);
   auto expected_dtype = dtype_id_to_tensor_dtype(kernel_data.c_dtype_id);
   check_tensor_common(tensor, "c", dev, expected_dtype, expected_shape);
 };
 
-inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t shape_m) {
+inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t shape_m, int64_t top_k) {
   if (get_dtype_num_bits(kernel_data.a_dtype_id) == 16) return;
   ASSERT_CHECK(tensor.has_value(), "as must not be none for 4b or 8b activation");
 
@@ -101,13 +98,12 @@ inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_da
   uint32_t group_size = kernel_data.input_scale_group_size;
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(problem_shape_k, group_size);
 
-  std::vector<int64_t> expected_shape = {shape_m};
-  if (kernel_data.is_moe && kernel_data.is_moe_down) expected_shape.push_back(kernel_data.top_k);
+  std::vector<int64_t> expected_shape = {shape_m * (kernel_data.gemm_type_id == 1 ? top_k : 1)};
   expected_shape.push_back(num_groups);
   check_tensor_common(tensor.value(), "as", dev, ScalarType::Float, expected_shape);
 };
 
-inline void check_tensor_bs(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t num_experts) {
+inline void check_tensor_bs(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev) {
   if (kernel_data.is_tensor_weight_scale && !kernel_data.is_group_weight_scale) return;
   uint32_t problem_shape_k = kernel_data.problem_shape_k;
   uint32_t problem_shape_n = kernel_data.problem_shape_n;
@@ -118,7 +114,7 @@ inline void check_tensor_bs(std::optional<Tensor> &tensor, KernelData &kernel_da
   uint32_t num_groups_n = group_size_n == 0 ? 1 : CEIL_DIV(problem_shape_n, group_size_n);
 
   std::vector<int64_t> expected_shape = {};
-  if (kernel_data.is_moe) expected_shape.push_back(num_experts);
+  if (kernel_data.gemm_type_id != 0) expected_shape.push_back(kernel_data.num_experts);
   expected_shape.push_back(num_groups);
   if (kernel_data.is_block_weight_scale) {
     expected_shape.push_back(num_groups_n);
@@ -129,7 +125,7 @@ inline void check_tensor_bs(std::optional<Tensor> &tensor, KernelData &kernel_da
   check_tensor_common(tensor.value(), "bs", dev, expected_dtype, expected_shape);
 };
 
-inline void check_tensor_bzp(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t num_experts) {
+inline void check_tensor_bzp(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev) {
   if (!kernel_data.has_zero_point) return;
   ASSERT_CHECK(tensor.has_value(), "bzp must not be none if has_zero_point");
 
@@ -139,7 +135,7 @@ inline void check_tensor_bzp(std::optional<Tensor> &tensor, KernelData &kernel_d
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(problem_shape_k, group_size);
 
   std::vector<int64_t> expected_shape = {};
-  if (kernel_data.is_moe) expected_shape.push_back(num_experts);
+  if (kernel_data.gemm_type_id != 0) expected_shape.push_back(kernel_data.num_experts);
   expected_shape.push_back(num_groups);
   ScalarType expected_dtype;
   if (kernel_data.is_fp_zero_point) {
@@ -152,20 +148,20 @@ inline void check_tensor_bzp(std::optional<Tensor> &tensor, KernelData &kernel_d
   check_tensor_common(tensor.value(), "bzp", dev, expected_dtype, expected_shape);
 };
 
-inline void check_tensor_bias(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t num_experts) {
+inline void check_tensor_bias(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev) {
   if (!kernel_data.has_bias) return;
   ASSERT_CHECK(tensor.has_value(), "bias must not be none if has_bias");
   std::vector<int64_t> expected_shape = {};
-  if (kernel_data.is_moe) expected_shape.push_back(num_experts);
+  if (kernel_data.gemm_type_id != 0) expected_shape.push_back(kernel_data.num_experts);
   expected_shape.push_back(kernel_data.problem_shape_n);
   auto expected_dtype = dtype_id_to_tensor_dtype(kernel_data.c_dtype_id);
   check_tensor_common(tensor.value(), "bias", dev, expected_dtype, expected_shape);
 };
 
-inline void check_tensor_gs(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t num_experts) {
+inline void check_tensor_gs(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev) {
   if (!kernel_data.is_tensor_weight_scale) return;
   ASSERT_CHECK(tensor.has_value(), "gs must not be none if has_global_scale");
-  std::vector<int64_t> expected_shape = {kernel_data.is_moe ? num_experts : 1};
+  std::vector<int64_t> expected_shape = {kernel_data.gemm_type_id != 0 ? kernel_data.num_experts : 1};
   check_tensor_common(tensor.value(), "gs", dev, ScalarType::Float, expected_shape);
 };
 
@@ -176,30 +172,30 @@ inline void check_tensor_locks(std::optional<Tensor> &tensor, KernelData &kernel
 };
 
 inline void check_tensor_moe(
-    std::optional<Tensor> &topk_weights,
-    std::optional<Tensor> &sorted_token_ids,
+    std::optional<Tensor> &sorted_ids,
     std::optional<Tensor> &expert_ids,
     std::optional<Tensor> &num_tokens_padded,
+    std::optional<Tensor> &expert_layout,
     KernelData &kernel_data,
     int64_t dev) {
 
-  if (!kernel_data.is_moe) return;
-  ASSERT_CHECK(sorted_token_ids.has_value(), "sorted_token_ids must not be none if is_moe");
-  ASSERT_CHECK(expert_ids.has_value(), "expert_ids must not be none if is_moe");
-  ASSERT_CHECK(num_tokens_padded.has_value(), "num_tokens_padded must not be none if is_moe");
-  check_tensor_common(sorted_token_ids.value(), "sorted_token_ids", dev, ScalarType::Int);
-  check_tensor_common(expert_ids.value(), "expert_ids", dev, ScalarType::Int);
-  check_tensor_common(num_tokens_padded.value(), "num_tokens_padded", dev, ScalarType::Int);
-
-  if (!kernel_data.is_moe_down) return;
-  ASSERT_CHECK(topk_weights.has_value(), "topk_weights must not be none if is_moe_down");
-  check_tensor_common(topk_weights.value(), "topk_weights", dev, ScalarType::Float);
+  if (kernel_data.gemm_type_id == 1) {
+    ASSERT_CHECK(sorted_ids.has_value(), "sorted_ids must not be none for indexed gemm");
+    ASSERT_CHECK(expert_ids.has_value(), "expert_ids must not be none for indexed gemm");
+    ASSERT_CHECK(num_tokens_padded.has_value(), "num_tokens_padded must not be none for indexed gemm");
+    check_tensor_common(sorted_ids.value(), "sorted_ids", dev, ScalarType::Int);
+    check_tensor_common(expert_ids.value(), "expert_ids", dev, ScalarType::Int);
+    check_tensor_common(num_tokens_padded.value(), "num_tokens_padded", dev, ScalarType::Int);
+  }
+  if (kernel_data.gemm_type_id == 2 || kernel_data.gemm_type_id == 3) {
+    ASSERT_CHECK(expert_layout.has_value(), "expert_layout must not be none for grouped gemm");
+  }
 };
 
 inline CUtensorMap make_tma_desc_a(Tensor tensor, KernelData &kernel_data) {
   if (!kernel_data.use_tma_a) return CUtensorMap();
 
-  uint32_t tma_block_shape_m = kernel_data.is_moe ? 1 : kernel_data.block_shape_m;
+  uint32_t tma_block_shape_m = kernel_data.block_shape_m;
   uint32_t tma_block_shape_k = kernel_data.block_shape_k;
   uint32_t swizzle_bytes = 128;
   uint32_t a_dtype_num_bits = get_dtype_num_bits(kernel_data.a_dtype_id);
@@ -230,9 +226,8 @@ inline CUtensorMap make_tma_desc_b(Tensor &tensor, KernelData &kernel_data) {
 
 inline CUtensorMap make_tma_desc_c(Tensor tensor, KernelData &kernel_data) {
   if (!kernel_data.use_tma_c) return CUtensorMap();
-  uint32_t tma_block_shape_m = kernel_data.is_moe ? 1 : kernel_data.block_shape_m;
   tensor = tensor.view({-1, tensor.size(-1)});
-  return make_tma_desc(tensor, {64, tma_block_shape_m}, 128);
+  return make_tma_desc(tensor, {64, kernel_data.block_shape_m}, 128);
 }
 
 inline CUtensorMap make_tma_desc_bs(std::optional<Tensor> &tensor_, KernelData &kernel_data) {

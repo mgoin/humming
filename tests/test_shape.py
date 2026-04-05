@@ -115,7 +115,8 @@ def test_shape(
     )
 
     humming_kernel = HummingKernel(
-        problem_shape=(0, 1024, 1024),
+        shape_n=1024,
+        shape_k=1024,
         block_shape=block_shape,
         warp_shape=warp_shape,
         a_dtype=a_dtype,

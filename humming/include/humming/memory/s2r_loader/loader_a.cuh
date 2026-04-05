@@ -3,11 +3,11 @@
 #include <humming/utils/all.cuh>
 
 
-template <class MmaOpClass, class BlockShape, class WarpShape, class ElementA, class PipelineConfig>
+template <class MmaOpClass, class BlockShape, class WarpShape, class ElementA, class TuningConfig>
 class S2RMemoryLoaderA {
 private:
   using MmaShape = typename MmaOpClass::MmaShape;
-  static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
+  static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
   static constexpr uint32_t N_WARPS = BlockShape::N / WarpShape::N;

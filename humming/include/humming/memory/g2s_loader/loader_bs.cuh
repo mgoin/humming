@@ -6,23 +6,22 @@
 template <
     class ProblemShape, class BlockShape,
     class ElementBS,
-    class PipelineConfig, class QuantParamConfig, class MoEConfig>
+    class LayerConfig, class TuningConfig>
 class G2SMemoryLoaderBS {
 private:
-  static constexpr bool kUseWarpSpec = PipelineConfig::kUseWarpSpec;
-  static constexpr bool kUseTma = PipelineConfig::kUseTmaBS;
-  static constexpr bool kUseCpAsync = PipelineConfig::kUseCpAsync;
-  static constexpr bool kIsMoE = MoEConfig::kIsMoE;
-  static constexpr uint32_t kNumLoadThreads = PipelineConfig::kNumLoadThreads;
-  static constexpr uint32_t kLoadThreadOffset = PipelineConfig::kNumThreads - kNumLoadThreads;
+  static constexpr bool kUseWarpSpec = TuningConfig::kUseWarpSpec;
+  static constexpr bool kUseTma = TuningConfig::kUseTmaBS;
+  static constexpr bool kUseCpAsync = TuningConfig::kUseCpAsync;
+  static constexpr uint32_t kNumLoadThreads = TuningConfig::kNumLoadThreads;
+  static constexpr uint32_t kLoadThreadOffset = TuningConfig::kNumThreads - kNumLoadThreads;
 
-  static constexpr bool kIsChannel = QuantParamConfig::kIsChannelWeightScale;
-  static constexpr bool kIsGroup = QuantParamConfig::kIsGroupWeightScale;
-  static constexpr bool kIsBlock = QuantParamConfig::kIsBlockWeightScale;
-  static constexpr bool kIsTensor = QuantParamConfig::kIsTensorWeightScale;
+  static constexpr bool kIsChannel = LayerConfig::kIsChannelWeightScale;
+  static constexpr bool kIsGroup = LayerConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlock = LayerConfig::kIsBlockWeightScale;
+  static constexpr bool kIsTensor = LayerConfig::kIsTensorWeightScale;
   static constexpr bool kIsGroupOrBlock = kIsGroup || kIsBlock;
-  static constexpr uint32_t kGroupSize = !kIsGroupOrBlock ? ProblemShape::K : QuantParamConfig::kWeightScaleGroupSize;
-  static constexpr uint32_t kGroupSizeN = kIsBlock ? QuantParamConfig::kWeightScaleGroupSizeN : 1;
+  static constexpr uint32_t kGroupSize = !kIsGroupOrBlock ? ProblemShape::K : LayerConfig::kWeightScaleGroupSize;
+  static constexpr uint32_t kGroupSizeN = kIsBlock ? LayerConfig::kWeightScaleGroupSizeN : 1;
 
   static constexpr uint32_t kSmemStride = CEIL_DIV(BlockShape::N, kGroupSizeN) * ElementBS::kBits / 32 / 4;
   static constexpr uint32_t kGmemStride = ProblemShape::N * ElementBS::kBits / 32 / 4;
@@ -68,13 +67,13 @@ public:
     if constexpr (kIsBlock) {
       constexpr uint32_t kLoadStride = ProblemShape::N / kGroupSizeN;
       if (threadIdx.x < CEIL_DIV(BlockShape::K, kGroupSize) * CEIL_DIV(BlockShape::N, kGroupSizeN)) {
-        const uint32_t* gmem_ptr_load = reinterpret_cast<const uint32_t *>(gmem_ptr_raw);
-        uint32_t* smem_ptr_load = reinterpret_cast<uint32_t *>(smem_ptr);
+        const uint32_t *gmem_ptr_load = reinterpret_cast<const uint32_t *>(gmem_ptr_raw);
+        uint32_t *smem_ptr_load = reinterpret_cast<uint32_t *>(smem_ptr);
 
         const uint32_t gmem_row = row_offset + threadIdx.x / CEIL_DIV(BlockShape::N, kGroupSizeN);
         const uint32_t gmem_col = col_offset + threadIdx.x % CEIL_DIV(BlockShape::N, kGroupSizeN);
         uint32_t gmem_index = gmem_row * kLoadStride + gmem_col;
-        legacy_load<PipelineConfig::kUseCpAsync>(&gmem_ptr_load[gmem_index], &smem_ptr_load[threadIdx.x]);
+        legacy_load<TuningConfig::kUseCpAsync>(&gmem_ptr_load[gmem_index], &smem_ptr_load[threadIdx.x]);
       }
     } else {
       legacy_load_2d<
@@ -93,7 +92,7 @@ public:
 
   CUDA_INLINE
   void seek(uint32_t expert_id, uint32_t n_block_id, uint32_t k_block_id) {
-    row_offset = kIsMoE ? kProblemNumGroups * expert_id : 0;
+    row_offset = kProblemNumGroups * expert_id;
 
     if constexpr (kIsGroupOrBlock) {
       if constexpr (BlockShape::K >= kGroupSize) {

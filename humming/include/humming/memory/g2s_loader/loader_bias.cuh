@@ -3,15 +3,14 @@
 #include <humming/utils/all.cuh>
 
 
-template <class ProblemShape, class BlockShape, class PipelineConfig, class MoEConfig>
+template <class ProblemShape, class BlockShape, class TuningConfig>
 class G2SMemoryLoaderBias {
 private:
-  static constexpr bool kUseWarpSpec = PipelineConfig::kUseWarpSpec;
-  static constexpr bool kUseTma = PipelineConfig::kUseTmaBias;
-  static constexpr bool kUseCpAsync = PipelineConfig::kUseCpAsync;
-  static constexpr bool kIsMoE = MoEConfig::kIsMoE;
-  static constexpr uint32_t kNumLoadThreads = PipelineConfig::kNumLoadThreads;
-  static constexpr uint32_t kLoadThreadOffset = PipelineConfig::kNumThreads - kNumLoadThreads;
+  static constexpr bool kUseWarpSpec = TuningConfig::kUseWarpSpec;
+  static constexpr bool kUseTma = TuningConfig::kUseTmaBias;
+  static constexpr bool kUseCpAsync = TuningConfig::kUseCpAsync;
+  static constexpr uint32_t kNumLoadThreads = TuningConfig::kNumLoadThreads;
+  static constexpr uint32_t kLoadThreadOffset = TuningConfig::kNumThreads - kNumLoadThreads;
 
   static constexpr uint32_t kSmemStride = BlockShape::N * 16 / 32 / 4;
   static constexpr uint32_t kGmemStride = ProblemShape::N * 16 / 32 / 4;

@@ -28,13 +28,13 @@ def bench_marlin(
     has_zero_point: bool = False,
     shape_m_list: list[int] | None = None,
     is_moe_down: bool = False,
+    balanced: bool = False,
 ) -> list[dict[str, int | float]]:
     torch_dtype = dtypes.torch_dtype_map[dtypes.DataType.from_str(c_dtype)]
     layer = HummingLayer(
         shape_n=shape_n,
         shape_k=shape_k,
         num_experts=num_experts,
-        top_k=top_k,
         weight_config={
             "dtype": b_dtype,
             "group_size": weight_scale_group_size,
@@ -43,7 +43,6 @@ def bench_marlin(
         },
         input_config={"dtype": a_dtype},
         torch_dtype=torch_dtype,
-        is_moe_down=is_moe_down,
     ).to("cuda:0")
 
     for tensor in layer.parameters():
@@ -95,8 +94,9 @@ def bench_marlin(
                 num_experts=num_experts,
                 top_k=top_k,
                 block_size_config=block_size_m,
+                balanced=balanced,
             )
-            _, topk_weights, sorted_token_ids, expert_ids, num_tokens_padded = moe_tensors
+            _, _, sorted_ids, expert_ids, num_tokens_padded = moe_tensors
 
         def run_dense():
             return vllm_ops.marlin_gemm(
@@ -131,11 +131,11 @@ def bench_marlin(
                 g_idx=None,
                 perm=None,
                 workspace=layer.locks,
-                sorted_token_ids=sorted_token_ids,  # noqa
+                sorted_token_ids=sorted_ids,  # noqa
                 expert_ids=expert_ids,  # noqa
                 num_tokens_past_padded=num_tokens_padded,  # noqa
-                topk_weights=topk_weights,  # noqa
-                mul_topk_weights=is_moe_down,
+                topk_weights=None,  # noqa
+                mul_topk_weights=False,
                 b_q_type=vllm_scalar_type,
                 size_m=inputs.size(0),  # noqa
                 size_n=shape_n,
@@ -160,6 +160,7 @@ def bench_marlin(
             if num_experts is None:
                 nbytes += tensor.nbytes
             else:
+                assert expert_ids is not None
                 num_actived_experts = len(set(expert_ids.tolist()))
                 nbytes += tensor.nbytes // num_experts * num_actived_experts
 
@@ -190,6 +191,7 @@ def main():
     parser.add_argument("--num_experts", type=int, default=None)
     parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--is_moe_down", default=False, action="store_true")
+    parser.add_argument("--balanced", default=False, action="store_true")
     parser.add_argument("--shape_m_list", type=int, default=None, nargs="+")
     parser.add_argument("--output_file", type=str, default=None)
 

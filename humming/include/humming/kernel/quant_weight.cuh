@@ -242,7 +242,7 @@ __global__ void quant_weight(uint4 *in_ptr, uint4 *out_ptr, uint32_t *out_scale_
       if constexpr (kHasZeroPoint && !kIsFpZeroPoint) {
         zero_point_ptr[blockIdx.x] = static_cast<uint32_t>(zero_point);
       } else {
-        zero_point_ptr[blockIdx.x] = *reinterpret_cast<uint32_t*>(&zero_point_float);
+        zero_point_ptr[blockIdx.x] = *reinterpret_cast<uint32_t *>(&zero_point_float);
       }
     }
   } else {

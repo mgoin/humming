@@ -6,20 +6,19 @@
 template <
     class ProblemShape, class BlockShape,
     class ElementB,
-    class PipelineConfig, class QuantParamConfig, class MoEConfig>
+    class LayerConfig, class TuningConfig>
 class G2SMemoryLoaderBZP {
 private:
-  static constexpr bool kUseWarpSpec = PipelineConfig::kUseWarpSpec;
-  static constexpr bool kUseTma = PipelineConfig::kUseTmaBZP;
-  static constexpr bool kUseCpAsync = PipelineConfig::kUseCpAsync;
-  static constexpr bool kIsMoE = MoEConfig::kIsMoE;
-  static constexpr uint32_t kNumLoadThreads = PipelineConfig::kNumLoadThreads;
-  static constexpr uint32_t kLoadThreadOffset = PipelineConfig::kNumThreads - kNumLoadThreads;
+  static constexpr bool kUseWarpSpec = TuningConfig::kUseWarpSpec;
+  static constexpr bool kUseTma = TuningConfig::kUseTmaBZP;
+  static constexpr bool kUseCpAsync = TuningConfig::kUseCpAsync;
+  static constexpr uint32_t kNumLoadThreads = TuningConfig::kNumLoadThreads;
+  static constexpr uint32_t kLoadThreadOffset = TuningConfig::kNumThreads - kNumLoadThreads;
 
-  static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
-  static constexpr bool kIsChannel = QuantParamConfig::kIsChannelWeightScale;
-  static constexpr bool kIsGroup = QuantParamConfig::kIsGroupWeightScale;
-  static constexpr uint32_t kGroupSize = kIsGroup ? QuantParamConfig::kWeightScaleGroupSize : ProblemShape::K;
+  static constexpr bool kIsFpZeroPoint = LayerConfig::kIsFpZeroPoint;
+  static constexpr bool kIsChannel = LayerConfig::kIsChannelWeightScale;
+  static constexpr bool kIsGroup = LayerConfig::kIsGroupWeightScale;
+  static constexpr uint32_t kGroupSize = kIsGroup ? LayerConfig::kWeightScaleGroupSize : ProblemShape::K;
 
   static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementB::kBits));
   static constexpr uint32_t kSmemStride = BlockShape::N * kNumZPBits / 32 / 4;
@@ -67,7 +66,7 @@ public:
 
   CUDA_INLINE
   void advance() {
-    if (kIsGroupScale && (kLoadsPerGroup == 1 || counter == 0)) {
+    if (kIsGroup && (kLoadsPerGroup == 1 || counter == 0)) {
       row_offset += kNumGroups;
       gmem_ptr += kGmemStride * kNumGroups;
     }
@@ -75,7 +74,7 @@ public:
 
   CUDA_INLINE
   void seek(uint32_t expert_id, uint32_t n_block_id, uint32_t k_block_id) {
-    row_offset = kIsMoE ? kProblemNumGroups * expert_id : 0;
+    row_offset = kProblemNumGroups * expert_id;
     col_offset = n_block_id * (BlockShape::N * kNumZPBits / 32);
 
     if constexpr (kIsGroup) {

@@ -5,17 +5,19 @@
 
 template <
     class ProblemShape, class BlockShape, class PadShape,
-    class ElementA, class SchedulerConfig, class PipelineConfig, class MoEConfig>
+    class ElementA, class ComputeConfig, class TuningConfig>
 class G2SMemoryLoaderA {
 private:
-  static constexpr bool kUseWarpSpec = PipelineConfig::kUseWarpSpec;
-  static constexpr bool kUseTma = PipelineConfig::kUseTmaA;
-  static constexpr bool kUseCpAsync = PipelineConfig::kUseCpAsync;
-  static constexpr bool kIsMoE = MoEConfig::kIsMoE;
-  static constexpr uint32_t kNumLoadThreads = PipelineConfig::kNumLoadThreads;
-  static constexpr uint32_t kLoadThreadOffset = PipelineConfig::kNumThreads - kNumLoadThreads;
-  static constexpr uint32_t kMultiCastSizeA = PipelineConfig::kMultiCastSizeA;
-  static constexpr bool kUseMMajorScheduler = SchedulerConfig::kUseMMajorScheduler;
+  static constexpr bool kUseWarpSpec = TuningConfig::kUseWarpSpec;
+  static constexpr bool kUseTma = TuningConfig::kUseTmaA;
+  static constexpr bool kUseCpAsync = TuningConfig::kUseCpAsync;
+  static constexpr bool kIsDenseGemm = ComputeConfig::kGemmType == GemmType::DENSE;
+  static constexpr bool kIsIndexedGemm = ComputeConfig::kGemmType == GemmType::INDEXED;
+  static constexpr bool kIsGroupedGemm = ComputeConfig::kGemmType == GemmType::GROUPED_CONTIGUOUS || ComputeConfig::kGemmType == GemmType::GROUPED_MASKED;
+
+  static constexpr uint32_t kNumLoadThreads = TuningConfig::kNumLoadThreads;
+  static constexpr uint32_t kLoadThreadOffset = TuningConfig::kNumThreads - kNumLoadThreads;
+  static constexpr uint32_t kMultiCastSizeA = TuningConfig::kMultiCastSizeA;
 
   static constexpr uint32_t kSmemStride = BlockShape::K * ElementA::kBits / 32 / 4;
   static constexpr uint32_t kGmemStride = (ProblemShape::K - PadShape::K) * ElementA::kBits / 32 / 4;
@@ -33,7 +35,7 @@ public:
   const int4 *gmem_ptr;
 
   const uint32_t *row_index;
-  const uint32_t shape_m;
+  uint32_t shape_m;
   uint32_t block_shape_m;
   uint32_t load_row_index[kUseTma ? CEIL_DIV(BlockShape::M, kNumLoadThreads) : kLoadIters];
   uint32_t row_offset;
@@ -59,15 +61,6 @@ public:
 
   CUDA_INLINE
   void load_tma(int4 *smem_ptr, void *mbar_ptr) {
-    if constexpr (!kIsMoE) {
-      load_tma_dense(smem_ptr, mbar_ptr);
-    } else {
-      load_tma_moe(smem_ptr, mbar_ptr);
-    }
-  }
-
-  CUDA_INLINE
-  void load_tma_dense(int4 *smem_ptr, void *mbar_ptr) {
     if (thread_id < kNumTmaLoadsPerLine) {
       const uint32_t block_idx = thread_id;
       const uint32_t smem_offset = BlockShape::M * 8 * block_idx;
@@ -78,23 +71,6 @@ public:
         tma_load_2d<kMultiCastSizeA>(tensor_map_ptr, smem_ptr + smem_offset, mbar_ptr, col_offset2, row_offset);
       }
     }
-  }
-
-  CUDA_INLINE
-  void load_tma_moe(int4 *smem_ptr, void *mbar_ptr) {
-    PRAGMA_UNROLL
-    for (uint32_t i = 0; i < CEIL_DIV(BlockShape::M, kNumLoadThreads); i++) {
-      uint32_t row = thread_id + kNumLoadThreads * i;
-      if (row >= BlockShape::M) break;
-      uint32_t gmem_row = load_row_index[i];
-
-      PRAGMA_UNROLL
-      for (uint32_t block_idx = 0; i < kNumTmaLoadsPerLine; i++) {
-        const uint32_t smem_offset = row * (kSwizzleBytes / 16) + BlockShape::M * 8 * block_idx;
-        const uint32_t col_offset2 = col_offset + (1024 / ElementA::kBits) * block_idx;
-        tma_load_2d(tensor_map_ptr, smem_ptr + smem_offset, mbar_ptr, col_offset2, gmem_row);
-      }
-    };
   }
 
   CUDA_INLINE
@@ -120,12 +96,12 @@ public:
       uint32_t smem_swizzled_offset = smem_row * 8 + smem_swizzled_col;
 
       uint32_t gmem_col = smem_row / BlockShape::M * 8 + smem_col;
-      uint32_t gmem_row = kIsMoE ? load_row_index[i] : (smem_row % BlockShape::M);
+      uint32_t gmem_row = kIsIndexedGemm ? load_row_index[i] : (smem_row % BlockShape::M);
       uint32_t gmem_offset = gmem_row * kGmemStride + gmem_col;
 
       bool pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset) < (ProblemShape::K - PadShape::K);
       bool pred1 = kNumInt4s % kNumLoadThreads == 0 || i != kLoadIters - 1 || smem_offset < kNumInt4s;
-      bool pred2 = gmem_row < (kIsMoE ? shape_m : block_shape_m);
+      bool pred2 = gmem_row < (kIsIndexedGemm ? shape_m : block_shape_m);
 
       if constexpr (PadShape::K == 0) {
         legacy_load_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + smem_swizzled_offset, pred1 && pred2);
@@ -149,13 +125,13 @@ public:
       uint32_t smem_swizzled_offset = smem_row * 8 + smem_swizzled_col;
 
       uint32_t gmem_row = smem_row % (BlockShape::M / 2) * 2 + smem_col / 4;
-      gmem_row = kIsMoE ? load_row_index[i] : gmem_row;
+      gmem_row = kIsIndexedGemm ? load_row_index[i] : gmem_row;
       uint32_t gmem_col = smem_col % 4;
       uint32_t gmem_offset = gmem_row * kGmemStride + gmem_col;
 
       bool pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset) < (ProblemShape::K - PadShape::K);
       bool pred1 = kNumInt4s % kNumLoadThreads == 0 || i != kLoadIters - 1 || smem_offset < kNumInt4s;
-      bool pred2 = gmem_row < (kIsMoE ? shape_m : block_shape_m);
+      bool pred2 = gmem_row < (kIsIndexedGemm ? shape_m : block_shape_m);
       if constexpr (PadShape::K == 0) {
         legacy_load_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + smem_swizzled_offset, pred1 && pred2);
       } else {
@@ -171,23 +147,23 @@ public:
   }
 
   CUDA_INLINE
-  void seek(uint32_t m_block_id, uint32_t k_block_id) {
-    row_offset = m_block_id * BlockShape::M;
+  void seek(uint32_t m_block_id, uint32_t k_block_id, uint32_t current_shape_m, uint32_t m_offset) {
+    if constexpr (kIsGroupedGemm) {
+      shape_m = current_shape_m;
+      row_offset = m_offset;
+    } else {
+      row_offset = m_block_id * BlockShape::M;
+    }
     col_offset = k_block_id * BlockShape::K;
-    block_shape_m = shape_m - row_offset;
+    block_shape_m = MIN(shape_m - row_offset, BlockShape::M);
 
     uint32_t gmem_offset = k_block_id * kSmemStride;
-    gmem_offset += kIsMoE ? 0 : (m_block_id * (kGmemStride * BlockShape::M));
+    gmem_offset += kIsIndexedGemm ? 0 : (row_offset * kGmemStride);
     gmem_ptr = gmem_ptr_raw + gmem_offset;
 
-    if constexpr (kIsMoE && kUseTma) {
-      static_assert(CEIL_DIV(BlockShape::M, kNumLoadThreads) == 1);
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < CEIL_DIV(BlockShape::M, kNumLoadThreads); i++) {
-        uint32_t row = thread_id + kNumLoadThreads * i;
-        if (row < BlockShape::M) load_row_index[i] = row_index[row];
-      }
-    } else if constexpr (kIsMoE && !kUseTma) {
+    if constexpr (kIsIndexedGemm) {
+      static_assert(!kUseTma);
+
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kLoadIters; i++) {
         uint32_t smem_offset = i * kNumLoadThreads + thread_id;

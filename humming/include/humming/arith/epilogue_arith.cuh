@@ -10,25 +10,24 @@ template <
     class MmaOpClass,
     class BlockShape, class WarpShape,
     class ElementA, class ElementB, class ElementC, class ElementBS,
-    class SchedulerConfig, class EpilogueConfig, class QuantParamConfig, class MoEConfig>
+    class LayerConfig, class TuningConfig>
 class EpilogueArithmetic : F16Conversion<ElementC> {
 private:
   using scalar_t = typename F16Conversion<ElementC>::scalar_t;
   using scalar_t2 = typename F16Conversion<ElementC>::scalar_t2;
 
-  static constexpr bool kUseStreamK = SchedulerConfig::kUseStreamK;
+  static constexpr bool kUseStreamK = TuningConfig::kUseStreamK;
   static constexpr bool kIsF16Accum = MmaOpClass::kCTypeBits == 16;
-  static constexpr bool kHasBias = EpilogueConfig::kHasBias;
+  static constexpr bool kHasBias = LayerConfig::kHasBias;
   static constexpr bool kHasInputScale = ElementA::kBits != 16;
-  static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
-  static constexpr bool kIsChannelInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
-  static constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
-  static constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
-  static constexpr bool kIsChannelWeightScale = QuantParamConfig::kIsChannelWeightScale;
-  static constexpr bool kIsTensorWeightScale = QuantParamConfig::kIsTensorWeightScale;
+  static constexpr bool kIsGroupInputScale = kHasInputScale && LayerConfig::kInputScaleGroupSize > 0;
+  static constexpr bool kIsChannelInputScale = kHasInputScale && LayerConfig::kInputScaleGroupSize == 0;
+  static constexpr bool kIsGroupWeightScale = LayerConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlockWeightScale = LayerConfig::kIsBlockWeightScale;
+  static constexpr bool kIsChannelWeightScale = LayerConfig::kIsChannelWeightScale;
+  static constexpr bool kIsTensorWeightScale = LayerConfig::kIsTensorWeightScale;
   static constexpr bool kIsGroupOrBlockWeightScale = kIsGroupWeightScale || kIsBlockWeightScale;
-  static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
-  static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
+  static constexpr bool kHasZeroPoint = LayerConfig::kHasZeroPoint;
 
   static constexpr uint2 kExpOffset = get_epilogue_exp_offset<
       ElementA, ElementB, ElementC, ElementBS, kHasZeroPoint,
@@ -44,7 +43,6 @@ public:
   uint32_t bs[MAX(kSizeBS, 2)];
   uint32_t dq_bs[MAX(kSizeDequantBS, 4)];
   uint32_t bias[kSizeBias];
-  uint32_t topk_weights[kSizeAS];
   uint32_t gs = 0;
   uint32_t _dummy;
 
@@ -81,8 +79,8 @@ public:
   CUDA_INLINE
   void may_process_on_smem_write(uint32_t row, uint32_t col) {
     if (kIsTensorWeightScale && kIsF16Accum && row == 0 && col == 0) {
-      scalar_t2& gs_scalar2 = *reinterpret_cast<scalar_t2*>(&gs);
-      gs_scalar2 = this->float2num2(*reinterpret_cast<float*>(&gs));
+      scalar_t2 &gs_scalar2 = *reinterpret_cast<scalar_t2 *>(&gs);
+      gs_scalar2 = this->float2num2(*reinterpret_cast<float *>(&gs));
 
       if constexpr (kExpOffset.x) {
         gs_scalar2 = gs_scalar2 * prepare_exp_scale_factor<scalar_t2, kExpOffset.x>();
@@ -90,7 +88,7 @@ public:
     }
     if constexpr (kIsChannelInputScale && kIsF16Accum) {
       if (row == 0 && col == 0) {
-        scalar_t2& gs_scalar2 = *reinterpret_cast<scalar_t2*>(&gs);
+        scalar_t2 &gs_scalar2 = *reinterpret_cast<scalar_t2 *>(&gs);
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < kSizeAS; i++) {
           reinterpret_cast<scalar_t2 *>(as)[i] = this->float2num2(reinterpret_cast<float *>(as)[i]);
@@ -99,15 +97,6 @@ public:
         };
       };
     }
-
-    if constexpr (kIsMoEDown) {
-      if (row == 0 && col == 0) {
-        PRAGMA_UNROLL
-        for (uint32_t i = 0; i < kSizeAS; i++) {
-          reinterpret_cast<scalar_t2 *>(topk_weights)[i] = this->float2num2(reinterpret_cast<float *>(topk_weights)[i]);
-        };
-      };
-    };
 
     if constexpr (kIsChannelWeightScale && ElementBS::kBits == 8) {
       if (row == 0 && col == 0) {
@@ -174,11 +163,6 @@ public:
     if constexpr (kIsF16Accum && kHasBias) {
       regs_half2[0] = __hadd2(regs_half2[0], bias_half2[col]);
     }
-
-    if constexpr (kIsMoEDown) {
-      scalar_t2 score = *reinterpret_cast<scalar_t2 *>(&topk_weights[row]);
-      regs_half2[0] = __hmul2(regs_half2[0], score);
-    }
   };
 
   template <class T = uint32_t>
@@ -194,10 +178,5 @@ public:
   template <class T = uint32_t>
   CUDA_INLINE T *regs_bias_as_ptr() {
     return reinterpret_cast<T *>(bias);
-  };
-
-  template <class T = uint32_t>
-  CUDA_INLINE T *regs_topk_weights_as_ptr() {
-    return reinterpret_cast<T *>(topk_weights);
   };
 };

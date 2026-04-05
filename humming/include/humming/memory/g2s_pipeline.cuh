@@ -8,44 +8,40 @@
 #include <humming/memory/g2s_loader/loader_bias.cuh>
 #include <humming/memory/g2s_loader/loader_bs.cuh>
 #include <humming/memory/g2s_loader/loader_bzp.cuh>
-#include <humming/memory/g2s_loader/loader_topk_weights.cuh>
 
 
 template <
     class SharedStorage,
     class ProblemShape, class BlockShape, class PadShape,
     class ElementA, class ElementB, class ElementBS,
-    class SchedulerConfig, class PipelineConfig, class EpilogueConfig,
-    class QuantParamConfig, class MoEConfig>
+    class LayerConfig, class ComputeConfig, class TuningConfig>
 class ProducerPipeline {
 private:
-  static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
-  static constexpr uint32_t kNumLoadThreads = PipelineConfig::kNumLoadThreads;
-  static constexpr uint32_t kNumMathThreads = PipelineConfig::kNumMathThreads;
+  static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
+  static constexpr uint32_t kNumLoadThreads = TuningConfig::kNumLoadThreads;
+  static constexpr uint32_t kNumMathThreads = TuningConfig::kNumMathThreads;
   static constexpr uint32_t kLoadThreadOffset = kNumThreads - kNumLoadThreads;
 
-  static constexpr bool kUseMBarrier = PipelineConfig::kUseMBarrier;
-  static constexpr bool kUseCpAsync = PipelineConfig::kUseCpAsync;
-  static constexpr bool kUseTma = PipelineConfig::kUseTma;
-  static constexpr bool kUseTmaA = PipelineConfig::kUseTmaA;
-  static constexpr bool kUseTmaB = PipelineConfig::kUseTmaB;
-  static constexpr bool kUseTmaBS = PipelineConfig::kUseTmaBS;
-  static constexpr bool kUseTmaBZP = PipelineConfig::kUseTmaBZP;
-  static constexpr bool kUseTmaBias = PipelineConfig::kUseTmaBias;
+  static constexpr bool kUseMBarrier = TuningConfig::kUseMBarrier;
+  static constexpr bool kUseCpAsync = TuningConfig::kUseCpAsync;
+  static constexpr bool kUseTma = TuningConfig::kUseTma;
+  static constexpr bool kUseTmaA = TuningConfig::kUseTmaA;
+  static constexpr bool kUseTmaB = TuningConfig::kUseTmaB;
+  static constexpr bool kUseTmaBS = TuningConfig::kUseTmaBS;
+  static constexpr bool kUseTmaBZP = TuningConfig::kUseTmaBZP;
+  static constexpr bool kUseTmaBias = TuningConfig::kUseTmaBias;
 
   static constexpr bool kHasInputScale = ElementA::kBits != 16;
-  static constexpr bool kIsChannelInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
-  static constexpr bool kIsGroupInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize > 0;
-  static constexpr bool kIsChannelWeightScale = QuantParamConfig::kIsChannelWeightScale;
-  static constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
-  static constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
-  static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
-  static constexpr bool kHasBias = EpilogueConfig::kHasBias;
-  static constexpr bool kIsMoE = MoEConfig::kIsMoE;
-  static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
-  static constexpr bool kHasChannelData = kIsChannelInputScale || kIsChannelWeightScale || kHasBias || kIsMoEDown;
+  static constexpr bool kIsChannelInputScale = kHasInputScale && LayerConfig::kInputScaleGroupSize == 0;
+  static constexpr bool kIsGroupInputScale = kHasInputScale && LayerConfig::kInputScaleGroupSize > 0;
+  static constexpr bool kIsChannelWeightScale = LayerConfig::kIsChannelWeightScale;
+  static constexpr bool kIsGroupWeightScale = LayerConfig::kIsGroupWeightScale;
+  static constexpr bool kIsBlockWeightScale = LayerConfig::kIsBlockWeightScale;
+  static constexpr bool kHasZeroPoint = LayerConfig::kHasZeroPoint;
+  static constexpr bool kHasBias = LayerConfig::kHasBias;
+  static constexpr bool kHasChannelData = kIsChannelInputScale || kIsChannelWeightScale || kHasBias;
 
-  static constexpr uint32_t kNumStages = PipelineConfig::kNumStages;
+  static constexpr uint32_t kNumStages = TuningConfig::kNumStages;
 
   template <bool kIsFirst = false>
   static constexpr uint2 get_stage_load_bytes() {
@@ -93,8 +89,6 @@ private:
       else legacy_load_bytes += sizeof(smem.bias);
     }
 
-    if constexpr (kIsMoEDown) legacy_load_bytes += sizeof(smem.topk_weights);
-
     return {tma_load_bytes, legacy_load_bytes};
   }
 
@@ -105,17 +99,16 @@ public:
   static constexpr bool kHasStageCpAsyncMBarrier = get_stage_load_bytes().y > 0;
   static constexpr bool kHasChannelTmaMBarrier = get_channel_load_bytes().x > 0;
   static constexpr bool kHasChannelCpAsyncMBarrier = get_channel_load_bytes().y > 0;
-  static constexpr uint32_t kMultiCastSizeA = PipelineConfig::kMultiCastSizeA;
-  static constexpr uint32_t kMultiCastSizeB = PipelineConfig::kMultiCastSizeB;
+  static constexpr uint32_t kMultiCastSizeA = TuningConfig::kMultiCastSizeA;
+  static constexpr uint32_t kMultiCastSizeB = TuningConfig::kMultiCastSizeB;
   static constexpr uint32_t kMultiCastSize = kMultiCastSizeA * kMultiCastSizeB;
 
-  using LoaderA = G2SMemoryLoaderA<ProblemShape, BlockShape, PadShape, ElementA, SchedulerConfig, PipelineConfig, MoEConfig>;
-  using LoaderB = G2SMemoryLoaderB<ProblemShape, BlockShape, ElementA, ElementB, SchedulerConfig, PipelineConfig, MoEConfig>;
-  using LoaderAS = G2SMemoryLoaderAS<ProblemShape, BlockShape, PadShape, ElementA, PipelineConfig, QuantParamConfig, MoEConfig>;
-  using LoaderBS = G2SMemoryLoaderBS<ProblemShape, BlockShape, ElementBS, PipelineConfig, QuantParamConfig, MoEConfig>;
-  using LoaderBZP = G2SMemoryLoaderBZP<ProblemShape, BlockShape, ElementB, PipelineConfig, QuantParamConfig, MoEConfig>;
-  using LoaderBias = G2SMemoryLoaderBias<ProblemShape, BlockShape, PipelineConfig, MoEConfig>;
-  using LoaderTopkWeights = G2SMemoryLoaderTopKWeights<BlockShape, MoEConfig>;
+  using LoaderA = G2SMemoryLoaderA<ProblemShape, BlockShape, PadShape, ElementA, ComputeConfig, TuningConfig>;
+  using LoaderB = G2SMemoryLoaderB<ProblemShape, BlockShape, ElementA, ElementB, ComputeConfig, TuningConfig>;
+  using LoaderAS = G2SMemoryLoaderAS<ProblemShape, BlockShape, PadShape, ElementA, LayerConfig, ComputeConfig, TuningConfig>;
+  using LoaderBS = G2SMemoryLoaderBS<ProblemShape, BlockShape, ElementBS, LayerConfig, TuningConfig>;
+  using LoaderBZP = G2SMemoryLoaderBZP<ProblemShape, BlockShape, ElementB, LayerConfig, TuningConfig>;
+  using LoaderBias = G2SMemoryLoaderBias<ProblemShape, BlockShape, TuningConfig>;
 
   SharedStorage &smem;
   LoaderA loader_a;
@@ -124,8 +117,7 @@ public:
   LoaderBS loader_bs;
   LoaderBZP loader_bzp;
   LoaderBias loader_bias;
-  LoaderTopkWeights loader_topk_weights;
-  uint32_t phases[PipelineConfig::kNumStages + 1] = {0};
+  uint32_t phases[TuningConfig::kNumStages + 1] = {0};
   const uint32_t thread_id = threadIdx.x - kLoadThreadOffset;
   uint32_t cluster_rank = blockIdx.x % kMultiCastSize;
 
@@ -138,7 +130,6 @@ public:
       const void *void_ptr_bs,
       const void *void_ptr_bzp,
       const void *void_ptr_bias,
-      const void *void_ptr_topk_weights,
       uint32_t shape_m)
       : smem(smem),
         loader_a(void_ptr_a, smem.rd_row_index, shape_m),
@@ -146,8 +137,7 @@ public:
         loader_as(void_ptr_as, smem.rd_row_index, shape_m),
         loader_bs(void_ptr_bs),
         loader_bzp(void_ptr_bzp),
-        loader_bias(void_ptr_bias),
-        loader_topk_weights(void_ptr_topk_weights, smem.rd_row_index, shape_m) {
+        loader_bias(void_ptr_bias) {
 
     if (thread_id == 0) {
       if constexpr (kUseTmaA) prefetch_tensor_map(void_ptr_a);
@@ -178,7 +168,7 @@ public:
 
       if (thread_id < kNumStages + 2) __mbarrier_init(&smem.load_mbar[thread_id], count);
       uint32_t factor = (kMultiCastSize > 1 && cluster_rank == 0) ? kMultiCastSize : 1;
-      if (thread_id < kNumStages + 1) __mbarrier_init(&smem.math_mbar[thread_id], PipelineConfig::kNumMathThreads * factor / 32);
+      if (thread_id < kNumStages + 1) __mbarrier_init(&smem.math_mbar[thread_id], TuningConfig::kNumMathThreads * factor / 32);
     }
   }
 
@@ -215,7 +205,6 @@ public:
     if constexpr (kIsChannelInputScale) loader_as.load(smem.as_c, &smem.load_mbar[kNumStages + 1]);
     if constexpr (kIsChannelWeightScale) loader_bs.load(smem.bs_c, &smem.load_mbar[kNumStages + 1]);
     if constexpr (kHasBias) loader_bias.load(smem.bias, &smem.load_mbar[kNumStages + 1]);
-    if constexpr (kIsMoEDown) loader_topk_weights.load(smem.topk_weights);
 
     constexpr uint2 load_bytes = get_channel_load_bytes();
     if constexpr (load_bytes.x > 0 || load_bytes.y > 0) {
@@ -251,45 +240,44 @@ public:
     }
   }
 
-  CUDA_INLINE void seek(uint32_t expert_id, uint32_t m_block_id, uint32_t n_block_id, uint32_t k_block_id) {
-    loader_a.seek(m_block_id, k_block_id);
+  CUDA_INLINE void seek(
+      uint32_t expert_id, uint32_t m_block_id, uint32_t n_block_id, uint32_t k_block_id,
+      uint32_t current_shape_m, uint32_t m_offset) {
+    loader_a.seek(m_block_id, k_block_id, current_shape_m, m_offset);
     loader_b.seek(expert_id, n_block_id, k_block_id);
-    loader_as.seek(m_block_id, k_block_id);
+    loader_as.seek(m_block_id, k_block_id, current_shape_m, m_offset);
     loader_bs.seek(expert_id, n_block_id, k_block_id);
     loader_bzp.seek(expert_id, n_block_id, k_block_id);
     loader_bias.seek(expert_id, n_block_id);
-    loader_topk_weights.seek();
   }
 };
 
 
 template <
     class SharedStorage, class ElementA,
-    class PipelineConfig, class EpilogueConfig,
-    class QuantParamConfig, class MoEConfig>
+    class LayerConfig, class TuningConfig>
 class ConsumerPipeline {
 private:
-  static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
-  static constexpr uint32_t kNumMathThreads = PipelineConfig::kNumMathThreads;
+  static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
+  static constexpr uint32_t kNumMathThreads = TuningConfig::kNumMathThreads;
 
-  static constexpr bool kUseMBarrier = PipelineConfig::kUseMBarrier;
-  static constexpr bool kUseCpAsync = PipelineConfig::kUseCpAsync;
+  static constexpr bool kUseMBarrier = TuningConfig::kUseMBarrier;
+  static constexpr bool kUseCpAsync = TuningConfig::kUseCpAsync;
 
   static constexpr bool kHasInputScale = ElementA::kBits != 16;
-  static constexpr bool kIsChannelInputScale = kHasInputScale && QuantParamConfig::kInputScaleGroupSize == 0;
-  static constexpr bool kIsChannelWeightScale = QuantParamConfig::kIsChannelWeightScale;
-  static constexpr bool kHasBias = EpilogueConfig::kHasBias;
-  static constexpr bool kIsMoEDown = MoEConfig::kIsMoEDown;
-  static constexpr bool kHasChannelData = kIsChannelInputScale || kIsChannelWeightScale || kHasBias || kIsMoEDown;
+  static constexpr bool kIsChannelInputScale = kHasInputScale && LayerConfig::kInputScaleGroupSize == 0;
+  static constexpr bool kIsChannelWeightScale = LayerConfig::kIsChannelWeightScale;
+  static constexpr bool kHasBias = LayerConfig::kHasBias;
+  static constexpr bool kHasChannelData = kIsChannelInputScale || kIsChannelWeightScale || kHasBias;
 
-  static constexpr uint32_t kNumStages = PipelineConfig::kNumStages;
-  static constexpr uint32_t kMultiCastSizeA = PipelineConfig::kMultiCastSizeA;
-  static constexpr uint32_t kMultiCastSizeB = PipelineConfig::kMultiCastSizeB;
+  static constexpr uint32_t kNumStages = TuningConfig::kNumStages;
+  static constexpr uint32_t kMultiCastSizeA = TuningConfig::kMultiCastSizeA;
+  static constexpr uint32_t kMultiCastSizeB = TuningConfig::kMultiCastSizeB;
   static constexpr uint32_t kMultiCastSize = kMultiCastSizeA * kMultiCastSizeB;
 
 public:
   SharedStorage &smem;
-  uint32_t phases[PipelineConfig::kNumStages + 2] = {0};
+  uint32_t phases[TuningConfig::kNumStages + 2] = {0};
   uint32_t cluster_rank = blockIdx.x % kMultiCastSize;
   const uint32_t lane_id = threadIdx.x % 32;
 
@@ -334,7 +322,7 @@ public:
       mbarrier_arrive(&smem.math_mbar[stage_id]);
       if constexpr (kMultiCastSize > 1) {
         if (cluster_rank >= 1) {
-          void* aa = __cluster_map_shared_rank(&smem.math_mbar[stage_id], 0);
+          void *aa = __cluster_map_shared_rank(&smem.math_mbar[stage_id], 0);
           mbarrier_arrive<true>(aa);
         }
       }

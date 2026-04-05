@@ -1,23 +1,24 @@
 import dataclasses
+import json
 import os
 import zlib
-from typing import Any, ClassVar
+from concurrent.futures import ThreadPoolExecutor
+from typing import ClassVar
 
 import jinja2
 
 import humming.jit.utils as jit_utils
 from humming import dtypes
 from humming.config import (
-    EpilogueConfig,
-    MmaConfig,
+    ComputeConfig,
+    GemmType,
+    LayerConfig,
     MmaOpClass,
     MmaType,
-    MoEConfig,
-    PipelineConfig,
-    QuantParamConfig,
-    SchedulerConfig,
+    TuningConfig,
 )
 from humming.jit.runtime import KernelRuntime
+from humming.tune import get_heuristics_config
 
 CODE_TEMPLATE = jinja2.Template("""
 #if {{use_warp_spec}}
@@ -31,29 +32,19 @@ public:
 {{mma_op_class}}
 };
 
-class SchedulerConfig {
+class LayerConfig {
 public:
-{{scheduler_config}}
+{{layer_config}}
 };
 
-class PipelineConfig {
+class ComputeConfig {
 public:
-{{pipeline_config}}
+{{compute_config}}
 };
 
-class EpilogueConfig {
+class TuningConfig {
 public:
-{{epilogue_config}}
-};
-
-class QuantParamConfig {
-public:
-{{quant_param_config}}
-};
-
-class MoEConfig {
-public:
-{{moe_config}}
+{{tuning_config}}
 };
 
 using SharedStorageType = SharedStorage<
@@ -63,10 +54,9 @@ using SharedStorageType = SharedStorage<
     {{a_dtype}},
     {{b_dtype}},
     {{bs_dtype}},
-    PipelineConfig,
-    EpilogueConfig,
-    QuantParamConfig,
-    MoEConfig>;
+    LayerConfig,
+    ComputeConfig,
+    TuningConfig>;
 
 auto ptr = reinterpret_cast<void*>(&humming<
     MmaOpClass,
@@ -78,11 +68,9 @@ auto ptr = reinterpret_cast<void*>(&humming<
     {{b_dtype}},
     {{c_dtype}},
     {{bs_dtype}},
-    SchedulerConfig,
-    PipelineConfig,
-    EpilogueConfig,
-    QuantParamConfig,
-    MoEConfig>);
+    LayerConfig,
+    ComputeConfig,
+    TuningConfig>);
 
 
 extern "C" __constant__ uint32_t SMEM_SIZE = sizeof(SharedStorageType);
@@ -101,116 +89,59 @@ extern "C" __constant__ uint32_t WARP_SHAPE_M = {{warp_shape[0]}};
 extern "C" __constant__ uint32_t WARP_SHAPE_N = {{warp_shape[1]}};
 extern "C" __constant__ uint32_t WARP_SHAPE_K = {{warp_shape[2]}};
 
-extern "C" __constant__ uint32_t PAD_SHAPE_N = {{pad_shape[1]}};
-extern "C" __constant__ uint32_t PAD_SHAPE_K = {{pad_shape[2]}};
-
 extern "C" __constant__ uint32_t A_DTYPE_ID = {{a_dtype}}::kId;
 extern "C" __constant__ uint32_t B_DTYPE_ID = {{b_dtype}}::kId;
 extern "C" __constant__ uint32_t C_DTYPE_ID = {{c_dtype}}::kId;
 extern "C" __constant__ uint32_t BS_DTYPE_ID = {{bs_dtype}}::kId;
 
-{{scheduler_config_extern}}
+{{layer_config_extern}}
 
-{{pipeline_config_extern}}
+{{compute_config_extern}}
 
-{{epilogue_config_extern}}
-
-{{quant_param_config_extern}}
-
-{{moe_config_extern}}
+{{tuning_config_extern}}
 
 """)
 
 
 @dataclasses.dataclass(kw_only=True)
-class HummingKernel(
-    KernelRuntime,
-    SchedulerConfig,
-    PipelineConfig,
-    EpilogueConfig,
-    QuantParamConfig,
-    MoEConfig,
-    MmaConfig,
-):
+class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
     name: ClassVar[str] = "humming"
-    problem_shape: tuple[int, int, int]
-    block_shape: tuple[int, int, int]
-    warp_shape: tuple[int, int, int]
-    pad_shape: tuple[int, int, int] = (0, 0, 0)
-    a_dtype: dtypes.DataType
-    b_dtype: dtypes.DataType
-    c_dtype: dtypes.DataType
-    bs_dtype: dtypes.DataType
+    _str2kernel_cache: ClassVar[dict[tuple[str, str, str], int | list[int]]] = {}
+
+    def __post_init__(self):
+        LayerConfig.__post_init__(self)
+        ComputeConfig.__post_init__(self)
+        TuningConfig.__post_init__(self)
+        KernelRuntime.__post_init__(self)
 
     def init_kernel(self) -> None:
-        for key in ["a_dtype", "b_dtype", "c_dtype", "bs_dtype"]:
-            dtype = getattr(self, key)
-            if isinstance(dtype, str):
-                setattr(self, key, dtypes.DataType.from_str(dtype))
-
-        self.scheduler_config = SchedulerConfig.from_dict(vars(self))
-        self.pipeline_config = PipelineConfig.from_dict(vars(self))
-        self.epilogue_config = EpilogueConfig.from_dict(vars(self))
-        self.quant_param_config = QuantParamConfig.from_dict(vars(self))
-        self.moe_config = MoEConfig.from_dict(vars(self))
-        self.mma_config = MmaConfig.from_dict(vars(self))
-        name_list = ["scheduler", "pipeline", "epilogue", "quant_param", "moe", "mma"]
-        for name in name_list:
-            config = getattr(self, name + "_config")
-            for key, value in vars(config).items():
-                setattr(self, key, value)
-
         self.check_shape()
         self.check_dtype()
         self.check_scale()
         self.check_config()
         self.mma_op_class = self.select_mma_op_class()
 
-        assert isinstance(self.pipeline_config.use_warp_spec, bool)
-
+        assert self.bs_dtype is not None
         self.code = CODE_TEMPLATE.render(
-            use_warp_spec=int(self.pipeline_config.use_warp_spec),
+            use_warp_spec=int(self.use_warp_spec or False),
             mma_op_class=self.mma_op_class.to_cpp_str(),
             problem_shape=self.problem_shape,
+            pad_shape=self.pad_shape,
             block_shape=self.block_shape,
             warp_shape=self.warp_shape,
-            pad_shape=self.pad_shape,
+            layer_config=self.to_cpp_str(LayerConfig),
+            compute_config=self.to_cpp_str(ComputeConfig),
+            tuning_config=self.to_cpp_str(TuningConfig),
+            layer_config_extern=self.to_extern_cpp_str(LayerConfig),
+            compute_config_extern=self.to_extern_cpp_str(ComputeConfig),
+            tuning_config_extern=self.to_extern_cpp_str(TuningConfig),
             a_dtype=self.a_dtype.to_cpp_str(),
             b_dtype=self.b_dtype.to_cpp_str(),
             c_dtype=self.c_dtype.to_cpp_str(),
             bs_dtype=self.bs_dtype.to_cpp_str(),
-            scheduler_config=self.scheduler_config.to_cpp_str(),
-            pipeline_config=self.pipeline_config.to_cpp_str(),
-            epilogue_config=self.epilogue_config.to_cpp_str(),
-            quant_param_config=self.quant_param_config.to_cpp_str(),
-            moe_config=self.moe_config.to_cpp_str(),
-            scheduler_config_extern=self.scheduler_config.to_extern_cpp_str(),
-            pipeline_config_extern=self.pipeline_config.to_extern_cpp_str(),
-            epilogue_config_extern=self.epilogue_config.to_extern_cpp_str(),
-            quant_param_config_extern=self.quant_param_config.to_extern_cpp_str(),
-            moe_config_extern=self.moe_config.to_extern_cpp_str(),
         )
 
         self.prepare()
-
-    @classmethod
-    def from_config(cls, config: dict[str, Any]):
-        raise NotImplementedError
-
-    def check_kwarg_keys(self, keys):
-        def get_field_names(c):
-            return [x.name for x in dataclasses.fields(c)]
-
-        valid_keys = ["pad_shape"]
-        valid_keys += get_field_names(SchedulerConfig)
-        valid_keys += get_field_names(PipelineConfig)
-        valid_keys += get_field_names(EpilogueConfig)
-        valid_keys += get_field_names(QuantParamConfig)
-        valid_keys += get_field_names(MoEConfig)
-        valid_keys += get_field_names(MmaConfig)
-        valid_keys = [x for x in valid_keys if not x.endswith("_threads")]
-        invalid_keys = set(keys) - set(valid_keys)
-        assert not invalid_keys, f"{invalid_keys}"
 
     def load_cubin(self):
         from humming import ops
@@ -230,24 +161,24 @@ class HummingKernel(
     def select_mma_op_class(self):
         if self.a_dtype in [dtypes.int4, dtypes.int8]:
             mma_cd_dtype = dtypes.int32
-        elif self.mma_config.use_f16_accum:
+        elif self.use_f16_accum:
             mma_cd_dtype = self.c_dtype
         else:
             mma_cd_dtype = dtypes.float32
 
-        mma_shape_m = 64 if self.mma_config.mma_type == MmaType.WGMMA else 16
-        mma_shape_n = self.warp_shape[0] if self.mma_config.mma_type == MmaType.WGMMA else 8
+        mma_shape_m = 64 if self.mma_type == MmaType.WGMMA else 16
+        mma_shape_n = self.warp_shape[0] if self.mma_type == MmaType.WGMMA else 8
         mma_shape_k = 256 // self.a_dtype.num_bits
         if self.sm_version == 75 and self.a_dtype == dtypes.int8:
             mma_shape_m = 8
 
-        if self.mma_config.mma_type == MmaType.MMA and self.warp_shape[0] % 16 == 8:
+        if self.mma_type == MmaType.MMA and self.warp_shape[0] % 16 == 8:
             mma_shape_m = 8
 
-        if self.mma_config.mma_type == MmaType.MMA and mma_shape_m == 8:
+        if self.mma_type == MmaType.MMA and mma_shape_m == 8:
             mma_shape_k = mma_shape_k // 2
 
-        if self.mma_config.mma_type == MmaType.WGMMA:
+        if self.mma_type == MmaType.WGMMA:
             assert self.warp_shape[0] % mma_shape_n == 0
             assert self.warp_shape[1] % (mma_shape_m // 4) == 0
         else:
@@ -256,7 +187,7 @@ class HummingKernel(
         assert self.warp_shape[2] % mma_shape_k == 0
 
         return MmaOpClass.from_config(
-            self.mma_config.mma_type,
+            self.mma_type,
             mma_shape_m,
             mma_shape_n,
             mma_shape_k,
@@ -333,7 +264,7 @@ class HummingKernel(
                 assert not self.b_dtype.is_signed
         elif self.b_dtype.is_integer_type and self.a_dtype.is_floating_point_type:
             assert not self.b_dtype.is_signed
-            if self.quant_param_config.has_zero_point:
+            if self.has_zero_point:
                 assert self.b_dtype.num_bits <= self.a_dtype.mantissa_bits + 1
             else:
                 assert self.b_dtype.num_bits <= self.a_dtype.mantissa_bits + 2
@@ -343,28 +274,28 @@ class HummingKernel(
             assert self.b_dtype.mantissa_bits <= self.a_dtype.mantissa_bits
             assert self.b_dtype.exponent_bits >= 1
         elif self.b_dtype.is_floating_point_type and not self.a_dtype.is_integer_type:
-            # not implemented yet
             raise NotImplementedError
 
-        if self.mma_config.use_f16_accum:
+        if self.use_f16_accum:
             if self.a_dtype == dtypes.float8e4m3:
                 assert self.b_dtype.is_integer_type or self.b_dtype.exponent_bits <= 4
             else:
                 assert self.a_dtype == dtypes.float16
 
     def check_config(self):
-        # 16-bit activation don't support input scale
-        # for 8bit/4-bit activation, we enable input scale by default
-        if self.pipeline_config.use_warp_spec or self.pipeline_config.use_tma:
-            assert self.pipeline_config.use_mbarrier
-        is_channel_weight_scale = self.quant_param_config.is_channel_weight_scale
-        is_group_weight_scale = self.quant_param_config.is_group_weight_scale
+        if self.use_warp_spec or self.use_tma:
+            assert self.use_mbarrier
+        is_channel_weight_scale = self.is_channel_weight_scale
+        is_group_weight_scale = self.is_group_weight_scale
         if not (is_channel_weight_scale or is_group_weight_scale):
-            self.pipeline_config.use_tma_bs = False
-        if not self.quant_param_config.has_zero_point:
-            self.pipeline_config.use_tma_bzp = False
-        if not self.epilogue_config.has_bias:
-            self.pipeline_config.use_tma_bias = False
+            self.use_tma_bs = False
+        if not self.has_zero_point:
+            self.use_tma_bzp = False
+        if not self.has_bias:
+            self.use_tma_bias = False
+        if self.gemm_type is None and self.num_experts == 0:
+            self.gemm_type = GemmType.DENSE
+        assert self.gemm_type is not None, "gemm_type must be specify for MoE GEMM"
 
     def __call__(self):
         msg = (
@@ -372,3 +303,74 @@ class HummingKernel(
             "please use humming.ops.launch_kernel([kernel.kernel_id], ...) instead."
         )
         raise NotImplementedError(msg)
+
+    @classmethod
+    def prepare_kernels(
+        cls,
+        layer_config: str | dict,
+        compute_config: str | dict | None = None,
+        tuning_config: str | dict | list | None = None,
+    ) -> int | list[int]:
+        def prepare_config_str(config: str | dict | list | None):
+            if config is None:
+                return "{}"
+            elif isinstance(config, str):
+                return config
+            else:
+                return str(config)
+
+        def prepare_config_obj(config: str | dict | list | None):
+            if config is None:
+                return {}
+            elif not isinstance(config, str):
+                return config
+            else:
+                return json.loads(config)
+
+        layer_config_str = prepare_config_str(layer_config)
+        compute_config_str = prepare_config_str(compute_config)
+        tuning_config_str = prepare_config_str(tuning_config)
+        cache_key = (layer_config_str, compute_config_str, tuning_config_str)
+        if cache_key in cls._str2kernel_cache:
+            return cls._str2kernel_cache[cache_key]
+
+        layer_config_obj = prepare_config_obj(layer_config)
+        compute_config_obj = prepare_config_obj(compute_config)
+        tuning_config_obj = prepare_config_obj(tuning_config)
+        layer_config_obj.pop("sublayer_name", None)
+
+        if not tuning_config_obj:
+            from humming.layer import HummingLayerMeta
+
+            meta = HummingLayerMeta(**layer_config_obj)
+            tuning_config_obj = get_heuristics_config(meta, **compute_config_obj)
+
+        if isinstance(tuning_config_obj, dict):
+            config = layer_config_obj | compute_config_obj | tuning_config_obj
+            kernel = HummingKernel(**config)
+            cls._str2kernel_cache[cache_key] = kernel.kernel_id
+            return kernel.kernel_id
+
+        def prepare_kernel(data):
+            _, _, tuning_config_obj_single = data
+            config = layer_config_obj | compute_config_obj | tuning_config_obj_single
+            kernel = HummingKernel(**config)
+            return config, kernel
+
+        res = []
+        if os.environ.get("HUMMING_DISABLE_PARALLEL_BUILD", "0") != "1":
+            # Parallelize kernel compilation using multiple threads,
+            # but ensure kernel loading occurs in the main thread to prevent CUDA context issues.
+            # (KernelRuntime would skip loading when running in child thread).
+            executor = ThreadPoolExecutor(max_workers=16)
+            for config, kernel in executor.map(prepare_kernel, tuning_config_obj):
+                kernel.load_cubin()
+                res += [config[0], config[1], kernel.kernel_id]
+            executor.shutdown(wait=False)
+        else:
+            for config in tuning_config_obj:
+                kernel = HummingKernel(**config)
+                res += [config[0], config[1], kernel.kernel_id]
+
+        cls._str2kernel_cache[cache_key] = res
+        return res

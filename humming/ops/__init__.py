@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from humming.kernel.humming import HummingKernel
 from humming.ops.bench import tops_bench  # noqa
 from humming.ops.input import quant_input
 from humming.ops.utils import init_humming_launcher, register_op
@@ -29,13 +30,13 @@ def launch_kernel(
     zero_point: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
     global_scale: torch.Tensor | None = None,
-    topk_weights: torch.Tensor | None = None,
-    sorted_token_ids: torch.Tensor | None = None,
+    sorted_ids: torch.Tensor | None = None,
     expert_ids: torch.Tensor | None = None,
     num_tokens_padded: torch.Tensor | None = None,
+    expert_layout: torch.Tensor | None = None,
     locks: torch.Tensor | None = None,
-) -> torch.Tensor:
-    init_humming_launcher()
+    top_k: int = 1,
+):
     return torch.ops.humming.launch_kernel(
         configs,
         inputs,
@@ -46,11 +47,53 @@ def launch_kernel(
         zero_point,
         bias,
         global_scale,
-        topk_weights,
-        sorted_token_ids,
+        sorted_ids,
         expert_ids,
         num_tokens_padded,
+        expert_layout,
         locks,
+        top_k,
+    )
+
+
+def humming_gemm(
+    layer_config: str,
+    compute_config: str | None,
+    tuning_config: str | None,
+    inputs: torch.Tensor,
+    weight: torch.Tensor,
+    outputs: torch.Tensor | None = None,
+    input_scale: torch.Tensor | None = None,
+    weight_scale: torch.Tensor | None = None,
+    zero_point: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    global_scale: torch.Tensor | None = None,
+    sorted_ids: torch.Tensor | None = None,
+    expert_ids: torch.Tensor | None = None,
+    num_tokens_padded: torch.Tensor | None = None,
+    expert_layout: torch.Tensor | None = None,
+    locks: torch.Tensor | None = None,
+    top_k: int = 1,
+) -> torch.Tensor:
+    configs = HummingKernel.prepare_kernels(layer_config, compute_config, tuning_config)
+    if isinstance(configs, int):
+        configs = [configs]
+    return torch.ops.humming.launch_kernel(
+        configs,
+        inputs,
+        weight,
+        outputs,
+        input_scale,
+        weight_scale,
+        zero_point,
+        bias,
+        global_scale,
+        sorted_ids,
+        expert_ids,
+        num_tokens_padded,
+        expert_layout,
+        locks,
+        top_k,
     )
 
 
@@ -60,6 +103,7 @@ register_op("humming::dequant_weight", dequant_weight, dequant_weight)
 register_op("humming::repack_weight", repack_weight, repack_weight)
 register_op("humming::pack_weight", pack_weight, pack_weight)
 register_op("humming::unpack_weight", unpack_weight, unpack_weight)
+register_op("humming::humming_gemm", humming_gemm, humming_gemm)
 
 
 if not TYPE_CHECKING:
@@ -69,3 +113,4 @@ if not TYPE_CHECKING:
     repack_weight = torch.ops.humming.repack_weight
     pack_weight = torch.ops.humming.pack_weight
     unpack_weight = torch.ops.humming.unpack_weight
+    humming_gemm = torch.ops.humming.humming_gemm

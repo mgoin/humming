@@ -115,7 +115,8 @@ def test_pipeline(
             use_tma_kwargs["use_tma_" + key] = None if random.random() < 0.5 else False
 
     humming_kernel = HummingKernel(
-        problem_shape=(0, 1024, 1024),
+        shape_n=1024,
+        shape_k=1024,
         block_shape=(16, a_dtype.num_bits * 16, 512 // a_dtype.num_bits),
         warp_shape=(16, a_dtype.num_bits * 4, 512 // a_dtype.num_bits),
         a_dtype=a_dtype,
@@ -231,7 +232,8 @@ def test_write_splits(
     )
 
     humming_kernel = HummingKernel(
-        problem_shape=(0, 1024, 1024),
+        shape_n=1024,
+        shape_k=1024,
         block_shape=(64, a_dtype.num_bits * 16, 512 // a_dtype.num_bits),
         warp_shape=(64, a_dtype.num_bits * 4, 512 // a_dtype.num_bits),
         a_dtype=a_dtype,

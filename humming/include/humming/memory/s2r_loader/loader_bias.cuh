@@ -3,10 +3,10 @@
 #include <humming/utils/all.cuh>
 
 
-template <class MmaOpClass, class BlockShape, class WarpShape, class PipelineConfig>
+template <class MmaOpClass, class BlockShape, class WarpShape, class TuningConfig>
 class S2RMemoryLoaderBias {
 private:
-  static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
+  static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
   static constexpr bool kUseWgmma = MmaOpClass::kMmaType == MmaType::WGMMA;
 
   static constexpr uint32_t kSmemStride = BlockShape::N * 16 / 32 / 4;

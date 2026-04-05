@@ -107,9 +107,8 @@ CUDA_INLINE void legacy_load_zfill_pred(const T *gmem_ptr, T *smem_ptr, bool pre
   }
 };
 
-
-template <bool use_cp_async, uint32_t num_int4s, uint32_t threads, uint32_t thread_offset = 0>
-CUDA_INLINE void legacy_load_1d(const int4 *gmem_ptr, int4 *smem_ptr) {
+template <bool use_cp_async, uint32_t num_int4s, uint32_t threads, uint32_t thread_offset = 0, typename T = int4>
+CUDA_INLINE void legacy_load_1d(const T *gmem_ptr, T *smem_ptr) {
   constexpr uint32_t iters = CEIL_DIV(num_int4s, threads);
   const uint32_t thread_id = threadIdx.x - thread_offset;
 
@@ -123,8 +122,8 @@ CUDA_INLINE void legacy_load_1d(const int4 *gmem_ptr, int4 *smem_ptr) {
   }
 };
 
-template <bool use_cp_async, uint32_t num_int4s, uint32_t threads, uint32_t gmem_stride, uint32_t smem_stride, uint32_t thread_offset = 0>
-CUDA_INLINE void legacy_load_2d(const int4 *gmem_ptr, int4 *smem_ptr) {
+template <bool use_cp_async, uint32_t num_int4s, uint32_t threads, uint32_t gmem_stride, uint32_t smem_stride, uint32_t thread_offset = 0, typename T = int4>
+CUDA_INLINE void legacy_load_2d(const T *gmem_ptr, T *smem_ptr) {
   static_assert(num_int4s % smem_stride == 0);
   const uint32_t thread_id = threadIdx.x - thread_offset;
 

@@ -1,4 +1,5 @@
 from humming import dtypes
+from humming.config import GemmType
 from humming.tune.base import DeviceHeuristics
 
 
@@ -16,7 +17,7 @@ class Sm80Heuristics(DeviceHeuristics):
         b_dtype: dtypes.DataType,
         group_size: int,
         use_f16_accum: bool,
-        is_moe: bool,
+        gemm_type: GemmType,
     ):
         if a_dtype.num_bits == 16 or group_size == 0 and a_dtype == b_dtype:
             if use_f16_accum:
@@ -56,7 +57,7 @@ class Sm86Heuristics(DeviceHeuristics):
         b_dtype: dtypes.DataType,
         group_size: int,
         use_f16_accum: bool,
-        is_moe: bool,
+        gemm_type: GemmType,
     ):
         if a_dtype.num_bits == 16 and use_f16_accum:
             num_stages = 3 if b_dtype.num_bits < 8 else 2

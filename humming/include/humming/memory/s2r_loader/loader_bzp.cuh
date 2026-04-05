@@ -6,14 +6,14 @@
 template <
     class BlockShape, class WarpShape,
     class ElementA, class ElementB,
-    class PipelineConfig, class QuantParamConfig>
+    class LayerConfig, class TuningConfig>
 class S2RMemoryLoaderBZP {
 private:
-  static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
-  static constexpr bool kIsChannelScale = QuantParamConfig::kIsChannelWeightScale;
-  static constexpr bool kIsGroupScale = QuantParamConfig::kIsGroupWeightScale;
-  static constexpr uint32_t kGroupSize = kIsChannelScale ? BlockShape::K : QuantParamConfig::kWeightScaleGroupSize;
-  static constexpr uint32_t kNumThreads = PipelineConfig::kNumThreads;
+  static constexpr bool kIsFpZeroPoint = LayerConfig::kIsFpZeroPoint;
+  static constexpr bool kIsChannelScale = LayerConfig::kIsChannelWeightScale;
+  static constexpr bool kIsGroupScale = LayerConfig::kIsGroupWeightScale;
+  static constexpr uint32_t kGroupSize = kIsChannelScale ? BlockShape::K : LayerConfig::kWeightScaleGroupSize;
+  static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;

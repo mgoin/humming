@@ -1,11 +1,15 @@
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from humming import dtypes
-from humming.layer import HummingLayerMeta
+from humming.config import GemmType
 from humming.utils.smem import estimate_smem_size_layer
+
+if TYPE_CHECKING:
+    from humming.layer import HummingLayerMeta
 
 
 class DeviceHeuristics:
@@ -22,25 +26,30 @@ class DeviceHeuristics:
         b_dtype: dtypes.DataType,
         group_size: int,
         use_f16_accum: bool,
-        is_moe: bool,
+        gemm_type: GemmType,
     ):
         raise NotImplementedError
 
     @classmethod
     def get_config(
         cls,
-        meta: HummingLayerMeta,
+        meta: "HummingLayerMeta",
         shape_m: int,
-        use_stream_k: bool,
-        use_f16_accum: bool,
-        use_batch_invariance: bool,
+        use_f16_accum: bool = False,
+        use_batch_invariance: bool = False,
+        gemm_type: GemmType = GemmType.DENSE,
     ):
         compute_bound_min_shape_m = meta.estimate_bound_min_shape_m(use_f16_accum)
 
         # 1. base config
         group_size = meta.input_scale_group_size or meta.weight_scale_group_size
-        is_moe = meta.num_experts is not None
-        config = cls.get_base_config(meta.a_dtype, meta.b_dtype, group_size, use_f16_accum, is_moe)
+        config = cls.get_base_config(
+            meta.a_dtype,
+            meta.b_dtype,
+            group_size,
+            use_f16_accum,
+            gemm_type,
+        )
         block_shape_m, block_shape_n, block_shape_k = config["block_shape"]
         warp_shape_m, warp_shape_n, warp_shape_k = config["warp_shape"]
         num_ctas_per_sm = config.get("num_ctas_per_sm", 1)
@@ -49,7 +58,7 @@ class DeviceHeuristics:
         num_warps_m = block_shape_m // warp_shape_m
 
         # 2. block_shape_m and warp_shape_m
-        if meta.num_experts is None:
+        if not meta.num_experts:
             if shape_m <= block_shape_m:
                 block_shape_m = math.ceil(shape_m / 16) * 16
             else:
@@ -57,10 +66,10 @@ class DeviceHeuristics:
                 block_shape_m = np.argmin(blocks).item() * 16 + 16
         else:
             for moe_block_size in [16, 32, 48, 64]:
-                if shape_m * meta.top_k / meta.num_experts / moe_block_size < 0.9:
+                if shape_m / meta.num_experts / moe_block_size < 0.9:
                     break
 
-            shape_m = int(meta.top_k * shape_m / meta.num_experts / 0.9)
+            shape_m = int(shape_m / meta.num_experts / 0.9)
             shape_m = max(shape_m, 1)
             if block_shape_m == 128:
                 if np.ceil(shape_m / 96) * 96 < np.ceil(shape_m / 64) * 64:
@@ -120,12 +129,12 @@ class DeviceHeuristics:
 
         if num_warps < 8:
             block_shape = (block_shape_m, block_shape_n, block_shape_k)
-            smem_size = estimate_smem_size_layer(meta, block_shape, num_stages)
+            smem_size = estimate_smem_size_layer(meta, block_shape, gemm_type, num_stages)
             while num_warps < 8:
                 if meta.shape_k % (block_shape_k * 2) != 0:
                     break
                 block_shape_new = (block_shape_m, block_shape_n, block_shape_k * 2)
-                smem_size = estimate_smem_size_layer(meta, block_shape_new, num_stages)
+                smem_size = estimate_smem_size_layer(meta, block_shape_new, gemm_type, num_stages)
                 if smem_size * num_ctas_per_sm > cls.max_smem_size:
                     break
                 block_shape = block_shape_new
@@ -137,7 +146,7 @@ class DeviceHeuristics:
             num_warps = num_warps * 2
 
         if num_warps < 8 and num_ctas_per_sm == 1 and num_blocks_n * num_blocks_m >= num_sms:
-            smem_size = estimate_smem_size_layer(meta, block_shape, num_stages)
+            smem_size = estimate_smem_size_layer(meta, block_shape, gemm_type, num_stages)
             if smem_size * 2 <= cls.max_smem_size:
                 num_ctas_per_sm = 2
 
@@ -151,10 +160,11 @@ class DeviceHeuristics:
         max_num_stages = 5 if cls.sm_version == 80 else 3
         for num_stages_new in range(num_stages + 1, max_num_stages + 1):
             block_shape = (block_shape_m, block_shape_n, block_shape_k)
-            smem_size = estimate_smem_size_layer(meta, block_shape, num_stages_new)
+            smem_size = estimate_smem_size_layer(meta, block_shape, gemm_type, num_stages_new)
             if smem_size * num_ctas_per_sm < cls.max_smem_size:
                 num_stages = num_stages_new
 
+        use_stream_k = True
         if use_batch_invariance:
             warp_shape_k = 512 // meta.a_dtype.num_bits
             block_shape_k = 512 // meta.a_dtype.num_bits
@@ -181,11 +191,11 @@ class DeviceHeuristics:
         }
 
     @classmethod
-    def estimate_num_blocks_m(cls, meta: HummingLayerMeta, shape_m: int, block_shape_m: int):
-        if meta.num_experts is None:
+    def estimate_num_blocks_m(cls, meta: "HummingLayerMeta", shape_m: int, block_shape_m: int):
+        if not meta.num_experts:
             estimated_num_blocks_m = math.ceil(shape_m / block_shape_m)
-        elif shape_m * meta.top_k < meta.num_experts:
-            estimated_num_blocks_m = shape_m * meta.top_k
+        elif shape_m < meta.num_experts:
+            estimated_num_blocks_m = shape_m
         else:
             estimated_num_blocks_m = meta.num_experts
 
@@ -198,10 +208,10 @@ class DeviceHeuristics:
     @classmethod
     def get_configs(
         cls,
-        meta: HummingLayerMeta,
-        use_stream_k: bool,
-        use_f16_accum: bool,
-        use_batch_invariance: bool,
+        meta: "HummingLayerMeta",
+        use_f16_accum: bool = False,
+        use_batch_invariance: bool = False,
+        gemm_type: GemmType = GemmType.DENSE,
     ):
         if meta.a_dtype.num_bits == 16:
             assert meta.a_dtype in cls.b16_allowed_dtypes
@@ -216,10 +226,10 @@ class DeviceHeuristics:
         configs: list[list[int | dict]] = []
         last_config_str: str = ""
 
-        if meta.num_experts is None:
+        if not meta.num_experts:
             max_shape_m = 8192
         else:
-            max_shape_m = int(meta.num_experts / meta.top_k * 1024)
+            max_shape_m = int(max(meta.num_experts, 64) * 1024)
 
         shape_m_candidates = [1, 2, 4, 8]
         if cls.sm_version == 90:
@@ -231,9 +241,9 @@ class DeviceHeuristics:
             config = cls.get_config(
                 meta=meta,
                 shape_m=shape_m,
-                use_stream_k=use_stream_k,
                 use_f16_accum=use_f16_accum,
                 use_batch_invariance=use_batch_invariance,
+                gemm_type=gemm_type,
             )
             config_str = str(config)
 

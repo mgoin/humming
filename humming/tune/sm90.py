@@ -1,10 +1,14 @@
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from humming import dtypes
-from humming.layer import HummingLayerMeta
+from humming.config import GemmType
 from humming.tune.base import DeviceHeuristics
+
+if TYPE_CHECKING:
+    from humming.layer import HummingLayerMeta
 
 
 class Sm90Heuristics(DeviceHeuristics):
@@ -17,11 +21,11 @@ class Sm90Heuristics(DeviceHeuristics):
     @classmethod
     def get_config1(
         cls,
-        meta: HummingLayerMeta,
+        meta: "HummingLayerMeta",
         shape_m: int,
-        use_stream_k: bool,
-        use_f16_accum: bool,
-        use_batch_invariance: bool,
+        use_f16_accum: bool = False,
+        use_batch_invariance: bool = False,
+        gemm_type: GemmType = GemmType.DENSE,
     ):
         if use_f16_accum:
             max_block_m = 256
@@ -49,18 +53,15 @@ class Sm90Heuristics(DeviceHeuristics):
             elif block_shape_m <= 32:
                 warp_shape_k = warp_shape_k // 2
 
-        if use_batch_invariance:
-            use_stream_k = False
-
         config = {
             "block_shape": (block_shape_m, block_shape_n, block_shape_k),
             "warp_shape": (block_shape_m, warp_shape_n, warp_shape_k),
-            "use_stream_k": use_stream_k,
+            "use_stream_k": not use_batch_invariance,
             "use_f16_accum": use_f16_accum,
             "num_stages": 4,
         }
 
-        if meta.num_experts is None:
+        if not meta.num_experts:
             config["use_warp_spec"] = True
             config["use_tma"] = True
             config["use_mbarrier"] = True
@@ -73,11 +74,11 @@ class Sm90Heuristics(DeviceHeuristics):
     @classmethod
     def get_config2(
         cls,
-        meta: HummingLayerMeta,
+        meta: "HummingLayerMeta",
         shape_m: int,
-        use_stream_k: bool,
-        use_f16_accum: bool,
-        use_batch_invariance: bool,
+        use_f16_accum: bool = False,
+        use_batch_invariance: bool = False,
+        gemm_type: GemmType = GemmType.DENSE,
     ):
         if use_f16_accum:
             max_block_m = 256
@@ -91,20 +92,17 @@ class Sm90Heuristics(DeviceHeuristics):
         num_blocks_list = cls.calc_num_block_list(meta, shape_m, max_block_m)
         block_shape_m = np.argmin(num_blocks_list).item() * 8 + 8
 
-        if use_batch_invariance:
-            use_stream_k = False
-
         block_shape_k = 256 if block_shape_m <= 32 else 128
 
         config = {
             "block_shape": (block_shape_m, 128, block_shape_k),
             "warp_shape": (block_shape_m, 16, 128),
-            "use_stream_k": use_stream_k,
+            "use_stream_k": not use_batch_invariance,
             "use_f16_accum": use_f16_accum,
             "num_stages": 4,
         }
 
-        if meta.num_experts is None:
+        if not meta.num_experts:
             config["use_warp_spec"] = True
             config["use_tma"] = True
             config["use_mbarrier"] = True
@@ -117,12 +115,12 @@ class Sm90Heuristics(DeviceHeuristics):
     @classmethod
     def calc_num_block_list(
         cls,
-        meta: HummingLayerMeta,
+        meta: "HummingLayerMeta",
         shape_m: int,
         max_block_m: int,
     ):
         num_blocks_list = []
-        if meta.num_experts is None:
+        if not meta.num_experts:
             for i in range(max_block_m // 8):
                 block_m = i * 8 + 8
                 num_blocks_list.append(math.ceil(shape_m / block_m))
@@ -143,11 +141,11 @@ class Sm90Heuristics(DeviceHeuristics):
     @classmethod
     def get_config(
         cls,
-        meta: HummingLayerMeta,
+        meta: "HummingLayerMeta",
         shape_m: int,
-        use_stream_k: bool,
-        use_f16_accum: bool,
-        use_batch_invariance: bool,
+        use_f16_accum: bool = False,
+        use_batch_invariance: bool = False,
+        gemm_type: GemmType = GemmType.DENSE,
     ):
         if meta.b_dtype.num_bits == 16:
             func = cls.get_config1
@@ -156,4 +154,4 @@ class Sm90Heuristics(DeviceHeuristics):
         else:
             func = cls.get_config2
 
-        return func(meta, shape_m, use_stream_k, use_f16_accum, use_batch_invariance)
+        return func(meta, shape_m, use_f16_accum, use_batch_invariance, gemm_type)

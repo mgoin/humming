@@ -110,14 +110,14 @@ CUDA_INLINE void mbarrier_arrive(void *barrier) {
   uint32_t smem_int_mbar = cast_smem_ptr_to_uint(barrier);
 
   if constexpr (kUseCluster) {
-    asm volatile ("mbarrier.arrive.shared::cluster.b64 _, [%0];"
-                  :
-                  : "r"(smem_int_mbar)
-                  : "memory");
+    asm volatile("mbarrier.arrive.shared::cluster.b64 _, [%0];"
+                 :
+                 : "r"(smem_int_mbar)
+                 : "memory");
   } else {
-    asm volatile ("mbarrier.arrive.shared.b64 _, [%0];"
-            :
-            : "r"(smem_int_mbar)
-            : "memory");
+    asm volatile("mbarrier.arrive.shared.b64 _, [%0];"
+                 :
+                 : "r"(smem_int_mbar)
+                 : "memory");
   }
 };

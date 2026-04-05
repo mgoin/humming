@@ -109,12 +109,8 @@ class NVCCCompiler(Compiler):
     def _compile(cls, source_path, cache_dirname, sm_version):
         nvcc_path = jit_utils.get_cuda_command_path("nvcc")
         target_path = (cache_dirname / "kernel_tmp.cubin").as_posix()
-        keep_dirname = cache_dirname / "tmp"
-        keep_dirname.mkdir(exist_ok=True, parents=True)
-        keep_dirname = keep_dirname.as_posix()
-        flags = cls.get_flags(sm_version) + ["--keep", f"--keep-dir={keep_dirname}"]
 
-        cmd = [nvcc_path, source_path, "-o", target_path] + flags
+        cmd = [nvcc_path, source_path, "-o", target_path] + cls.get_flags(sm_version)
         with open(cache_dirname / "cmdline.json", "w") as f:
             json.dump(cmd, f, ensure_ascii=False)
 

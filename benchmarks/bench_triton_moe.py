@@ -65,7 +65,8 @@ def bench_triton_moe(
     is_moe_down: bool,
     dtype: str,
     out_dtype: str,
-    block_shape: str | list[int] | None,
+    block_shape: str | list[int] | None = None,
+    balanced: bool = False,
     shape_m_list: list[int] | None = None,
 ) -> list[dict[str, int | float]]:
     if isinstance(block_shape, str):
@@ -129,9 +130,10 @@ def bench_triton_moe(
             shape_m=shape_m,
             num_experts=num_experts,
             top_k=top_k,
+            balanced=balanced,
             block_size_config=config["BLOCK_SIZE_M"],
         )
-        _, topk_weights, sorted_token_ids, expert_ids, num_tokens_padded = moe_tensors
+        _, _, sorted_ids, expert_ids, num_tokens_padded = moe_tensors
 
         def run():
             outputs = torch.randn(
@@ -145,11 +147,11 @@ def bench_triton_moe(
                 C=outputs,
                 A_scale=input_scale,  # noqa
                 B_scale=weight_scale,
-                topk_weights=topk_weights,  # noqa
-                sorted_token_ids=sorted_token_ids,  # noqa
+                topk_weights=None,  # noqa
+                sorted_token_ids=sorted_ids,  # noqa
                 expert_ids=expert_ids,  # noqa
                 num_tokens_post_padded=num_tokens_padded,  # noqa
-                mul_routed_weight=is_moe_down,
+                mul_routed_weight=False,
                 top_k=1 if is_moe_down else top_k,
                 config=config,  # noqa
                 compute_type=getattr(tl, out_dtype),
@@ -167,6 +169,7 @@ def bench_triton_moe(
         outputs = run()
         t = triton.testing.do_bench(run, warmup=100, rep=1000)
 
+        assert expert_ids is not None
         num_actived_experts = len(set(expert_ids.tolist()))
         nbytes = inputs.nbytes + outputs.nbytes
         if input_scale is not None:
@@ -202,6 +205,7 @@ def main():
     parser.add_argument("--num_experts", type=int, required=True)
     parser.add_argument("--top_k", type=int, required=True)
     parser.add_argument("--is_moe_down", default=False, action="store_true")
+    parser.add_argument("--balanced", default=False, action="store_true")
     parser.add_argument("--shape_m_list", type=int, default=None, nargs="+")
     parser.add_argument("--output_file", type=str, default=None)
     parser.add_argument("--block_shape", type=str, default=None)

@@ -1,4 +1,5 @@
 from humming import dtypes
+from humming.config import GemmType
 from humming.tune.base import DeviceHeuristics
 
 
@@ -15,7 +16,7 @@ class Sm75Heuristics(DeviceHeuristics):
         b_dtype: dtypes.DataType,
         group_size: int,
         use_f16_accum: bool,
-        is_moe: bool,
+        gemm_type: GemmType,
     ):
         if a_dtype.num_bits == 16:
             warp_shape_k = 64 if b_dtype.num_bits <= 3 else 32
@@ -32,7 +33,7 @@ class Sm75Heuristics(DeviceHeuristics):
                 "num_ctas_per_sm": 2,
                 "num_write_splits": 2,
             }
-        elif group_size == 0 and not is_moe:
+        elif group_size == 0 and gemm_type != GemmType.DENSE:
             return {
                 "block_shape": (128, 256, 64),
                 "warp_shape": (64, 64, 64),

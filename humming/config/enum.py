@@ -12,3 +12,10 @@ class WeightScaleType(enum.Enum):
     CHANNEL = "channel"
     TENSOR = "tensor"
     GROUP_TENSOR = "group_tensor"
+
+
+class GemmType(enum.Enum):
+    DENSE = "dense"
+    INDEXED = "indexed"
+    GROUPED_CONTIGUOUS = "grouped_contiguous"
+    GROUPED_MASKED = "grouped_masked"

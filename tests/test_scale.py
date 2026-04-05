@@ -31,7 +31,7 @@ from humming.utils.weight import (
 @pytest.mark.parametrize("bs_dtype", ["float16", "bfloat16", "float8e5m2", "float8e4m3"])
 @pytest.mark.parametrize("input_scale_group_size", [16, 32, 64, 128, 0])
 @pytest.mark.parametrize("weight_scale_group_size", [16, 32, 64, 128, 0])
-@pytest.mark.parametrize("mma_type", ["wgmma"])
+@pytest.mark.parametrize("mma_type", ["mma", "wgmma"])
 def test_scale(
     a_dtype,
     b_dtype,
@@ -107,7 +107,8 @@ def test_scale(
     )
 
     humming_kernel = HummingKernel(
-        problem_shape=(0, 1024, 1024),
+        shape_n=1024,
+        shape_k=1024,
         block_shape=(16, a_dtype.num_bits * 16, 512 // a_dtype.num_bits),
         warp_shape=(16, a_dtype.num_bits * 4, 512 // a_dtype.num_bits),
         a_dtype=a_dtype,
@@ -232,7 +233,8 @@ def test_global_scale(
     )
 
     humming_kernel = HummingKernel(
-        problem_shape=(0, 1024, 1024),
+        shape_n=1024,
+        shape_k=1024,
         block_shape=(16, a_dtype.num_bits * 16, 512 // a_dtype.num_bits),
         warp_shape=(16, a_dtype.num_bits * 4, 512 // a_dtype.num_bits),
         a_dtype=a_dtype,
@@ -354,7 +356,8 @@ def test_int_weight_scale(
     )
 
     humming_kernel = HummingKernel(
-        problem_shape=(0, 1024, 1024),
+        shape_n=1024,
+        shape_k=1024,
         block_shape=(16, a_dtype.num_bits * 16, 512 // a_dtype.num_bits),
         warp_shape=(16, a_dtype.num_bits * 4, 512 // a_dtype.num_bits),
         a_dtype=a_dtype,
@@ -471,7 +474,8 @@ def test_block_scale(
     )
 
     humming_kernel = HummingKernel(
-        problem_shape=(0, 1024, 1024),
+        shape_n=1024,
+        shape_k=1024,
         block_shape=(16, a_dtype.num_bits * 16, 1024 // a_dtype.num_bits),
         warp_shape=(16, a_dtype.num_bits * 4, 512 // a_dtype.num_bits),
         a_dtype=a_dtype,
@@ -506,5 +510,4 @@ def test_block_scale(
         weight_ref = weight_ref.to(torch_dtype).float()
 
     outputs_ref = inputs_ref.matmul(weight_ref.T).to(torch_dtype)
-    torch.save((outputs, outputs_ref), "aa.pt")
     torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=0.2)

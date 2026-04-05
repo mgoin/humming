@@ -7,14 +7,14 @@ template <
     class MmaOpClass_, class SharedStorage, class ArithClass,
     class WarpShape,
     class ElementA, class ElementB,
-    class QuantParamConfig>
+    class LayerConfig>
 struct WMMA {
 public:
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kNumWarpShapeNSplits = WarpShape::N == ElementA::kBits * 2 ? 2 : 1;
 
-  static constexpr bool kHasZeroPoint = QuantParamConfig::kHasZeroPoint;
-  static constexpr bool kIsFpZeroPoint = QuantParamConfig::kIsFpZeroPoint;
+  static constexpr bool kHasZeroPoint = LayerConfig::kHasZeroPoint;
+  static constexpr bool kIsFpZeroPoint = LayerConfig::kIsFpZeroPoint;
 
   using MmaOpClass = MmaOpClass_;
   using MmaShape = typename MmaOpClass::MmaShape;
@@ -101,9 +101,9 @@ public:
   template <class T = uint32_t>
   CUDA_INLINE T *final_regs_c_as_ptr() {
     uint32_t index = 0;
-    constexpr bool kIsGroupInputScale = QuantParamConfig::kInputScaleGroupSize > 0;
-    constexpr bool kIsGroupWeightScale = QuantParamConfig::kIsGroupWeightScale;
-    constexpr bool kIsBlockWeightScale = QuantParamConfig::kIsBlockWeightScale;
+    constexpr bool kIsGroupInputScale = LayerConfig::kInputScaleGroupSize > 0;
+    constexpr bool kIsGroupWeightScale = LayerConfig::kIsGroupWeightScale;
+    constexpr bool kIsBlockWeightScale = LayerConfig::kIsBlockWeightScale;
 
     if constexpr (ElementA::kBits < 16 && (kIsGroupInputScale || kIsGroupWeightScale || kIsBlockWeightScale)) {
       index = 1;

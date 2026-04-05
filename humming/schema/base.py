@@ -23,7 +23,7 @@ class BaseWeightSchema:
         tensors_attrs: dict[str, dict[str, Any]],
         num_experts: int | None = None,
     ) -> dict[str, dict[str, Any]]:
-        if num_experts is None:
+        if num_experts is None or num_experts == 0:
             return tensors_attrs
         for _, attr in tensors_attrs.items():
             if attr["shape"] == (1,):

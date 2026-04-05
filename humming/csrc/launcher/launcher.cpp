@@ -67,17 +67,18 @@ Tensor launch_kernel(
     std::optional<Tensor> bzp_,
     std::optional<Tensor> bias_,
     std::optional<Tensor> gs_,
-    std::optional<Tensor> topk_weights_,
     std::optional<Tensor> sorted_ids_,
     std::optional<Tensor> expert_ids_,
     std::optional<Tensor> num_tokens_padded_,
+    std::optional<Tensor> expert_layout_,
     std::optional<Tensor> locks_,
+    at::SymInt top_k,
     bool should_check_tensor = true) {
 
   if (a.is_meta()) {
     KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, 1);
     KernelData& kernel_data = kernel_launch_data.kernel_data;
-    Tensor c = may_make_tensor_c(c_, a, kernel_data);
+    Tensor c = may_make_tensor_c(c_, a, kernel_data, top_k);
     return c;
   }
 
@@ -87,21 +88,21 @@ Tensor launch_kernel(
   KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, shape_m);
   KernelData& kernel_data = kernel_launch_data.kernel_data;
   int64_t &num_sms = kernel_launch_data.num_sms;
-  int64_t actual_shape_m = shape_m * (kernel_data.is_moe_down ? kernel_data.top_k : 1);
-  Tensor c = may_make_tensor_c(c_, a, kernel_data);
+  int64_t actual_shape_m = shape_m * (kernel_data.gemm_type_id == 1 ? top_k.expect_int() : 1);
+  Tensor c = may_make_tensor_c(c_, a, kernel_data, top_k);
   a = a.contiguous();
 
   if (should_check_tensor) {
     check_tensor_a(a, kernel_data, dev);
     check_tensor_b(b, kernel_data, dev);
-    check_tensor_c(c, kernel_data, dev, shape_m);
-    check_tensor_as(as_, kernel_data, dev, shape_m);
-    check_tensor_bs(bs_, kernel_data, dev, num_experts);
-    check_tensor_bzp(bzp_, kernel_data, dev, num_experts);
-    check_tensor_bias(bias_, kernel_data, dev, num_experts);
-    check_tensor_gs(gs_, kernel_data, dev, num_experts);
+    check_tensor_c(c, kernel_data, dev, shape_m, top_k.expect_int());
+    check_tensor_as(as_, kernel_data, dev, shape_m, top_k.expect_int());
+    check_tensor_bs(bs_, kernel_data, dev);
+    check_tensor_bzp(bzp_, kernel_data, dev);
+    check_tensor_bias(bias_, kernel_data, dev);
+    check_tensor_gs(gs_, kernel_data, dev);
     check_tensor_locks(locks_, kernel_data, dev);
-    check_tensor_moe(topk_weights_, sorted_ids_, expert_ids_, num_tokens_padded_, kernel_data, dev);
+    check_tensor_moe(sorted_ids_, expert_ids_, num_tokens_padded_, expert_layout_, kernel_data, dev);
   }
 
   void *a_ptr = a.data_ptr();
@@ -112,10 +113,10 @@ Tensor launch_kernel(
   void *bzp_ptr = bzp_.has_value() ? bzp_->data_ptr() : nullptr;
   void *bias_ptr = bias_.has_value() ? bias_->data_ptr() : nullptr;
   void *gs_ptr = gs_.has_value() ? gs_->data_ptr() : nullptr;
-  void *topk_weights_ptr = topk_weights_.has_value() ? topk_weights_->data_ptr() : nullptr;
   void *sorted_ids_ptr = sorted_ids_.has_value() ? sorted_ids_->data_ptr() : nullptr;
   void *expert_ids_ptr = expert_ids_.has_value() ? expert_ids_->data_ptr() : nullptr;
   void *num_tokens_padded_ptr = num_tokens_padded_.has_value() ? num_tokens_padded_->data_ptr() : nullptr;
+  void *expert_layout_ptr = expert_layout_.has_value() ? expert_layout_->data_ptr() : nullptr;
   void *locks_ptr = locks_.has_value() ? locks_->data_ptr() : nullptr;
 
   auto tensor_map_a = make_tma_desc_a(a, kernel_data);
@@ -125,6 +126,7 @@ Tensor launch_kernel(
   auto tensor_map_bzp = make_tma_desc_bzp(bzp_, kernel_data);
   auto tensor_map_bias = make_tma_desc_bias(bias_, kernel_data);
   auto to_void_ptr = [&](void *ptr) { return ptr; };
+  uint32_t top_k_val = top_k.expect_int();
 
   void *kernel_args[] = {
       kernel_data.use_tma_a ? to_void_ptr(&tensor_map_a) : to_void_ptr(&a_ptr),
@@ -135,12 +137,13 @@ Tensor launch_kernel(
       kernel_data.use_tma_bzp ? to_void_ptr(&tensor_map_bzp) : to_void_ptr(&bzp_ptr),
       kernel_data.use_tma_bias ? to_void_ptr(&tensor_map_bias) : to_void_ptr(&bias_ptr),
       &gs_ptr,
-      &topk_weights_ptr,
       &sorted_ids_ptr,
       &expert_ids_ptr,
       &num_tokens_padded_ptr,
+      &expert_layout_ptr,
       &locks_ptr,
-      &actual_shape_m};
+      &actual_shape_m,
+      &top_k_val};
 
   CUlaunchConfig config = {};
   config.gridDimX = kernel_data.num_ctas_per_sm * get_num_sms(num_sms, dev);
@@ -203,17 +206,16 @@ int64_t register_kernel(const std::string &cubin_path, const std::string &func_n
         reader.getUint32("BLOCK_SHAPE_K"),
         reader.getUint32("PAD_SHAPE_N"),
         reader.getUint32("PAD_SHAPE_K"),
+        reader.getUint32("NUM_EXPERTS"),
         reader.getUint32("INPUT_SCALE_GROUP_SIZE"),
         reader.getUint32("WEIGHT_SCALE_GROUP_SIZE"),
         reader.getUint32("WEIGHT_SCALE_GROUP_SIZE_N"),
-        reader.getUint32("TOP_K"),
         reader.getUint32("NUM_CTAS_PER_SM"),
         reader.getUint32("MULTI_CAST_SIZE_A"),
         reader.getUint32("MULTI_CAST_SIZE_B"),
+        reader.getUint32("GEMM_TYPE_ID"),
 
         reader.getBool("USE_STREAM_K"),
-        reader.getBool("IS_MOE"),
-        reader.getBool("IS_MOE_DOWN"),
         reader.getBool("IS_FP_ZERO_POINT"),
         reader.getBool("IS_CHANNEL_WEIGHT_SCALE"),
         reader.getBool("IS_GROUP_WEIGHT_SCALE"),
@@ -236,8 +238,8 @@ COMMON_TORCH_LIBRARY(humming, m) {
   m.def(
       "launch_kernel(int[] configs, Tensor a, Tensor b, Tensor? c, "
       "Tensor? as_, Tensor? bs, Tensor? bzp, Tensor? bias, Tensor? gs, "
-      "Tensor? topk_weights, Tensor? sorted_ids, Tensor? expert_ids, Tensor? num_tokens_padded, "
-      "Tensor? locks, bool should_check_tensor = True) -> Tensor");
+      "Tensor? sorted_ids, Tensor? expert_ids, Tensor? num_tokens_padded, Tensor? expert_layout, "
+      "Tensor? locks, SymInt top_k, bool should_check_tensor = True) -> Tensor");
   m.def("register_kernel(str cubin_path, str func_name) -> int");
 };
 
