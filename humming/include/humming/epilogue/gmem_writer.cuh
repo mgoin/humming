@@ -163,4 +163,9 @@ public:
     }
     gmem_ptr = gmem_ptr_raw + offset;
   };
+
+  CUDA_INLINE
+  void update_tensor_map_ptr(const CUtensorMap *tensor_map_ptr_) {
+    tensor_map_ptr = tensor_map_ptr_;
+  };
 };

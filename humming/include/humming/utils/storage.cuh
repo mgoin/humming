@@ -76,10 +76,11 @@ public:
   uint32_t rd_row_index[kIsIndexedGemm ? BlockShape::M : 0];
   uint32_t wr_row_index[kIsIndexedGemm ? BlockShape::M : 0];
 
-  uint32_t expert_offset[kIsGroupedGemm ? kNumExperts : 0];
+  CUtensorMap tensor_map_buffer[kIsGroupedGemm ? 1 : 0];
+  uint32_t expert_offset[ComputeConfig::kGemmType == GemmType::GROUPED_CONTIGUOUS ? kNumExperts : 0];
   uint32_t expert_tokens[kIsGroupedGemm ? kNumExperts : 0];
-  uint32_t total_m_blocks[1];
+  uint32_t total_m_blocks[kIsGroupedGemm ? 1: 0];
 
-  uint64_t load_mbar[kUseMBarrier ? (kNumStages + 2) : 0];
+  alignas(128) uint64_t load_mbar[kUseMBarrier ? (kNumStages + 2) : 0];
   uint64_t math_mbar[kUseWarpSpec ? (kNumStages + 1) : 0];
 };

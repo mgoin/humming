@@ -18,6 +18,17 @@ inline Tensor may_make_tensor_c(std::optional<Tensor> &c, const Tensor &a, Kerne
   return at::empty_symint({shape_m, shape_n}, options);
 }
 
+inline Tensor make_tensor_map_buffer(const Tensor &a, KernelData& kernel_data, uint32_t num_ctas) {
+  at::SymInt size = 0;
+
+  if (kernel_data.use_tma_c && (kernel_data.gemm_type_id == 2 || kernel_data.gemm_type_id == 3)) {
+    size = 32;  // 32 int32 = 128 bytes
+  }
+
+  auto options = a.options().dtype(ScalarType::Int);
+  return at::empty_symint({size * num_ctas}, options);
+}
+
 inline void check_tensor_common(
     const Tensor &tensor, std::string name,
     int64_t expected_dev,

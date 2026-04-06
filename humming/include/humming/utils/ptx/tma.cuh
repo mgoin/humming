@@ -118,3 +118,20 @@ CUDA_INLINE void tma_wait_store_group() {
     asm volatile("cp.async.bulk.wait_group %0;\n" ::"n"(N));
   }
 };
+
+template <uint32_t ord>
+CUDA_INLINE void tensor_map_replace_global_dim(void *smem_desc_ptr, uint32_t value) {
+  uint32_t smem_int_ptr = cast_smem_ptr_to_uint(smem_desc_ptr);
+  asm volatile("tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], %1, %2;\n"
+               :
+               : "r"(smem_int_ptr), "n"(ord), "r"(value) : "memory");
+};
+
+CUDA_INLINE void tensor_map_release_cta() {
+    asm volatile("fence.proxy.tensormap::generic.release.cta;");
+};
+
+CUDA_INLINE void tensor_map_acquire_cta(const void *gmem_desc_ptr) {
+    uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(gmem_desc_ptr);
+    asm volatile("fence.proxy.tensormap::generic.acquire.cta [%0], 128;" :: "l"(gmem_int_desc) : "memory");
+};

@@ -17,6 +17,7 @@ private:
   static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
   static constexpr uint32_t kNumMathThreads = TuningConfig::kNumMathThreads;
   static constexpr uint32_t kNumLoadThreads = TuningConfig::kNumLoadThreads;
+  static constexpr uint32_t kLoadThreadOffset = kNumThreads - kNumLoadThreads;
   static constexpr uint32_t kMultiCastSizeA = TuningConfig::kMultiCastSizeA;
   static constexpr uint32_t kMultiCastSizeB = TuningConfig::kMultiCastSizeB;
   static constexpr uint32_t kMultiCastSize = kMultiCastSizeA * kMultiCastSizeB;
@@ -58,6 +59,7 @@ public:
   uint32_t cluster_rank = blockIdx.x % kMultiCastSize;
 
   // for moe gemm (indexed gemm or grouped gemm)
+  uint32_t old_expert_id = (1 << 30);
   uint32_t expert_id = 0;
 
   // for indexed gemm
@@ -71,13 +73,21 @@ public:
   uint32_t offset_in_expert = 0;
   uint32_t m_offset = 0;
 
+  CUtensorMap* tensor_map_buffer;
 
   CUDA_INLINE
   Scheduler(
-      SharedStorage &smem,
+      SharedStorage &smem, const void* output_ptr, CUtensorMap* tensor_map_buffer,
       uint32_t shape_m, uint32_t top_k, const uint32_t *row_index_blocks, const uint32_t *expert_ids,
       const uint32_t *num_tokens_padded_ptr, const uint32_t *expert_layout_ptr)
-      : smem(smem), shape_m(shape_m), top_k(top_k), row_index_blocks(row_index_blocks), expert_ids(expert_ids) {
+      : smem(smem), tensor_map_buffer(tensor_map_buffer), shape_m(shape_m), top_k(top_k),
+        row_index_blocks(row_index_blocks), expert_ids(expert_ids) {
+
+    if constexpr (kIsGroupedGemm && TuningConfig::kUseTmaC) {
+      if (threadIdx.x == kLoadThreadOffset) smem.tensor_map_buffer[0] = reinterpret_cast<const CUtensorMap*>(output_ptr)[0];
+      __syncwarp();
+    }
+
     current_shape_m = shape_m;
     expert_max_num_tokens = shape_m / LayerConfig::kNumExperts;
     calc_m_blocks(shape_m, num_tokens_padded_ptr, expert_layout_ptr);
@@ -262,6 +272,9 @@ public:
       m_offset = smem.expert_offset[expert_id] + offset_in_expert;
       current_shape_m = smem.expert_offset[expert_id] + smem.expert_tokens[expert_id];
     }
+
+    if (old_expert_id != expert_id) update_tensor_map_c();
+    old_expert_id = expert_id;
   };
 
   CUDA_INLINE
@@ -293,4 +306,17 @@ public:
 
     sync_part_threads<kNumLoadThreads, kNumThreads>();
   };
+
+  CUDA_INLINE
+  void update_tensor_map_c() {
+    if constexpr (kIsGroupedGemm && TuningConfig::kUseTmaC) {
+      if (threadIdx.x == kLoadThreadOffset) {
+        tensor_map_replace_global_dim<1>(smem.tensor_map_buffer, current_shape_m);
+        tensor_map_buffer[blockIdx.x] = smem.tensor_map_buffer[0];
+        tensor_map_release_cta();
+        tensor_map_acquire_cta(tensor_map_buffer + blockIdx.x);
+      }
+      __syncthreads();
+    }
+  }
 };

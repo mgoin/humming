@@ -18,6 +18,8 @@ private:
   using SmemWriter = EpilogueSmemWriter<MmaOpClass, ArithClass, BlockShape, WarpShape, ElementA, ElementC, LayerConfig, TuningConfig>;
   using GmemWriter = EpilogueGmemWriter<ArithClass, ProblemShape, BlockShape, PadShape, ElementC, ComputeConfig, TuningConfig>;
   using OutputPtrType = std::conditional_t<TuningConfig::kUseTmaC, const void *, void *>;
+
+  static constexpr bool kIsGroupedGemm = ComputeConfig::kGemmType == GemmType::GROUPED_CONTIGUOUS || ComputeConfig::kGemmType == GemmType::GROUPED_MASKED;
   static constexpr uint32_t kNumWriteSplits = TuningConfig::kNumWriteSplits;
 
 public:
@@ -34,15 +36,16 @@ public:
 
   CUDA_INLINE
   EpiloguePipeline(
-      SharedStorage &smem, OutputPtrType output_ptr, ArithClass &arith,
+      SharedStorage &smem, OutputPtrType output_ptr, CUtensorMap *tensor_map_buffer, ArithClass &arith,
       const uint32_t *GS, int32_t *locks, uint32_t output_shape_m, uint32_t top_k)
       : GS(GS), locks(locks), arith(arith),
         smem_reducer(smem.reduce), smem_writer(smem.reduce, arith),
         gmem_writer(arith, smem.reduce, output_ptr, smem.wr_row_index, output_shape_m, top_k) {
-    if (threadIdx.x == 0) {
-      if constexpr (TuningConfig::kUseTmaC) prefetch_tensor_map(output_ptr);
+    if constexpr (TuningConfig::kUseTmaC) {
+      if constexpr (kIsGroupedGemm) gmem_writer.update_tensor_map_ptr(tensor_map_buffer + blockIdx.x);
+      else if (threadIdx.x == 0) prefetch_tensor_map(output_ptr);
     }
-    __syncwarp();
+    sync_math_threads();
   }
 
   CUDA_INLINE
@@ -63,6 +66,7 @@ public:
       gmem_writer.write(slice_id, slice_count, i);
       sync_math_threads();
     }
+    __syncthreads();
     if (slice_count > 1) release_gmem_barrier();
   }
 

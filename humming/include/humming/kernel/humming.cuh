@@ -40,6 +40,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     const uint32_t *expert_ids_ptr,
     const uint32_t *num_tokens_padded_ptr,
     const uint32_t *expert_layout_ptr,
+    CUtensorMap *tensor_map_buffer,
     int32_t *locks,
     uint32_t shape_m,
     uint32_t top_k) {
@@ -84,11 +85,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   auto pbs = [&]() {if constexpr (TuningConfig::kUseTmaBS) return &BS; else return BS; };
   auto pbzp = [&]() {if constexpr (TuningConfig::kUseTmaBZP) return &BZP; else return BZP; };
   auto pbias = [&]() {if constexpr (TuningConfig::kUseTmaBias) return &Bias; else return Bias; };
-  auto scheduler = Scheduler(smem, shape_m, top_k, sorted_ids_ptr, expert_ids_ptr, num_tokens_padded_ptr, expert_layout_ptr);
+  auto scheduler = Scheduler(smem, pc(), tensor_map_buffer, shape_m, top_k, sorted_ids_ptr, expert_ids_ptr, num_tokens_padded_ptr, expert_layout_ptr);
   auto mainloop_arith = MainloopArithmetic();
   auto epilogue_arith = EpilogueArithmetic();
   auto mma = MMA(smem, mainloop_arith);
-  auto epilogue = Epilogue(smem, pc(), epilogue_arith, GS, locks, shape_m, top_k);
+  auto epilogue = Epilogue(smem, pc(), tensor_map_buffer, epilogue_arith, GS, locks, shape_m, top_k);
   auto producer = ProducerPipeline(smem, pa(), pb(), pas(), pbs(), pbzp(), pbias(), shape_m);
   auto consumer = ConsumerPipeline(smem);
   auto s2r_pipe = S2RMemoryPipeline(smem, mma, epilogue);
@@ -148,6 +149,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
     consumer.wait_channel();
     s2r_pipe.load_channel(scheduler.slice_id);
+    __syncthreads();
     epilogue.call(mma.final_regs_c_as_ptr());
   }
 };

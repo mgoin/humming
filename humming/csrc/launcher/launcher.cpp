@@ -90,6 +90,8 @@ Tensor launch_kernel(
   int64_t &num_sms = kernel_launch_data.num_sms;
   int64_t actual_shape_m = shape_m * (kernel_data.gemm_type_id == 1 ? top_k.expect_int() : 1);
   Tensor c = may_make_tensor_c(c_, a, kernel_data, top_k);
+  uint32_t num_ctas = kernel_data.num_ctas_per_sm * get_num_sms(num_sms, dev);
+  Tensor tensor_map_buffer = make_tensor_map_buffer(a, kernel_data, num_ctas);
   a = a.contiguous();
 
   if (should_check_tensor) {
@@ -118,6 +120,7 @@ Tensor launch_kernel(
   void *num_tokens_padded_ptr = num_tokens_padded_.has_value() ? num_tokens_padded_->data_ptr() : nullptr;
   void *expert_layout_ptr = expert_layout_.has_value() ? expert_layout_->data_ptr() : nullptr;
   void *locks_ptr = locks_.has_value() ? locks_->data_ptr() : nullptr;
+  void *tensor_map_buffer_ptr = tensor_map_buffer.data_ptr();
 
   auto tensor_map_a = make_tma_desc_a(a, kernel_data);
   auto tensor_map_b = make_tma_desc_b(b, kernel_data);
@@ -141,12 +144,13 @@ Tensor launch_kernel(
       &expert_ids_ptr,
       &num_tokens_padded_ptr,
       &expert_layout_ptr,
+      &tensor_map_buffer_ptr,
       &locks_ptr,
       &actual_shape_m,
       &top_k_val};
 
   CUlaunchConfig config = {};
-  config.gridDimX = kernel_data.num_ctas_per_sm * get_num_sms(num_sms, dev);
+  config.gridDimX = num_ctas;
   config.gridDimY = 1;
   config.gridDimZ = 1;
   config.blockDimX = kernel_data.num_threads;

@@ -106,7 +106,8 @@ def test_indexed_gemm(m, num_experts, top_k, block_shape_m):
 @pytest.mark.parametrize("top_k", [1, 2, 3])
 @pytest.mark.parametrize("block_shape_m", [16, 48, 64])
 @pytest.mark.parametrize("expert_max_tokens", [None, 4, 64, 233, 666])
-def test_grouped_gemm(m, num_experts, top_k, block_shape_m, expert_max_tokens):
+@pytest.mark.parametrize("use_tma", [True, False])
+def test_grouped_gemm(m, num_experts, top_k, block_shape_m, expert_max_tokens, use_tma):
     c_dtype = dtypes.bfloat16
     a_dtype = dtypes.bfloat16
     b_dtype = dtypes.uint4
@@ -162,10 +163,9 @@ def test_grouped_gemm(m, num_experts, top_k, block_shape_m, expert_max_tokens):
         num_experts=num_experts,
         num_stages=3,
         use_warp_spec=False,
-        use_tma=False,
-        use_cp_async=False,
         has_bias=False,
         mma_type="mma",
+        use_tma=use_tma,
         use_stream_k=False,
         gemm_type="grouped_contiguous" if expert_max_tokens is None else "grouped_masked",
     )
