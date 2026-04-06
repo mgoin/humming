@@ -114,3 +114,15 @@ if not TYPE_CHECKING:
     pack_weight = torch.ops.humming.pack_weight
     unpack_weight = torch.ops.humming.unpack_weight
     humming_gemm = torch.ops.humming.humming_gemm
+
+
+__all__ = [
+    "quant_input",
+    "quant_weight",
+    "dequant_weight",
+    "repack_weight",
+    "pack_weight",
+    "unpack_weight",
+    "humming_gemm",
+    "tops_bench",
+]

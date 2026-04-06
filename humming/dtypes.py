@@ -7,6 +7,7 @@ import torch
 @dataclasses.dataclass(kw_only=True, repr=False)
 class DataType:
     num_bits: int
+    is_signed: bool = True
     is_integer_type: bool = False
     is_floating_point_type: bool = False
 
@@ -55,7 +56,6 @@ class DataType:
 
 @dataclasses.dataclass(kw_only=True, repr=False)
 class InergerType(DataType):
-    is_signed: bool
     is_integer_type: bool = True
 
     __hash__ = DataType.__hash__

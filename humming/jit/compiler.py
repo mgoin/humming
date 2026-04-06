@@ -39,8 +39,7 @@ class Compiler:
         signature += "$$" + Compiler.cuh_last_update_time()
         hash_hex = jit_utils.hash_to_hex(signature)
 
-        cache_dirname = os.path.join(jit_utils.get_humming_cache_dir(), hash_hex)
-        cache_dirname = Path(cache_dirname)
+        cache_dirname = Path(os.path.join(jit_utils.get_humming_cache_dir(), hash_hex))
         cache_filename = cache_dirname / "kernel.cubin"
         cache_dirname.mkdir(exist_ok=True, parents=True)
 
@@ -71,6 +70,14 @@ class Compiler:
 
         os.replace(cache_dirname / "kernel_tmp.cubin", cache_dirname / "kernel.cubin")
         return cache_filename.as_posix()
+
+    @classmethod
+    def get_flags(cls, sm_version):
+        raise NotImplementedError
+
+    @classmethod
+    def _compile(cls, source_path, cache_dirname, sm_version):
+        raise NotImplementedError
 
 
 class NVCCCompiler(Compiler):

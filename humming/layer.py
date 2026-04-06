@@ -85,6 +85,7 @@ class HummingLayerMeta(LayerConfig):
     def weight_nbytes(self):
         nbytes1 = self.shape_n * self.shape_k * self.b_dtype.num_bits // 8
         num_groups = self.shape_k / (self.weight_scale_group_size or self.shape_k)
+        assert self.bs_dtype is not None
         nbytes2 = self.shape_n * num_groups * self.bs_dtype.num_bits // 8
         nbytes3 = self.shape_n * num_groups * (math.ceil(self.b_dtype.num_bits / 4) * 4) // 8
         nbytes = nbytes1 + nbytes2
@@ -334,13 +335,18 @@ class HummingLayerMethod:
             packed=True,
         )
 
-        weight_scale = prepare_humming_weight_scale(
-            weight_scale,
-            to_apply_on_c=meta.should_apply_bs_on_c,
-            is_blockwise=meta.weight_scale_type == WeightScaleType.BLOCK,
-        )
-        zero_point = prepare_humming_zero_point(zero_point, meta.b_dtype, packed=True)
-        bias = prepare_humming_bias(bias)
+        if weight_scale is not None:
+            weight_scale = prepare_humming_weight_scale(
+                weight_scale,
+                to_apply_on_c=meta.should_apply_bs_on_c,
+                is_blockwise=meta.weight_scale_type == WeightScaleType.BLOCK,
+            )
+
+        if zero_point is not None:
+            zero_point = prepare_humming_zero_point(zero_point, meta.b_dtype, packed=True)
+
+        if bias is not None:
+            bias = prepare_humming_bias(bias)
 
         if meta.use_int_weight_scale:
             assert weight_scale is not None
@@ -655,6 +661,7 @@ class HummingLayer(HummingModule):
 
     def transform(self):
         if not isinstance(self.weight_schema, HummingWeightSchema):
+            assert self.torch_dtype is not None
             self.weight_schema, tensors = self.weight_schema.convert_humming(
                 tensors=self.state_dict(),
                 shape_n_stacks=[self.shape_n],
@@ -676,6 +683,7 @@ class HummingLayer(HummingModule):
                 param = torch.nn.Parameter(tensor, requires_grad=False)
                 setattr(self, name, param)
 
+        assert isinstance(self.input_schema, HummingInputSchema)
         HummingLayerMethod.prepare_layer_meta(
             layer=self,
             shape_n=self.shape_n,

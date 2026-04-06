@@ -223,7 +223,7 @@ class BaseInputSchema:
             sm_version = sm_version[0] * 10 + sm_version[1]
         assert isinstance(sm_version, int)
 
-        a_dtype_order = []
+        a_dtype_order: list[dtypes.DataType] = []
         if a_dtype is None or a_dtype in [dtypes.float16, dtypes.bfloat16]:
             return a_dtype
         elif a_dtype == dtypes.float8e4m3:

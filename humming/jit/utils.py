@@ -90,10 +90,10 @@ def get_cuda_command_path(name):
 @functools.lru_cache(maxsize=1)
 def get_cuda_nvcc_version(nvcc_path):
     result = subprocess.run([nvcc_path, "--version"], stdout=subprocess.PIPE, text=True).stdout
-    result = re.findall("release (\\d+\\.\\d+)", result)
-    if result is None:
+    re_result = re.findall("release (\\d+\\.\\d+)", result)
+    if re_result is None:
         raise RuntimeError(f"Invalid NVCC: {nvcc_path}")
-    return result[0]
+    return re_result[0]
 
 
 @functools.lru_cache(maxsize=1)

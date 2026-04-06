@@ -109,6 +109,7 @@ class ComputeConfig(BaseHummingConfig):
 
     @property
     def gemm_type_id(self):
+        assert self.gemm_type is not None
         value = self.gemm_type.value.lower()
         return ["dense", "indexed", "grouped_contiguous", "grouped_masked"].index(value)
 

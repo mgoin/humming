@@ -1,6 +1,6 @@
 import dataclasses
 import threading
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import cuda.bindings.driver as cbd
 import torch
@@ -12,7 +12,7 @@ from humming.jit.compiler import NVCCCompiler
 
 @dataclasses.dataclass(kw_only=True)
 class KernelRuntime:
-    _instances: ClassVar[dict[tuple[str, str], "KernelRuntime"]] = {}
+    _instances: ClassVar[dict[tuple[str, tuple[Any, ...]], "KernelRuntime"]] = {}
 
     def __new__(cls, *args, **kwargs):
         def get_value(value):
@@ -39,11 +39,14 @@ class KernelRuntime:
         self.init_sm_version()
         self.init_kernel()
         self.inited = True
-        if hasattr(self, "_vars"):
+        if not hasattr(self, "_vars"):
+            self._vars = vars(self)
+        else:
             for key, value in self._vars.items():
                 setattr(self, key, value)
-        else:
-            self._vars = vars(self)
+
+    def init_kernel(self):
+        raise NotImplementedError
 
     def init_sm_version(self):
         device_props = torch.cuda.get_device_properties()

@@ -243,12 +243,10 @@ def prepare_humming_weight(
 
 
 def prepare_humming_weight_scale(
-    weight_scale: torch.Tensor | None,
+    weight_scale: torch.Tensor,
     to_apply_on_c: bool = False,
     is_blockwise: bool = False,
-) -> torch.Tensor | None:
-    if weight_scale is None:
-        return None
+) -> torch.Tensor:
     if is_blockwise:
         return weight_scale.transpose(-1, -2).contiguous()
 
@@ -272,13 +270,10 @@ def prepare_humming_weight_scale(
 
 
 def prepare_humming_zero_point(
-    zero_point: torch.Tensor | None,
+    zero_point: torch.Tensor,
     dtype: dtypes.DataType,
     packed: bool = False,
 ) -> torch.Tensor | None:
-    if zero_point is None:
-        return zero_point
-
     if zero_point.dtype.is_floating_point:
         return prepare_humming_weight_scale(zero_point, False)
 
@@ -300,9 +295,7 @@ def prepare_humming_zero_point(
     return zero_point.view(torch.int32).view(-1, shape_n * num_zp_bits // 32)
 
 
-def prepare_humming_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
-    if bias is None:
-        return None
+def prepare_humming_bias(bias: torch.Tensor) -> torch.Tensor:
     bias = prepare_humming_weight_scale(bias.unsqueeze(-1), True)
     assert bias is not None
     return bias.squeeze(-2)

@@ -119,6 +119,7 @@ def generate_random_weight(
     )
 
     if dtype.is_integer_type and has_zero_point:
+        assert zero_point is not None
         weight_ref = quanted_weight.to(zero_point.dtype)
         weight_ref = weight_ref - zero_point.repeat_interleave(group_size, -1)
         weight_ref = weight_ref.float()

@@ -31,3 +31,11 @@ INPUT_SCHEMA_MAP: dict[str, type[BaseInputSchema]] = {
 
 BaseWeightSchema.WEIGHT_SCHEMA_MAP = WEIGHT_SCHEMA_MAP
 BaseInputSchema.INPUT_SCHEMA_MAP = INPUT_SCHEMA_MAP
+
+
+__all__ = [
+    "BaseInputSchema",
+    "BaseWeightSchema",
+    "HummingInputSchema",
+    "HummingWeightSchema",
+]
