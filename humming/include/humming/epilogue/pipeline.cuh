@@ -66,7 +66,6 @@ public:
       gmem_writer.write(slice_id, slice_count, i);
       sync_math_threads();
     }
-    __syncthreads();
     if (slice_count > 1) release_gmem_barrier();
   }
 
