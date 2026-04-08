@@ -36,7 +36,7 @@ class DeviceHeuristics:
         meta: "HummingLayerMeta",
         shape_m: int,
         use_f16_accum: bool = False,
-        use_batch_invariance: bool = False,
+        use_batch_invariant: bool = False,
         gemm_type: GemmType = GemmType.DENSE,
     ):
         compute_bound_min_shape_m = meta.estimate_bound_min_shape_m(use_f16_accum)
@@ -165,7 +165,7 @@ class DeviceHeuristics:
                 num_stages = num_stages_new
 
         use_stream_k = True
-        if use_batch_invariance:
+        if use_batch_invariant:
             warp_shape_k = 512 // meta.a_dtype.num_bits
             block_shape_k = 512 // meta.a_dtype.num_bits
             use_stream_k = False
@@ -210,7 +210,7 @@ class DeviceHeuristics:
         cls,
         meta: "HummingLayerMeta",
         use_f16_accum: bool = False,
-        use_batch_invariance: bool = False,
+        use_batch_invariant: bool = False,
         gemm_type: GemmType = GemmType.DENSE,
     ):
         if meta.a_dtype.num_bits == 16:
@@ -242,7 +242,7 @@ class DeviceHeuristics:
                 meta=meta,
                 shape_m=shape_m,
                 use_f16_accum=use_f16_accum,
-                use_batch_invariance=use_batch_invariance,
+                use_batch_invariant=use_batch_invariant,
                 gemm_type=gemm_type,
             )
             config_str = str(config)

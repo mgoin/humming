@@ -8,7 +8,7 @@ from typing import Any, Callable
 import torch
 
 from humming import dtypes, ops
-from humming.config import LayerConfig, MmaType, WeightScaleType
+from humming.config import GemmType, LayerConfig, MmaType, WeightScaleType
 from humming.schema import (
     BaseInputSchema,
     BaseWeightSchema,
@@ -295,6 +295,43 @@ class HummingLayerMethod:
             )
 
         return weight_scale, out_global_scale
+    
+    @classmethod
+    def get_default_tunning_configs(
+        cls,
+        layer: HummingModule | torch.nn.Module,
+        use_f16_accum: bool = False,
+        use_batch_invariant: bool = False,
+        gemm_type: GemmType | str = GemmType.DENSE,
+        sublayer_name: str = "",
+    ) -> list[Any]:
+        assert isinstance(layer.humming_metas, dict)
+        meta = layer.humming_metas[sublayer_name]
+        return get_heuristics_config(
+            meta=meta,
+            use_f16_accum=use_f16_accum,
+            gemm_type=gemm_type,
+            use_batch_invariant=use_batch_invariant,
+        )
+
+    @classmethod
+    def get_default_moe_block_size_configs(
+        cls,
+        layer: HummingModule | torch.nn.Module,
+        use_f16_accum: bool = False,
+        use_batch_invariant: bool = False,
+        sublayer_name: str = "",
+    ) -> list[int]:
+        tunning_configs = cls.get_default_tunning_configs(
+            layer=layer,
+            use_f16_accum=use_f16_accum,
+            use_batch_invariant=use_batch_invariant,
+            sublayer_name=sublayer_name,
+        )
+        block_size_configs = []
+        for min_shape_m, max_shape_m, config in tunning_configs:
+            block_size_configs += [min_shape_m, max_shape_m, config["block_shape"][0]]
+        return block_size_configs
 
     @classmethod
     def transform_humming_layer(
@@ -368,12 +405,12 @@ class HummingLayerMethod:
         layer: HummingModule | torch.nn.Module,
         use_stream_k: bool = True,
         use_f16_accum: bool = False,
-        use_batch_invariance: bool = False,
+        use_batch_invariant: bool = False,
         sublayer_name: str = "",
     ):
         assert isinstance(layer.humming_metas, dict)
         meta = layer.humming_metas[sublayer_name]
-        return get_heuristics_config(meta, use_stream_k, use_f16_accum, use_batch_invariance)
+        return get_heuristics_config(meta, use_stream_k, use_f16_accum, use_batch_invariant)
 
     @classmethod
     def may_quant_input(
@@ -439,6 +476,10 @@ class HummingLayerMethod:
             locks=layer.locks,
             top_k=top_k,
         )
+
+
+class HummingMethod(HummingLayerMethod):
+    pass
 
 
 @dataclasses.dataclass(repr=False, eq=False)

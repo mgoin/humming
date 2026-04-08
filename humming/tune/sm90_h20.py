@@ -66,7 +66,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
         meta: "HummingLayerMeta",
         shape_m: int,
         use_f16_accum: bool = False,
-        use_batch_invariance: bool = False,
+        use_batch_invariant: bool = False,
         gemm_type: GemmType = GemmType.DENSE,
     ):
         # 1. base config
@@ -178,7 +178,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
             if smem_size * num_ctas_per_sm < cls.max_smem_size:
                 config["num_stages"] = 5
 
-        if use_batch_invariance:
+        if use_batch_invariant:
             warp_shape_k = 512 // meta.a_dtype.num_bits
             block_shape_k = 512 // meta.a_dtype.num_bits
             # TODO: check if TMA / cp.async affect batch invariance

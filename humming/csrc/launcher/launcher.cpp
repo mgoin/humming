@@ -75,20 +75,19 @@ Tensor launch_kernel(
     at::SymInt top_k,
     bool should_check_tensor = true) {
 
+  KernelLaunchData base_kernel_launch_data = find_kernel_launch_data(configs, 1);
+  KernelData& base_kernel_data = base_kernel_launch_data.kernel_data;
   if (a.is_meta()) {
-    KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, 1);
-    KernelData& kernel_data = kernel_launch_data.kernel_data;
-    Tensor c = may_make_tensor_c(c_, a, kernel_data, top_k);
-    return c;
+    return may_make_tensor_c(c_, a, base_kernel_data, top_k);
   }
 
   int64_t dev = a.get_device();
   int64_t shape_m = a.size(0);
   int64_t num_experts = b.dim() == 3 ? b.size(0) : 0;
-  KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, shape_m);
+  int64_t actual_shape_m = shape_m * (base_kernel_data.gemm_type_id == 1 ? top_k.expect_int() : 1);
+  KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, actual_shape_m);
   KernelData& kernel_data = kernel_launch_data.kernel_data;
   int64_t &num_sms = kernel_launch_data.num_sms;
-  int64_t actual_shape_m = shape_m * (kernel_data.gemm_type_id == 1 ? top_k.expect_int() : 1);
   Tensor c = may_make_tensor_c(c_, a, kernel_data, top_k);
   uint32_t num_ctas = kernel_data.num_ctas_per_sm * get_num_sms(num_sms, dev);
   Tensor tensor_map_buffer = make_tensor_map_buffer(a, kernel_data, num_ctas);
@@ -146,7 +145,7 @@ Tensor launch_kernel(
       &expert_layout_ptr,
       &tensor_map_buffer_ptr,
       &locks_ptr,
-      &actual_shape_m,
+      &shape_m,
       &top_k_val};
 
   CUlaunchConfig config = {};

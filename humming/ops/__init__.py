@@ -5,6 +5,7 @@ import torch
 from humming.kernel.humming import HummingKernel
 from humming.ops.bench import tops_bench  # noqa
 from humming.ops.input import quant_input
+from humming.ops.moe import moe_fused_mul_sum
 from humming.ops.utils import init_humming_launcher, register_op
 from humming.ops.weight import (
     dequant_weight,
@@ -104,6 +105,7 @@ register_op("humming::repack_weight", repack_weight, repack_weight)
 register_op("humming::pack_weight", pack_weight, pack_weight)
 register_op("humming::unpack_weight", unpack_weight, unpack_weight)
 register_op("humming::humming_gemm", humming_gemm, humming_gemm)
+register_op("humming::fused_moe_mul_sum", moe_fused_mul_sum, moe_fused_mul_sum)
 
 
 if not TYPE_CHECKING:
@@ -114,6 +116,7 @@ if not TYPE_CHECKING:
     pack_weight = torch.ops.humming.pack_weight
     unpack_weight = torch.ops.humming.unpack_weight
     humming_gemm = torch.ops.humming.humming_gemm
+    fused_moe_mul_sum = torch.ops.humming.fused_moe_mul_sum
 
 
 __all__ = [
@@ -125,4 +128,5 @@ __all__ = [
     "unpack_weight",
     "humming_gemm",
     "tops_bench",
+    "moe_fused_mul_sum",
 ]

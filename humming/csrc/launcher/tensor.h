@@ -9,7 +9,7 @@
 inline Tensor may_make_tensor_c(std::optional<Tensor> &c, const Tensor &a, KernelData& kernel_data, at::SymInt top_k) {
   if (c.has_value()) return c.value();
 
-  at::SymInt shape_m = a.size(0);
+  at::SymInt shape_m = a.sym_size(0);
   at::SymInt shape_n = kernel_data.problem_shape_n - kernel_data.pad_shape_n;
   if (kernel_data.gemm_type_id == 1) shape_m = shape_m * top_k;
 

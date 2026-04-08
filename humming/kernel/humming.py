@@ -353,9 +353,10 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
 
         def prepare_kernel(data):
             _, _, tuning_config_obj_single = data
-            config = layer_config_obj | compute_config_obj | tuning_config_obj_single
-            kernel = HummingKernel(**config)
-            return config, kernel
+            kernel_config = layer_config_obj | compute_config_obj | tuning_config_obj_single
+            num_sms = kernel_config.pop("num_sms", 0)
+            kernel = HummingKernel(**kernel_config)
+            return data, kernel, num_sms
 
         res = []
         if os.environ.get("HUMMING_DISABLE_PARALLEL_BUILD", "0") != "1":
@@ -363,14 +364,15 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             # but ensure kernel loading occurs in the main thread to prevent CUDA context issues.
             # (KernelRuntime would skip loading when running in child thread).
             executor = ThreadPoolExecutor(max_workers=16)
-            for config, kernel in executor.map(prepare_kernel, tuning_config_obj):
+            for config, kernel, num_sms in executor.map(prepare_kernel, tuning_config_obj):
                 kernel.load_cubin()
-                res += [config[0], config[1], kernel.kernel_id]
+                res += [config[0], config[1], kernel.kernel_id, num_sms]
             executor.shutdown(wait=False)
         else:
             for config in tuning_config_obj:
-                kernel = HummingKernel(**config)
-                res += [config[0], config[1], kernel.kernel_id]
+                kernel_config, kernel, num_sms = prepare_kernel(config)
+                kernel = HummingKernel(**kernel_config)
+                res += [config[0], config[1], kernel.kernel_id, num_sms]
 
         cls._str2kernel_cache[cache_key] = res
         return res

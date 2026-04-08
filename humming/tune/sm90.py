@@ -24,7 +24,7 @@ class Sm90Heuristics(DeviceHeuristics):
         meta: "HummingLayerMeta",
         shape_m: int,
         use_f16_accum: bool = False,
-        use_batch_invariance: bool = False,
+        use_batch_invariant: bool = False,
         gemm_type: GemmType = GemmType.DENSE,
     ):
         if use_f16_accum:
@@ -37,7 +37,7 @@ class Sm90Heuristics(DeviceHeuristics):
         warp_shape_n = 32
         warp_shape_k = 1024 // meta.a_dtype.num_bits
 
-        if meta.shape_n <= 4096 and not use_batch_invariance:
+        if meta.shape_n <= 4096 and not use_batch_invariant:
             block_shape_n = 128
             block_shape_k = warp_shape_k * 2
             if block_shape_m <= 32:
@@ -56,7 +56,7 @@ class Sm90Heuristics(DeviceHeuristics):
         config = {
             "block_shape": (block_shape_m, block_shape_n, block_shape_k),
             "warp_shape": (block_shape_m, warp_shape_n, warp_shape_k),
-            "use_stream_k": not use_batch_invariance,
+            "use_stream_k": not use_batch_invariant,
             "use_f16_accum": use_f16_accum,
             "num_stages": 4,
         }
@@ -77,7 +77,7 @@ class Sm90Heuristics(DeviceHeuristics):
         meta: "HummingLayerMeta",
         shape_m: int,
         use_f16_accum: bool = False,
-        use_batch_invariance: bool = False,
+        use_batch_invariant: bool = False,
         gemm_type: GemmType = GemmType.DENSE,
     ):
         if use_f16_accum:
@@ -97,7 +97,7 @@ class Sm90Heuristics(DeviceHeuristics):
         config = {
             "block_shape": (block_shape_m, 128, block_shape_k),
             "warp_shape": (block_shape_m, 16, 128),
-            "use_stream_k": not use_batch_invariance,
+            "use_stream_k": not use_batch_invariant,
             "use_f16_accum": use_f16_accum,
             "num_stages": 4,
         }
@@ -144,7 +144,7 @@ class Sm90Heuristics(DeviceHeuristics):
         meta: "HummingLayerMeta",
         shape_m: int,
         use_f16_accum: bool = False,
-        use_batch_invariance: bool = False,
+        use_batch_invariant: bool = False,
         gemm_type: GemmType = GemmType.DENSE,
     ):
         if meta.b_dtype.num_bits == 16:
@@ -154,4 +154,4 @@ class Sm90Heuristics(DeviceHeuristics):
         else:
             func = cls.get_config2
 
-        return func(meta, shape_m, use_f16_accum, use_batch_invariance, gemm_type)
+        return func(meta, shape_m, use_f16_accum, use_batch_invariant, gemm_type)
