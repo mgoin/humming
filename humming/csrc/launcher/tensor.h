@@ -198,8 +198,15 @@ inline void check_tensor_moe(
     check_tensor_common(expert_ids.value(), "expert_ids", dev, ScalarType::Int);
     check_tensor_common(num_tokens_padded.value(), "num_tokens_padded", dev, ScalarType::Int);
   }
-  if (kernel_data.gemm_type_id == 2 || kernel_data.gemm_type_id == 3) {
+  if (kernel_data.gemm_type_id == 2) {
     ASSERT_CHECK(expert_layout.has_value(), "expert_layout must not be none for grouped gemm");
+    std::vector<int64_t> expected_shape = {kernel_data.num_experts + 1};
+    check_tensor_common(expert_layout.value(), "expert_token_offset", dev, ScalarType::Long, expected_shape);
+  }
+  if (kernel_data.gemm_type_id == 3) {
+    ASSERT_CHECK(expert_layout.has_value(), "expert_layout must not be none for grouped gemm");
+    std::vector<int64_t> expected_shape = {kernel_data.num_experts};
+    check_tensor_common(expert_layout.value(), "expert_num_tokens", dev, ScalarType::Int, expected_shape);
   }
 };
 

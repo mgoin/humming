@@ -142,8 +142,11 @@ public:
       uint32_t padded_shape_m = num_tokens_padded_ptr[0];
       m_blocks = CEIL_DIV(padded_shape_m, BlockShape::M * kMultiCastSizeB);
     } else if constexpr (kIsGroupedGemm) {
-      uint32_t *smem_ptr = ComputeConfig::kGemmType == GemmType::GROUPED_CONTIGUOUS ? smem.expert_offset : smem.expert_tokens;
-      legacy_load_1d<kUseCpAsync, kNumExperts, kNumLoadThreads>(expert_layout, smem_ptr);
+      if constexpr (ComputeConfig::kGemmType == GemmType::GROUPED_CONTIGUOUS) {
+        legacy_load_2d<kUseCpAsync, kNumExperts + 1, kNumThreads, 2, 1>(expert_layout, smem.expert_offset);
+      } else {
+        legacy_load_1d<kUseCpAsync, kNumExperts, kNumThreads>(expert_layout, smem.expert_tokens);
+      }
       if constexpr (kUseCpAsync) cp_async_commit_group();
       if constexpr (kUseCpAsync) cp_async_wait_group<0>();
       __syncthreads();

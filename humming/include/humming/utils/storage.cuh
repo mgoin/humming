@@ -77,7 +77,7 @@ public:
   uint32_t wr_row_index[kIsIndexedGemm ? BlockShape::M : 0];
 
   CUtensorMap tensor_map_buffer[kIsGroupedGemm ? 1 : 0];
-  uint32_t expert_offset[ComputeConfig::kGemmType == GemmType::GROUPED_CONTIGUOUS ? kNumExperts : 0];
+  uint32_t expert_offset[ComputeConfig::kGemmType == GemmType::GROUPED_CONTIGUOUS ? (kNumExperts + 1) : 0];
   uint32_t expert_tokens[kIsGroupedGemm ? kNumExperts : 0];
   uint32_t total_m_blocks[kIsGroupedGemm ? 1: 0];
 

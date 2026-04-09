@@ -73,6 +73,7 @@ Tensor launch_kernel(
     std::optional<Tensor> expert_layout_,
     std::optional<Tensor> locks_,
     at::SymInt top_k,
+    at::SymInt valid_shape_m,
     bool should_check_tensor = true) {
 
   KernelLaunchData base_kernel_launch_data = find_kernel_launch_data(configs, 1);
@@ -84,8 +85,11 @@ Tensor launch_kernel(
   int64_t dev = a.get_device();
   int64_t shape_m = a.size(0);
   int64_t num_experts = b.dim() == 3 ? b.size(0) : 0;
-  int64_t actual_shape_m = shape_m * (base_kernel_data.gemm_type_id == 1 ? top_k.expect_int() : 1);
-  KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, actual_shape_m);
+  int64_t valid_shape_m_val = valid_shape_m.expect_int();
+  if (valid_shape_m_val <= 0) {
+    valid_shape_m_val = shape_m * (base_kernel_data.gemm_type_id == 1 ? top_k.expect_int() : 1);
+  }
+  KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, valid_shape_m_val);
   KernelData& kernel_data = kernel_launch_data.kernel_data;
   int64_t &num_sms = kernel_launch_data.num_sms;
   Tensor c = may_make_tensor_c(c_, a, kernel_data, top_k);
@@ -242,7 +246,7 @@ COMMON_TORCH_LIBRARY(humming, m) {
       "launch_kernel(int[] configs, Tensor a, Tensor b, Tensor? c, "
       "Tensor? as_, Tensor? bs, Tensor? bzp, Tensor? bias, Tensor? gs, "
       "Tensor? sorted_ids, Tensor? expert_ids, Tensor? num_tokens_padded, Tensor? expert_layout, "
-      "Tensor? locks, SymInt top_k, bool should_check_tensor = True) -> Tensor");
+      "Tensor? locks, SymInt top_k, SymInt valid_shape_m, bool should_check_tensor = True) -> Tensor");
   m.def("register_kernel(str cubin_path, str func_name) -> int");
 };
 

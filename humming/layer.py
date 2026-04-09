@@ -315,25 +315,6 @@ class HummingLayerMethod:
         )
 
     @classmethod
-    def get_default_moe_block_size_configs(
-        cls,
-        layer: HummingModule | torch.nn.Module,
-        use_f16_accum: bool = False,
-        use_batch_invariant: bool = False,
-        sublayer_name: str = "",
-    ) -> list[int]:
-        tunning_configs = cls.get_default_tunning_configs(
-            layer=layer,
-            use_f16_accum=use_f16_accum,
-            use_batch_invariant=use_batch_invariant,
-            sublayer_name=sublayer_name,
-        )
-        block_size_configs = []
-        for min_shape_m, max_shape_m, config in tunning_configs:
-            block_size_configs += [min_shape_m, max_shape_m, config["block_shape"][0]]
-        return block_size_configs
-
-    @classmethod
     def transform_humming_layer(
         cls,
         layer: HummingModule | torch.nn.Module,
@@ -400,36 +381,26 @@ class HummingLayerMethod:
         cls.may_set_param(layer, meta.bias_name, bias)
 
     @classmethod
-    def get_default_kernel_configs(
-        cls,
-        layer: HummingModule | torch.nn.Module,
-        use_stream_k: bool = True,
-        use_f16_accum: bool = False,
-        use_batch_invariant: bool = False,
-        sublayer_name: str = "",
-    ):
-        assert isinstance(layer.humming_metas, dict)
-        meta = layer.humming_metas[sublayer_name]
-        return get_heuristics_config(meta, use_stream_k, use_f16_accum, use_batch_invariant)
-
-    @classmethod
     def may_quant_input(
         cls,
-        meta: HummingLayerMeta,
+        layer: HummingModule | torch.nn.Module,
         inputs: torch.Tensor,
         input_scale: torch.Tensor | None = None,
+        quanted_input: torch.Tensor | None = None,
+        sublayer_name: str = "",
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        assert meta.a_dtype.num_bits
+        meta = layer.humming_metas[sublayer_name]
         if meta.a_dtype.num_bits == 16:
             return inputs, None
         if input_scale is not None:
             return inputs, input_scale
-        inputs, input_scale = ops.quant_input(
+        quanted_input = ops.quant_input(
             inputs=inputs,
+            outputs=quanted_input,
             dtype=str(meta.a_dtype),
             group_size=None,
         )
-        return inputs, (input_scale if input_scale.size() else None)
+        return quanted_input, (input_scale if input_scale.size() else None)
 
     @classmethod
     def forward_layer(
@@ -443,13 +414,19 @@ class HummingLayerMethod:
         num_tokens_padded: torch.Tensor | None = None,
         expert_layout: torch.Tensor | None = None,
         top_k: int = 1,
+        valid_shape_m: int = 0,
         compute_config: dict | str | None = None,
         tuning_config: dict | list | str | None = None,
         sublayer_name: str = "",
     ):
         assert isinstance(layer.humming_metas, dict)
         meta = layer.humming_metas[sublayer_name]
-        inputs, input_scale = cls.may_quant_input(meta, inputs, input_scale)
+        inputs, input_scale = cls.may_quant_input(
+            layer=layer,
+            inputs=inputs,
+            input_scale=input_scale,
+            sublayer_name=sublayer_name,
+        )
 
         if isinstance(compute_config, dict):
             compute_config = json.dumps(compute_config)
@@ -475,6 +452,7 @@ class HummingLayerMethod:
             expert_layout=expert_layout,
             locks=layer.locks,
             top_k=top_k,
+            valid_shape_m=valid_shape_m,
         )
 
 

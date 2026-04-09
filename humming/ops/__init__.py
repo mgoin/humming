@@ -37,6 +37,7 @@ def launch_kernel(
     expert_layout: torch.Tensor | None = None,
     locks: torch.Tensor | None = None,
     top_k: int = 1,
+    valid_shape_m: int = 0,
 ):
     return torch.ops.humming.launch_kernel(
         configs,
@@ -54,6 +55,7 @@ def launch_kernel(
         expert_layout,
         locks,
         top_k,
+        valid_shape_m,
     )
 
 
@@ -75,6 +77,7 @@ def humming_gemm(
     expert_layout: torch.Tensor | None = None,
     locks: torch.Tensor | None = None,
     top_k: int = 1,
+    valid_shape_m: int = 0,
 ) -> torch.Tensor:
     configs = HummingKernel.prepare_kernels(layer_config, compute_config, tuning_config)
     if isinstance(configs, int):
@@ -95,6 +98,7 @@ def humming_gemm(
         expert_layout,
         locks,
         top_k,
+        valid_shape_m,
     )
 
 

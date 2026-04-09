@@ -218,7 +218,7 @@ def generate_random_moe_tensors(
             expert_first_token_offset = expert_num_tokens.cumsum(0)
             expert_first_token_offset[1:] = expert_first_token_offset[:-1].clone()
             expert_first_token_offset[0] = 0
-            expert_layout = expert_first_token_offset.int()
+            expert_layout = expert_first_token_offset.long()
         return topk_ids, expert_layout, None, None, None
     else:
         assert gemm_type == GemmType.INDEXED
