@@ -9,8 +9,11 @@ def moe_fused_mul_sum_kernel(
     inputs_ptr,
     topk_weights_ptr,
     outputs_ptr,
+    top_ids_ptr,
+    expert_map_ptr,
     num_tokens,
     stride_m,
+    has_expert_map: tl.constexpr,
     top_k: tl.constexpr,
     size: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -33,11 +36,20 @@ def moe_fused_mul_sum_kernel(
 
     for n in tl.static_range(top_k):
         b_val = tl.load(b_base + n, mask=m_mask, other=0.0).to(tl.float32)
-        a_vec = tl.load(
-            a_base + n * size,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
+        if has_expert_map:
+            id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=0)
+            expert_mask = tl.load(expert_map_ptr + id_val) >= 0
+            a_vec = tl.load(
+                a_base + n * size,
+                mask=mask & expert_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+        else:
+            a_vec = tl.load(
+                a_base + n * size,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
         acc += a_vec * b_val[:, None]
 
     out_ptrs = outputs_ptr + (offs_m * size)[:, None] + offs_k[None, :]
@@ -127,6 +139,8 @@ def moe_fused_mul_sum(
     inputs: torch.Tensor,
     topk_weights: torch.Tensor,
     outputs: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert inputs.ndim == 3
     assert topk_weights.ndim == 2
@@ -157,8 +171,11 @@ def moe_fused_mul_sum(
             inputs,
             topk_weights,
             outputs,
+            topk_ids,
+            expert_map,
             num_tokens,
             top_k * size,
+            expert_map is not None,
             top_k,
             size,
             BLOCK_M,
