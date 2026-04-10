@@ -21,7 +21,6 @@ private:
   static constexpr uint32_t kGmemStride = ProblemShape::N * kPartMmaShapeK * ElementB::kBits / 32 / 4;
   static constexpr uint32_t kGmemExpertStride = ProblemShape::N * ProblemShape::K * ElementB::kBits / 32 / 4;
   static constexpr uint32_t kNumInt4s = kSmemStride * BlockShape::K / kPartMmaShapeK;
-  static constexpr bool kUseMMajorScheduler = TuningConfig::kUseMMajorScheduler;
 
 public:
   const CUtensorMap *tensor_map_ptr;

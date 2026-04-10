@@ -1,4 +1,5 @@
 import dataclasses
+import os
 import threading
 from typing import Any, ClassVar
 
@@ -7,7 +8,7 @@ import torch
 
 import humming.jit.utils as jit_utils
 from humming import dtypes
-from humming.jit.compiler import NVCCCompiler
+from humming.jit.compiler import NVCCCompiler, NVRTCCompiler
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -56,8 +57,22 @@ class KernelRuntime:
         if self.sm_version >= 90:
             self.sm_version_str += "a"
 
+    @staticmethod
+    def _get_compiler():
+        compiler = os.environ.get("HUMMING_COMPILER", "nvcc").lower()
+        if compiler == "nvrtc":
+            return NVRTCCompiler
+        return NVCCCompiler
+
+    @staticmethod
+    def _ensure_cuda_context():
+        torch.cuda.set_device(torch.cuda.current_device())
+
     def prepare(self):
-        kernel_filename = NVCCCompiler.compile(self.code, sm_version=self.sm_version_str)
+        self._ensure_cuda_context()
+        compiler_cls = self._get_compiler()
+        kernel_expr = getattr(self, "kernel_expr", None)
+        kernel_filename = compiler_cls.compile(self.code, sm_version=self.sm_version_str, kernel_expr=kernel_expr)
         kernel_name = jit_utils.find_kernel_name_in_cubin(kernel_filename, self.name)
         self.kernel_name = kernel_name
         self.kernel_filename = kernel_filename

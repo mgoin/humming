@@ -11,7 +11,6 @@ from humming.jit.runtime import KernelRuntime
 CODE_TEMPLATE = """
 #include <humming/kernel/dequant_weight.cuh>
 
-auto ptr = reinterpret_cast<void*>(&dequant_unpacked_fp_type);
 """
 
 
@@ -21,6 +20,7 @@ class DequantKernel(KernelRuntime):
 
     def init_kernel(self):
         self.code = CODE_TEMPLATE
+        self.kernel_expr = "dequant_unpacked_fp_type"
         self.arg_types = (
             ctypes.c_void_p,
             ctypes.c_void_p,

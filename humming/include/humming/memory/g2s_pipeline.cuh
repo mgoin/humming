@@ -48,24 +48,24 @@ private:
     uint32_t tma_load_bytes = 0;
     uint32_t legacy_load_bytes = 0;
 
-    if constexpr (kUseTmaA) tma_load_bytes += sizeof(smem.a[0]);
-    else legacy_load_bytes += sizeof(smem.a[0]);
+    if constexpr (kUseTmaA) tma_load_bytes += SharedStorage::kStageBytesA;
+    else legacy_load_bytes += SharedStorage::kStageBytesA;
 
-    if constexpr (kUseTmaB) tma_load_bytes += sizeof(smem.b[0]);
-    else legacy_load_bytes += sizeof(smem.b[0]);
+    if constexpr (kUseTmaB) tma_load_bytes += SharedStorage::kStageBytesB;
+    else legacy_load_bytes += SharedStorage::kStageBytesB;
 
     if constexpr (kIsGroupInputScale) {
-      legacy_load_bytes += sizeof(smem.as[0]);
+      legacy_load_bytes += SharedStorage::kStageBytesAS;
     }
 
     if constexpr (kIsGroupWeightScale || kIsBlockWeightScale) {
-      if constexpr (kUseTmaBS) tma_load_bytes += sizeof(smem.bs[0]);
-      else legacy_load_bytes += sizeof(smem.bs[0]);
+      if constexpr (kUseTmaBS) tma_load_bytes += SharedStorage::kStageBytesBS;
+      else legacy_load_bytes += SharedStorage::kStageBytesBS;
     }
 
     if constexpr (kHasZeroPoint && (kIsGroupWeightScale || kIsFirst)) {
-      if constexpr (kUseTmaBZP) tma_load_bytes += sizeof(smem.bzp[0]);
-      else legacy_load_bytes += sizeof(smem.bzp[0]);
+      if constexpr (kUseTmaBZP) tma_load_bytes += SharedStorage::kStageBytesBZP;
+      else legacy_load_bytes += SharedStorage::kStageBytesBZP;
     }
 
     return {tma_load_bytes, legacy_load_bytes};
@@ -76,17 +76,17 @@ private:
     uint32_t legacy_load_bytes = 0;
 
     if constexpr (kIsChannelInputScale) {
-      legacy_load_bytes += sizeof(smem.as_c);
+      legacy_load_bytes += SharedStorage::kChannelBytesAS;
     }
 
     if constexpr (kIsChannelWeightScale) {
-      if constexpr (kUseTmaBS) tma_load_bytes += sizeof(smem.bs_c);
-      else legacy_load_bytes += sizeof(smem.bs_c);
+      if constexpr (kUseTmaBS) tma_load_bytes += SharedStorage::kChannelBytesBS;
+      else legacy_load_bytes += SharedStorage::kChannelBytesBS;
     }
 
     if constexpr (kHasBias) {
-      if constexpr (kUseTmaBias) tma_load_bytes += sizeof(smem.bias);
-      else legacy_load_bytes += sizeof(smem.bias);
+      if constexpr (kUseTmaBias) tma_load_bytes += SharedStorage::kBiasBytes;
+      else legacy_load_bytes += SharedStorage::kBiasBytes;
     }
 
     return {tma_load_bytes, legacy_load_bytes};
@@ -103,9 +103,9 @@ public:
   static constexpr uint32_t kMultiCastSizeB = TuningConfig::kMultiCastSizeB;
   static constexpr uint32_t kMultiCastSize = kMultiCastSizeA * kMultiCastSizeB;
 
-  using LoaderA = G2SMemoryLoaderA<ProblemShape, BlockShape, PadShape, ElementA, ComputeConfig, TuningConfig>;
+  using LoaderA = G2SMemoryLoaderA<SharedStorage, ProblemShape, BlockShape, PadShape, ElementA, ComputeConfig, TuningConfig>;
   using LoaderB = G2SMemoryLoaderB<ProblemShape, BlockShape, ElementA, ElementB, ComputeConfig, TuningConfig>;
-  using LoaderAS = G2SMemoryLoaderAS<ProblemShape, BlockShape, PadShape, ElementA, LayerConfig, ComputeConfig, TuningConfig>;
+  using LoaderAS = G2SMemoryLoaderAS<SharedStorage, ProblemShape, BlockShape, PadShape, ElementA, LayerConfig, ComputeConfig, TuningConfig>;
   using LoaderBS = G2SMemoryLoaderBS<ProblemShape, BlockShape, ElementBS, LayerConfig, TuningConfig>;
   using LoaderBZP = G2SMemoryLoaderBZP<ProblemShape, BlockShape, ElementB, LayerConfig, TuningConfig>;
   using LoaderBias = G2SMemoryLoaderBias<ProblemShape, BlockShape, TuningConfig>;
@@ -132,9 +132,9 @@ public:
       const void *void_ptr_bias,
       uint32_t shape_m)
       : smem(smem),
-        loader_a(void_ptr_a, smem.rd_row_index, shape_m),
+        loader_a(void_ptr_a, smem, shape_m),
         loader_b(void_ptr_b),
-        loader_as(void_ptr_as, smem.rd_row_index, shape_m),
+        loader_as(void_ptr_as, smem, shape_m),
         loader_bs(void_ptr_bs),
         loader_bzp(void_ptr_bzp),
         loader_bias(void_ptr_bias) {
@@ -180,16 +180,18 @@ public:
 
     uint2 load_bytes;
     if (pred) {
-      loader_a.load<kShouldAdvance>(smem.a[stage_id], &smem.load_mbar[mbar_index]);
-      loader_b.load<kShouldAdvance>(smem.b[stage_id], &smem.load_mbar[mbar_index]);
+      uint64_t *mbar_ptr = nullptr;
+      if constexpr (kUseMBarrier) mbar_ptr = &smem.load_mbar[mbar_index];
+      loader_a.load<kShouldAdvance>(smem.a[stage_id], mbar_ptr);
+      loader_b.load<kShouldAdvance>(smem.b[stage_id], mbar_ptr);
       if constexpr (kIsGroupInputScale) {
-        loader_as.load<kShouldAdvance>(smem.as[stage_id], &smem.load_mbar[mbar_index]);
+        loader_as.load<kShouldAdvance>(smem.as[stage_id], mbar_ptr);
       };
       if constexpr (kIsGroupWeightScale || kIsBlockWeightScale) {
-        loader_bs.load<kShouldAdvance>(smem.bs[stage_id], &smem.load_mbar[mbar_index]);
+        loader_bs.load<kShouldAdvance>(smem.bs[stage_id], mbar_ptr);
       };
       if constexpr (kHasZeroPoint && (kIsGroupWeightScale || kIsFirst)) {
-        loader_bzp.load<kShouldAdvance>(smem.bzp[stage_id], &smem.load_mbar[mbar_index]);
+        loader_bzp.load<kShouldAdvance>(smem.bzp[stage_id], mbar_ptr);
       }
       load_bytes = get_stage_load_bytes<kIsFirst>();
     }
@@ -202,9 +204,11 @@ public:
   }
 
   CUDA_INLINE void load_channel() {
-    if constexpr (kIsChannelInputScale) loader_as.load(smem.as_c, &smem.load_mbar[kNumStages + 1]);
-    if constexpr (kIsChannelWeightScale) loader_bs.load(smem.bs_c, &smem.load_mbar[kNumStages + 1]);
-    if constexpr (kHasBias) loader_bias.load(smem.bias, &smem.load_mbar[kNumStages + 1]);
+    uint64_t *channel_mbar_ptr = nullptr;
+    if constexpr (kUseMBarrier) channel_mbar_ptr = &smem.load_mbar[kNumStages + 1];
+    if constexpr (kIsChannelInputScale) loader_as.load(smem.as_c, channel_mbar_ptr);
+    if constexpr (kIsChannelWeightScale) loader_bs.load(smem.bs_c, channel_mbar_ptr);
+    if constexpr (kHasBias) loader_bias.load(smem.bias, channel_mbar_ptr);
 
     constexpr uint2 load_bytes = get_channel_load_bytes();
     if constexpr (load_bytes.x > 0 || load_bytes.y > 0) {

@@ -51,11 +51,11 @@ def bench_humming(
         input_config={"dtype": a_dtype, "group_size": input_scale_group_size},
         torch_dtype=torch_dtype,
     ).to("cuda:0")
-    meta = layer.humming_metas[""]
 
     for tensor in layer.parameters():
         random_fill_tensor(tensor)
     layer.transform()
+    meta = layer.humming_metas[""]
 
     default_shape_m_list = [2**i for i in range(15)]
     benchmark_result: list[dict[str, int | float]] = []

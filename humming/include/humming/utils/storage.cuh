@@ -2,6 +2,74 @@
 
 #include <humming/utils/base.cuh>
 
+// Conditional member macros: when the condition is false, the member is completely eliminated.
+
+#if HUMMING_HAS_INPUT_SCALE && HUMMING_INPUT_SCALE_GROUP_SIZE > 0
+  #define IF_HAS_STAGE_INPUT_SCALE(x) x
+#else
+  #define IF_HAS_STAGE_INPUT_SCALE(x)
+#endif
+
+#if HUMMING_WEIGHT_SCALE_GROUP_SIZE > 0
+  #define IF_HAS_STAGE_WEIGHT_SCALE(x) x
+#else
+  #define IF_HAS_STAGE_WEIGHT_SCALE(x)
+#endif
+
+#if HUMMING_HAS_ZERO_POINT
+  #define IF_HAS_ZERO_POINT(x) x
+#else
+  #define IF_HAS_ZERO_POINT(x)
+#endif
+
+#if HUMMING_IS_CHANNEL_WEIGHT_SCALE
+  #define IF_HAS_CHANNEL_WEIGHT_SCALE(x) x
+#else
+  #define IF_HAS_CHANNEL_WEIGHT_SCALE(x)
+#endif
+
+#if HUMMING_HAS_BIAS
+  #define IF_HAS_BIAS(x) x
+#else
+  #define IF_HAS_BIAS(x)
+#endif
+
+#if HUMMING_HAS_INPUT_SCALE && HUMMING_INPUT_SCALE_GROUP_SIZE == 0
+  #define IF_HAS_CHANNEL_INPUT_SCALE(x) x
+#else
+  #define IF_HAS_CHANNEL_INPUT_SCALE(x)
+#endif
+
+#if HUMMING_IS_INDEXED_GEMM
+  #define IF_IS_INDEXED_GEMM(x) x
+#else
+  #define IF_IS_INDEXED_GEMM(x)
+#endif
+
+#if HUMMING_IS_GROUPED_GEMM
+  #define IF_IS_GROUPED_GEMM(x) x
+#else
+  #define IF_IS_GROUPED_GEMM(x)
+#endif
+
+#if HUMMING_IS_GROUPED_CONTIGUOUS_GEMM
+  #define IF_IS_GROUPED_CONTIGUOUS_GEMM(x) x
+#else
+  #define IF_IS_GROUPED_CONTIGUOUS_GEMM(x)
+#endif
+
+#if HUMMING_USE_MBARRIER
+  #define IF_USE_MBARRIER(x) x
+#else
+  #define IF_USE_MBARRIER(x)
+#endif
+
+#if HUMMING_USE_WARP_SPEC
+  #define IF_USE_WARP_SPEC(x) x
+#else
+  #define IF_USE_WARP_SPEC(x)
+#endif
+
 
 template <
     class MmaOpClass,
@@ -54,6 +122,15 @@ public:
   static constexpr uint32_t kChannelSizeBZP = (kIsChannelWeightScale && kHasZeroPoint) ? kSmemStrideBZP : 0;
   static constexpr uint32_t kBiasSize = LayerConfig::kHasBias ? kSmemStrideBias : 0;
 
+  static constexpr uint32_t kStageBytesA = kStageSizeA * sizeof(int4);
+  static constexpr uint32_t kStageBytesB = kStageSizeB * sizeof(int4);
+  static constexpr uint32_t kStageBytesAS = kStageSizeAS * sizeof(int4);
+  static constexpr uint32_t kStageBytesBS = kStageSizeBS * sizeof(int4);
+  static constexpr uint32_t kStageBytesBZP = kStageSizeBZP * sizeof(int4);
+  static constexpr uint32_t kChannelBytesAS = kChannelSizeAS * sizeof(int4);
+  static constexpr uint32_t kChannelBytesBS = kChannelSizeBS * sizeof(int4);
+  static constexpr uint32_t kBiasBytes = kBiasSize * sizeof(int4);
+
   static constexpr bool kUseWarpSpec = TuningConfig::kUseWarpSpec;
   static constexpr bool kUseMBarrier = TuningConfig::kUseMBarrier;
   static constexpr bool kIsIndexedGemm = ComputeConfig::kGemmType == GemmType::INDEXED;
@@ -63,24 +140,24 @@ public:
     struct {
       int4 a[kNumStages][kStageSizeA];
       int4 b[kNumStages][kStageSizeB];
-      int4 as[kNumStages][kStageSizeAS];
-      int4 bs[kNumStages][kStageSizeBS];
-      int4 bzp[kIsChannelWeightScale ? 1 : kNumStages][kIsChannelWeightScale ? kChannelSizeBZP : kStageSizeBZP];
-      int4 bs_c[kChannelSizeBS];
-      int4 bias[kBiasSize];
-      int4 as_c[kChannelSizeAS];
+      IF_HAS_STAGE_INPUT_SCALE(int4 as[kNumStages][kStageSizeAS];)
+      IF_HAS_STAGE_WEIGHT_SCALE(int4 bs[kNumStages][kStageSizeBS];)
+      IF_HAS_ZERO_POINT(int4 bzp[kIsChannelWeightScale ? 1 : kNumStages][kIsChannelWeightScale ? kChannelSizeBZP : kStageSizeBZP];)
+      IF_HAS_CHANNEL_WEIGHT_SCALE(int4 bs_c[kChannelSizeBS];)
+      IF_HAS_BIAS(int4 bias[kBiasSize];)
+      IF_HAS_CHANNEL_INPUT_SCALE(int4 as_c[kChannelSizeAS];)
     };
     int4 reduce[MAX(kWarpReduceSize, kBlockOutputSize)];
   };
 
-  uint32_t rd_row_index[kIsIndexedGemm ? BlockShape::M : 0];
-  uint32_t wr_row_index[kIsIndexedGemm ? BlockShape::M : 0];
+  IF_IS_INDEXED_GEMM(uint32_t rd_row_index[BlockShape::M];)
+  IF_IS_INDEXED_GEMM(uint32_t wr_row_index[BlockShape::M];)
 
-  CUtensorMap tensor_map_buffer[kIsGroupedGemm ? 1 : 0];
-  uint32_t expert_offset[ComputeConfig::kGemmType == GemmType::GROUPED_CONTIGUOUS ? (kNumExperts + 1) : 0];
-  uint32_t expert_tokens[kIsGroupedGemm ? kNumExperts : 0];
-  uint32_t total_m_blocks[kIsGroupedGemm ? 1: 0];
+  IF_IS_GROUPED_GEMM(CUtensorMap tensor_map_buffer[1];)
+  IF_IS_GROUPED_GEMM(uint32_t expert_tokens[kNumExperts];)
+  IF_IS_GROUPED_GEMM(uint32_t total_m_blocks[1];)
+  IF_IS_GROUPED_CONTIGUOUS_GEMM(uint32_t expert_offset[kNumExperts + 1];)
 
-  alignas(128) uint64_t load_mbar[kUseMBarrier ? (kNumStages + 2) : 0];
-  uint64_t math_mbar[kUseWarpSpec ? (kNumStages + 1) : 0];
+  IF_USE_MBARRIER(alignas(128) uint64_t load_mbar[kNumStages + 2];)
+  IF_USE_WARP_SPEC(uint64_t math_mbar[kNumStages + 1];)
 };

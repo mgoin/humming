@@ -11,7 +11,6 @@ from humming.jit.runtime import KernelRuntime
 CODE_TEMPLATE = jinja2.Template("""
 #include <humming/kernel/pack_weight.cuh>
 
-auto ptr = reinterpret_cast<void*>(&unpack_weight_kernel<{{num_bits}}>);
 """)
 
 
@@ -22,6 +21,7 @@ class UnpackWeightKernel(KernelRuntime):
 
     def init_kernel(self):
         self.code = CODE_TEMPLATE.render(num_bits=self.num_bits)
+        self.kernel_expr = f"unpack_weight_kernel<{self.num_bits}>"
         self.arg_types = (ctypes.c_void_p, ctypes.c_void_p)
         self.prepare()
 

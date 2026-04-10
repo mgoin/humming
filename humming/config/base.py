@@ -39,6 +39,14 @@ def name_value_to_extern_const_style(name: str, value: Any) -> str:
     return ""
 
 
+def name_value_to_macro_style(name: str, value: Any) -> str:
+    name = name.upper()
+    if isinstance(value, (bool, int)):
+        value = int(value)
+        return f'#define HUMMING_{name.upper()} {int(value)}'
+    return ""
+
+
 @dataclasses.dataclass
 class BaseHummingConfig:
     _name_map: ClassVar[dict[str, str]] = {}
@@ -71,6 +79,23 @@ class BaseHummingConfig:
 
         if include_class_name:
             code = f"class {class_name} {{\n{code}\n}};"
+
+        return code
+
+    def to_macro_cpp_str(self, cls: type["BaseHummingConfig"] | None = None) -> str:
+        cls = cls or self.__class__
+        str_list = []
+        names = [x.name for x in dataclasses.fields(cls)]
+        names += list(cls._cpp_extra_names)
+        for name in names:
+            value = getattr(self, name)
+            if not isinstance(value, (bool, int, Enum)):
+                continue
+            line = name_value_to_macro_style(name, value)
+            str_list.append(line)
+
+        str_list = [x for x in str_list if x]
+        code = "\n".join(x for x in str_list if x)
 
         return code
 

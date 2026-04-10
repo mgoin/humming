@@ -4,6 +4,7 @@
 
 
 template <
+    class SharedStorage,
     class ProblemShape, class BlockShape, class PadShape,
     class ElementA,
     class LayerConfig, class ComputeConfig, class TuningConfig>
@@ -31,12 +32,12 @@ private:
   using LoadType = typename LoadTypeChooser<kNumGroups * 4>::Type;
 
 public:
+  SharedStorage &smem;
   const uint32_t thread_id = threadIdx.x - kLoadThreadOffset;
   const CUtensorMap *tensor_map_ptr;
   const uint32_t *gmem_ptr_raw;
   const uint32_t *gmem_ptr;
 
-  const uint32_t *row_index_ptr;
   uint32_t shape_m;
   uint32_t block_shape_m;
   uint32_t row_offset;
@@ -45,8 +46,8 @@ public:
   uint32_t counter = 0;
 
   CUDA_INLINE
-  G2SMemoryLoaderAS(const void *ptr, const uint32_t *row_index_ptr, uint32_t shape_m)
-      : row_index_ptr(row_index_ptr), shape_m(shape_m) {
+  G2SMemoryLoaderAS(const void *ptr, SharedStorage &smem, uint32_t shape_m)
+      : smem(smem), shape_m(shape_m) {
     gmem_ptr_raw = reinterpret_cast<const uint32_t *>(ptr);
   }
 
@@ -117,7 +118,7 @@ public:
       uint32_t smem_row = threadIdx.x / kSmemStride;
 
       if (smem_row < BlockShape::M) {
-        load_row_index = row_index_ptr[smem_row];
+        load_row_index = smem.rd_row_index[smem_row];
       } else {
         load_row_index = shape_m;
       }

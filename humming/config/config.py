@@ -44,6 +44,7 @@ class LayerConfig(BaseHummingConfig):
         "is_block_weight_scale",
         "is_group_weight_scale",
         "is_tensor_weight_scale",
+        "has_input_scale",
     )
 
     def __post_init__(self):
@@ -83,6 +84,7 @@ class LayerConfig(BaseHummingConfig):
                 value = dtypes.DataType.from_str(value)
             setattr(self, f"{name}_dtype", value)
 
+        self.has_input_scale = self.a_dtype.num_bits != 16
         self.is_channel_weight_scale = self.weight_scale_type == WeightScaleType.CHANNEL
         self.is_tensor_weight_scale = self.weight_scale_type in [
             WeightScaleType.TENSOR,
@@ -101,11 +103,21 @@ class ComputeConfig(BaseHummingConfig):
     use_batch_invariant: bool = False
     gemm_type: GemmType | None = None
 
-    _cpp_extra_names: ClassVar[tuple[str, ...]] = ("gemm_type_id",)
+    _cpp_extra_names: ClassVar[tuple[str, ...]] = (
+        "gemm_type_id",
+        "is_indexed_gemm",
+        "is_grouped_gemm",
+        "is_grouped_contiguous_gemm",
+        "is_grouped_masked_gemm",
+    )
 
     def __post_init__(self):
         if isinstance(self.gemm_type, str):
             self.gemm_type = GemmType(self.gemm_type)
+        self.is_indexed_gemm = self.gemm_type == GemmType.INDEXED
+        self.is_grouped_contiguous_gemm = self.gemm_type == GemmType.GROUPED_CONTIGUOUS
+        self.is_grouped_masked_gemm = self.gemm_type == GemmType.GROUPED_MASKED
+        self.is_grouped_gemm = self.is_grouped_contiguous_gemm or self.is_grouped_masked_gemm
 
     @property
     def gemm_type_id(self):

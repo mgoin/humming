@@ -29,7 +29,7 @@ CUDA_INLINE T atomic_reduce_add_f162(T &a, T &b) {
 };
 
 template <
-    class ArithClass,
+    class SharedStorage, class ArithClass,
     class ProblemShape, class BlockShape, class PadShape, class ElementC,
     class ComputeConfig, class TuningConfig>
 class EpilogueGmemWriter : F16Conversion<ElementC> {
@@ -50,11 +50,11 @@ private:
 
 public:
   ArithClass &arith;
+  SharedStorage &smem;
   int4 *smem_ptr;
   int4 *gmem_ptr_raw;
   int4 *gmem_ptr;
   const CUtensorMap *tensor_map_ptr;
-  const uint32_t *moe_row_index;
 
   uint32_t row_offset;
   uint32_t col_offset;
@@ -65,8 +65,8 @@ public:
   EpilogueGmemWriter(
       ArithClass &arith,
       int4 *smem_ptr, OutputPtrType output_ptr,
-      const uint32_t *moe_row_index, uint32_t shape_m, uint32_t top_k)
-      : arith(arith), smem_ptr(smem_ptr), moe_row_index(moe_row_index) {
+      SharedStorage &smem, uint32_t shape_m, uint32_t top_k)
+      : arith(arith), smem_ptr(smem_ptr), smem(smem) {
 
     if constexpr (kUseTmaC) {
       tensor_map_ptr = reinterpret_cast<const CUtensorMap *>(output_ptr);
@@ -91,7 +91,7 @@ public:
     constexpr uint32_t total_write_int4s = BlockShape::M * BlockShape::N * 2 / 16 / kNumWriteSplits;
     constexpr bool is_full_div = total_write_int4s % kNumMathThreads == 0;
     constexpr uint32_t iters = CEIL_DIV(total_write_int4s, kNumMathThreads);
-    uint32_t smem = cast_smem_ptr_to_uint(smem_ptr) / 128;
+    uint32_t smem_base = cast_smem_ptr_to_uint(smem_ptr) / 128;
 
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < iters; i++) {
@@ -100,11 +100,11 @@ public:
         uint32_t smem_row = smem_offset / 8;
         uint32_t smem_col = smem_offset % 8;
 
-        uint32_t smem_col_swizzled = smem_col ^ ((smem_row + smem) % 8);
+        uint32_t smem_col_swizzled = smem_col ^ ((smem_row + smem_base) % 8);
         uint32_t smem_offset_swizzled = smem_row * 8 + smem_col_swizzled;
         uint32_t gmem_row = smem_row % (BlockShape::M / kNumWriteSplits);
         if constexpr (kNumWriteSplits == 2) gmem_row += BlockShape::M / 2 * split_idx;
-        if constexpr (ComputeConfig::kGemmType == GemmType::INDEXED) gmem_row = moe_row_index[gmem_row];
+        if constexpr (ComputeConfig::kGemmType == GemmType::INDEXED) gmem_row = smem.wr_row_index[gmem_row];
         uint32_t gmem_col = smem_row / (BlockShape::M / kNumWriteSplits) * 8 + smem_col;
         bool pred1 = gmem_row < (kIsIndexedGemm ? output_shape_m : block_output_shape_m);
         bool pred2 = PadShape::N == 0 || (col_offset + gmem_col * 8 < ProblemShape::N - PadShape::N);

@@ -21,6 +21,13 @@ from humming.jit.runtime import KernelRuntime
 from humming.tune import get_heuristics_config
 
 CODE_TEMPLATE = jinja2.Template("""
+
+{{layer_config_macro}}
+
+{{compute_config_macro}}
+
+{{tuning_config_macro}}
+
 #if {{use_warp_spec}}
 #include <humming/kernel/humming_ws.cuh>
 #else
@@ -58,24 +65,11 @@ using SharedStorageType = SharedStorage<
     ComputeConfig,
     TuningConfig>;
 
-auto ptr = reinterpret_cast<void*>(&humming<
-    MmaOpClass,
-    Shape<0, {{problem_shape[1]}}, {{problem_shape[2]}}>,
-    Shape<{{block_shape[0]}}, {{block_shape[1]}}, {{block_shape[2]}}>,
-    Shape<{{warp_shape[0]}}, {{warp_shape[1]}}, {{warp_shape[2]}}>,
-    Shape<0, {{pad_shape[1]}}, {{pad_shape[2]}}>,
-    {{a_dtype}},
-    {{b_dtype}},
-    {{c_dtype}},
-    {{bs_dtype}},
-    LayerConfig,
-    ComputeConfig,
-    TuningConfig>);
 
 
 extern "C" __constant__ uint32_t SMEM_SIZE = sizeof(SharedStorageType);
-extern "C" __constant__ uint32_t SMEM_SIZE_A = sizeof(SharedStorageType::a);
-extern "C" __constant__ uint32_t SMEM_SIZE_B = sizeof(SharedStorageType::b);
+extern "C" __constant__ uint32_t SMEM_SIZE_A = SharedStorageType::kNumStages * SharedStorageType::kStageSizeA * sizeof(int4);
+extern "C" __constant__ uint32_t SMEM_SIZE_B = SharedStorageType::kNumStages * SharedStorageType::kStageSizeB * sizeof(int4);
 extern "C" __constant__ uint32_t SMEM_SIZE_REDUCE = sizeof(SharedStorageType::reduce);
 
 extern "C" __constant__ uint32_t PROBLEM_SHAPE_N = {{problem_shape[1]}};
@@ -135,10 +129,28 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             layer_config_extern=self.to_extern_cpp_str(LayerConfig),
             compute_config_extern=self.to_extern_cpp_str(ComputeConfig),
             tuning_config_extern=self.to_extern_cpp_str(TuningConfig),
+            layer_config_macro=self.to_macro_cpp_str(LayerConfig),
+            compute_config_macro=self.to_macro_cpp_str(ComputeConfig),
+            tuning_config_macro=self.to_macro_cpp_str(TuningConfig),
             a_dtype=self.a_dtype.to_cpp_str(),
             b_dtype=self.b_dtype.to_cpp_str(),
             c_dtype=self.c_dtype.to_cpp_str(),
             bs_dtype=self.bs_dtype.to_cpp_str(),
+        )
+        self.kernel_expr = (
+            f"humming<\n"
+            f"    MmaOpClass,\n"
+            f"    Shape<0, {self.problem_shape[1]}, {self.problem_shape[2]}>,\n"
+            f"    Shape<{self.block_shape[0]}, {self.block_shape[1]}, {self.block_shape[2]}>,\n"
+            f"    Shape<{self.warp_shape[0]}, {self.warp_shape[1]}, {self.warp_shape[2]}>,\n"
+            f"    Shape<0, {self.pad_shape[1]}, {self.pad_shape[2]}>,\n"
+            f"    {self.a_dtype.to_cpp_str()},\n"
+            f"    {self.b_dtype.to_cpp_str()},\n"
+            f"    {self.c_dtype.to_cpp_str()},\n"
+            f"    {self.bs_dtype.to_cpp_str()},\n"
+            f"    LayerConfig,\n"
+            f"    ComputeConfig,\n"
+            f"    TuningConfig>"
         )
 
         self.prepare()

@@ -18,8 +18,6 @@ public:
 {{mma_op_class}}
 };
 
-auto ptr = reinterpret_cast<void*>(&tops_bench<MmaOpClass, {{repeat_count}}, {{unroll_count}}>);
-                                
 """)
 
 
@@ -58,6 +56,7 @@ class TopsBenchKernel(KernelRuntime):
             repeat_count=self.repeat_count,
             unroll_count=self.unroll_count,
         )
+        self.kernel_expr = f"tops_bench<MmaOpClass, {self.repeat_count}, {self.unroll_count}>"
         self.arg_types = (ctypes.c_void_p,)
         self.prepare()
 

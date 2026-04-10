@@ -4,7 +4,7 @@
 
 
 template <
-    class ProblemShape, class BlockShape, class PadShape,
+    class SharedStorage, class ProblemShape, class BlockShape, class PadShape,
     class ElementA, class ComputeConfig, class TuningConfig>
 class G2SMemoryLoaderA {
 private:
@@ -29,12 +29,12 @@ private:
   static constexpr uint32_t kLoadIters = CEIL_DIV(kNumInt4s, kNumLoadThreads);
 
 public:
+  SharedStorage &smem;
   const uint32_t thread_id = threadIdx.x - kLoadThreadOffset;
   const CUtensorMap *tensor_map_ptr;
   const int4 *gmem_ptr_raw;
   const int4 *gmem_ptr;
 
-  const uint32_t *row_index;
   uint32_t shape_m;
   uint32_t block_shape_m;
   uint32_t load_row_index[kUseTma ? CEIL_DIV(BlockShape::M, kNumLoadThreads) : kLoadIters];
@@ -43,8 +43,8 @@ public:
   uint32_t cluster_rank = blockIdx.x % kMultiCastSizeA;
 
   CUDA_INLINE
-  G2SMemoryLoaderA(const void *ptr, const uint32_t *row_index, uint32_t shape_m)
-      : row_index(row_index), shape_m(shape_m) {
+  G2SMemoryLoaderA(const void *ptr, SharedStorage &smem, uint32_t shape_m)
+      : smem(smem), shape_m(shape_m) {
     if constexpr (kUseTma) {
       tensor_map_ptr = reinterpret_cast<const CUtensorMap *>(ptr);
     } else {
@@ -85,8 +85,8 @@ public:
   CUDA_INLINE
   void load_legacy_swizzled_128B(int4 *smem_ptr) {
     static_assert(BlockShape::K * ElementA::kBits >= 1024);
-    uint32_t smem = cast_smem_ptr_to_uint(smem_ptr);
-    uint32_t smem_swizzled_col = (thread_id % 8) ^ (((thread_id % 64) / 8 + smem / 128)) % 8;
+    uint32_t smem_base = cast_smem_ptr_to_uint(smem_ptr);
+    uint32_t smem_swizzled_col = (thread_id % 8) ^ (((thread_id % 64) / 8 + smem_base / 128)) % 8;
 
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < kLoadIters; i++) {
@@ -176,7 +176,7 @@ public:
         } else {
           gmem_row = smem_row % (BlockShape::M / 2) * 2 + smem_col / 4;
         }
-        load_row_index[i] = row_index[gmem_row];
+        load_row_index[i] = smem.rd_row_index[gmem_row];
       }
     }
   }

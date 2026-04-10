@@ -12,15 +12,6 @@ from humming.jit.runtime import KernelRuntime
 CODE_TEMPLATE = jinja2.Template("""
 #include <humming/kernel/process.cuh>
 
-auto ptr = reinterpret_cast<void*>(&weight_repack_nk<
-    {{weight_bits}},
-    {{activation_bits}},
-    {{is_weight_pakced}},
-    {{should_preprocess_for_int2fp}},
-    {{should_preprocess_with_zp}},
-    {{use_wgmma}},
-    {{group_size_zp}}
-  >);
 """)
 
 
@@ -47,6 +38,16 @@ class RepackWeightKernel(KernelRuntime):
             should_preprocess_with_zp=int(self.should_preprocess_with_zp),
             use_wgmma=int(self.use_wgmma),
             group_size_zp=self.group_size_zp,
+        )
+        self.kernel_expr = (
+            f"weight_repack_nk<\n"
+            f"    {self.weight_bits},\n"
+            f"    {self.activation_bits},\n"
+            f"    {int(self.is_weight_pakced)},\n"
+            f"    {int(self.should_preprocess_for_int2fp)},\n"
+            f"    {int(self.should_preprocess_with_zp)},\n"
+            f"    {int(self.use_wgmma)},\n"
+            f"    {self.group_size_zp}>"
         )
         self.arg_types = (
             ctypes.c_void_p,

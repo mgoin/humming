@@ -12,15 +12,6 @@ from humming.jit.runtime import KernelRuntime
 CODE_TEMPLATE = jinja2.Template("""
 #include <humming/kernel/quant_weight.cuh>
 
-auto ptr = reinterpret_cast<void*>(&quant_weight<
-    {{source_dtype}},
-    {{target_dtype}},
-    {{group_size}},
-    {{has_scale}},
-    {{use_e8m0_scale}},
-    {{has_zero_point}},
-    {{is_fp_zero_point}}
-  >);
 """)
 
 
@@ -44,6 +35,16 @@ class QuantWeightKernel(KernelRuntime):
             use_e8m0_scale=int(self.use_e8m0_scale),
             has_zero_point=int(self.has_zero_point),
             is_fp_zero_point=int(self.is_fp_zero_point),
+        )
+        self.kernel_expr = (
+            f"quant_weight<\n"
+            f"    {self.source_dtype.to_cpp_str()},\n"
+            f"    {self.target_dtype.to_cpp_str()},\n"
+            f"    {self.group_size},\n"
+            f"    {int(self.has_scale)},\n"
+            f"    {int(self.use_e8m0_scale)},\n"
+            f"    {int(self.has_zero_point)},\n"
+            f"    {int(self.is_fp_zero_point)}>"
         )
         self.arg_types = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
         self.prepare()
