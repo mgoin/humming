@@ -82,7 +82,6 @@ class Compiler:
 
 
 class NVRTCCompiler(Compiler):
-
     _STD_HEADER_SHIMS: dict[str, str] = {
         "climits": "#include <cuda/std/climits>",
         "cfloat": "#include <cuda/std/cfloat>",
@@ -165,6 +164,7 @@ class NVRTCCompiler(Compiler):
 
         try:
             import nvidia
+
             for pkg_path in nvidia.__path__:
                 for sub in os.listdir(pkg_path):
                     inc = os.path.join(pkg_path, sub, "include")

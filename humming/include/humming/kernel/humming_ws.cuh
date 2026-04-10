@@ -88,11 +88,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   auto scheduler = Scheduler(smem, pc(), tensor_map_buffer, shape_m, top_k, sorted_ids_ptr, expert_ids_ptr, num_tokens_padded_ptr, expert_layout_ptr);
   if (threadIdx.x >= TuningConfig::kNumMathThreads) {
     if constexpr (TuningConfig::kNumMathThreads > 256) {
-      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(40));
+      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(40));
     } else if constexpr (TuningConfig::kNumCtasPerSm == 1 && ElementA::kBits != 16) {
-      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(40));
+      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(40));
     } else {
-      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(24));
+      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(24));
     }
 
     auto producer = ProducerPipeline(smem, pa(), pb(), pas(), pbs(), pbzp(), pbias(), shape_m);
@@ -124,9 +124,9 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     }
   } else {
     if constexpr (TuningConfig::kNumMathThreads > 256) {
-      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(96));
+      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(96));
     } else {
-      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(232));
+      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(232));
     }
 
     auto mainloop_arith = MainloopArithmetic();

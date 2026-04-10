@@ -43,7 +43,7 @@ def name_value_to_macro_style(name: str, value: Any) -> str:
     name = name.upper()
     if isinstance(value, (bool, int)):
         value = int(value)
-        return f'#define HUMMING_{name.upper()} {int(value)}'
+        return f"#define HUMMING_{name.upper()} {int(value)}"
     return ""
 
 

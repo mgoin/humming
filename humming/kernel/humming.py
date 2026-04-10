@@ -68,8 +68,10 @@ using SharedStorageType = SharedStorage<
 
 
 extern "C" __constant__ uint32_t SMEM_SIZE = sizeof(SharedStorageType);
-extern "C" __constant__ uint32_t SMEM_SIZE_A = SharedStorageType::kNumStages * SharedStorageType::kStageSizeA * sizeof(int4);
-extern "C" __constant__ uint32_t SMEM_SIZE_B = SharedStorageType::kNumStages * SharedStorageType::kStageSizeB * sizeof(int4);
+extern "C" __constant__ uint32_t SMEM_SIZE_A = 
+    SharedStorageType::kNumStages * SharedStorageType::kStageSizeA * sizeof(int4);
+extern "C" __constant__ uint32_t SMEM_SIZE_B = 
+    SharedStorageType::kNumStages * SharedStorageType::kStageSizeB * sizeof(int4);
 extern "C" __constant__ uint32_t SMEM_SIZE_REDUCE = sizeof(SharedStorageType::reduce);
 
 extern "C" __constant__ uint32_t PROBLEM_SHAPE_N = {{problem_shape[1]}};

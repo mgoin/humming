@@ -63,40 +63,6 @@ struct LoadTypeChooser<16> {
   using Type = uint4;
 };
 
-// Zero-size array wrapper: empty struct when size is 0, zero overhead.
-// NVCC supports zero-size arrays as a GCC extension; NVRTC does not.
-template <typename T, uint32_t N>
-struct ZArray {
-  T _data[N];
-  CUDA_INLINE T& operator[](uint32_t i) { return _data[i]; }
-  CUDA_INLINE const T& operator[](uint32_t i) const { return _data[i]; }
-  CUDA_INLINE operator T*() { return _data; }
-  CUDA_INLINE operator const T*() const { return _data; }
-};
-template <typename T>
-struct ZArray<T, 0> {
-  // Dummy accessors for dead-code type-checking (never called at runtime).
-  CUDA_INLINE T& operator[](uint32_t) { return *reinterpret_cast<T*>(this); }
-  CUDA_INLINE const T& operator[](uint32_t) const { return *reinterpret_cast<const T*>(this); }
-  CUDA_INLINE operator T*() { return reinterpret_cast<T*>(this); }
-  CUDA_INLINE operator const T*() const { return reinterpret_cast<const T*>(this); }
-};
-
-// 2D version: empty when inner dimension is 0.
-template <typename T, uint32_t N1, uint32_t N2>
-struct ZArray2D {
-  T _data[N1][N2];
-  CUDA_INLINE T* operator[](uint32_t i) { return _data[i]; }
-  CUDA_INLINE const T* operator[](uint32_t i) const { return _data[i]; }
-  static constexpr uint32_t kRowBytes = N2 * sizeof(T);
-};
-template <typename T, uint32_t N1>
-struct ZArray2D<T, N1, 0> {
-  CUDA_INLINE T* operator[](uint32_t) { return reinterpret_cast<T*>(this); }
-  CUDA_INLINE const T* operator[](uint32_t) const { return reinterpret_cast<const T*>(this); }
-  static constexpr uint32_t kRowBytes = 0;
-};
-
 template <uint32_t M_, uint32_t N_, uint32_t K_>
 struct Shape {
   static constexpr uint32_t M = M_;

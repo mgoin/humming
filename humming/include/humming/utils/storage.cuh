@@ -5,69 +5,69 @@
 // Conditional member macros: when the condition is false, the member is completely eliminated.
 
 #if HUMMING_HAS_INPUT_SCALE && HUMMING_INPUT_SCALE_GROUP_SIZE > 0
-  #define IF_HAS_STAGE_INPUT_SCALE(x) x
+#define IF_HAS_STAGE_INPUT_SCALE(x) x
 #else
-  #define IF_HAS_STAGE_INPUT_SCALE(x)
+#define IF_HAS_STAGE_INPUT_SCALE(x)
 #endif
 
 #if HUMMING_WEIGHT_SCALE_GROUP_SIZE > 0
-  #define IF_HAS_STAGE_WEIGHT_SCALE(x) x
+#define IF_HAS_STAGE_WEIGHT_SCALE(x) x
 #else
-  #define IF_HAS_STAGE_WEIGHT_SCALE(x)
+#define IF_HAS_STAGE_WEIGHT_SCALE(x)
 #endif
 
 #if HUMMING_HAS_ZERO_POINT
-  #define IF_HAS_ZERO_POINT(x) x
+#define IF_HAS_ZERO_POINT(x) x
 #else
-  #define IF_HAS_ZERO_POINT(x)
+#define IF_HAS_ZERO_POINT(x)
 #endif
 
 #if HUMMING_IS_CHANNEL_WEIGHT_SCALE
-  #define IF_HAS_CHANNEL_WEIGHT_SCALE(x) x
+#define IF_HAS_CHANNEL_WEIGHT_SCALE(x) x
 #else
-  #define IF_HAS_CHANNEL_WEIGHT_SCALE(x)
+#define IF_HAS_CHANNEL_WEIGHT_SCALE(x)
 #endif
 
 #if HUMMING_HAS_BIAS
-  #define IF_HAS_BIAS(x) x
+#define IF_HAS_BIAS(x) x
 #else
-  #define IF_HAS_BIAS(x)
+#define IF_HAS_BIAS(x)
 #endif
 
 #if HUMMING_HAS_INPUT_SCALE && HUMMING_INPUT_SCALE_GROUP_SIZE == 0
-  #define IF_HAS_CHANNEL_INPUT_SCALE(x) x
+#define IF_HAS_CHANNEL_INPUT_SCALE(x) x
 #else
-  #define IF_HAS_CHANNEL_INPUT_SCALE(x)
+#define IF_HAS_CHANNEL_INPUT_SCALE(x)
 #endif
 
 #if HUMMING_IS_INDEXED_GEMM
-  #define IF_IS_INDEXED_GEMM(x) x
+#define IF_IS_INDEXED_GEMM(x) x
 #else
-  #define IF_IS_INDEXED_GEMM(x)
+#define IF_IS_INDEXED_GEMM(x)
 #endif
 
 #if HUMMING_IS_GROUPED_GEMM
-  #define IF_IS_GROUPED_GEMM(x) x
+#define IF_IS_GROUPED_GEMM(x) x
 #else
-  #define IF_IS_GROUPED_GEMM(x)
+#define IF_IS_GROUPED_GEMM(x)
 #endif
 
 #if HUMMING_IS_GROUPED_CONTIGUOUS_GEMM
-  #define IF_IS_GROUPED_CONTIGUOUS_GEMM(x) x
+#define IF_IS_GROUPED_CONTIGUOUS_GEMM(x) x
 #else
-  #define IF_IS_GROUPED_CONTIGUOUS_GEMM(x)
+#define IF_IS_GROUPED_CONTIGUOUS_GEMM(x)
 #endif
 
 #if HUMMING_USE_MBARRIER
-  #define IF_USE_MBARRIER(x) x
+#define IF_USE_MBARRIER(x) x
 #else
-  #define IF_USE_MBARRIER(x)
+#define IF_USE_MBARRIER(x)
 #endif
 
 #if HUMMING_USE_WARP_SPEC
-  #define IF_USE_WARP_SPEC(x) x
+#define IF_USE_WARP_SPEC(x) x
 #else
-  #define IF_USE_WARP_SPEC(x)
+#define IF_USE_WARP_SPEC(x)
 #endif
 
 

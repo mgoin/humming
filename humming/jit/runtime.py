@@ -72,7 +72,11 @@ class KernelRuntime:
         self._ensure_cuda_context()
         compiler_cls = self._get_compiler()
         kernel_expr = getattr(self, "kernel_expr", None)
-        kernel_filename = compiler_cls.compile(self.code, sm_version=self.sm_version_str, kernel_expr=kernel_expr)
+        kernel_filename = compiler_cls.compile(
+            self.code,
+            sm_version=self.sm_version_str,
+            kernel_expr=kernel_expr,
+        )
         kernel_name = jit_utils.find_kernel_name_in_cubin(kernel_filename, self.name)
         self.kernel_name = kernel_name
         self.kernel_filename = kernel_filename

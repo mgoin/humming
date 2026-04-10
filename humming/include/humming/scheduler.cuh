@@ -73,18 +73,18 @@ public:
   uint32_t offset_in_expert = 0;
   uint32_t m_offset = 0;
 
-  CUtensorMap* tensor_map_buffer;
+  CUtensorMap *tensor_map_buffer;
 
   CUDA_INLINE
   Scheduler(
-      SharedStorage &smem, const void* output_ptr, CUtensorMap* tensor_map_buffer,
+      SharedStorage &smem, const void *output_ptr, CUtensorMap *tensor_map_buffer,
       uint32_t shape_m, uint32_t top_k, const uint32_t *row_index_blocks, const uint32_t *expert_ids,
       const uint32_t *num_tokens_padded_ptr, const uint32_t *expert_layout_ptr)
       : smem(smem), tensor_map_buffer(tensor_map_buffer), shape_m(shape_m), top_k(top_k),
         row_index_blocks(row_index_blocks), expert_ids(expert_ids) {
 
     if constexpr (kIsGroupedGemm && TuningConfig::kUseTmaC) {
-      if (threadIdx.x == kLoadThreadOffset) smem.tensor_map_buffer[0] = reinterpret_cast<const CUtensorMap*>(output_ptr)[0];
+      if (threadIdx.x == kLoadThreadOffset) smem.tensor_map_buffer[0] = reinterpret_cast<const CUtensorMap *>(output_ptr)[0];
       __syncwarp();
     }
 

@@ -70,7 +70,7 @@ def get_heuristics_config(
             use_f16_accum=use_f16_accum,
             use_batch_invariant=use_batch_invariant,
             gemm_type=gemm_type,
-    )
+        )
 
 
 def get_default_moe_block_size_configs(

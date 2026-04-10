@@ -295,7 +295,7 @@ class HummingLayerMethod:
             )
 
         return weight_scale, out_global_scale
-    
+
     @classmethod
     def get_default_tunning_configs(
         cls,
