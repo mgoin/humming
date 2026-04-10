@@ -297,7 +297,7 @@ class HummingLayerMethod:
         return weight_scale, out_global_scale
 
     @classmethod
-    def get_default_tunning_configs(
+    def get_default_tuning_configs(
         cls,
         layer: HummingModule | torch.nn.Module,
         use_f16_accum: bool = False,
