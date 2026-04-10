@@ -46,9 +46,8 @@ pip install git+https://github.com/inclusionAI/humming.git
 
 
 ```python
-from humming.layer import HummingLayer
 import torch
-
+from humming.layer import HummingLayer
 
 layer = HummingLayer(
     shape_n=8192,
@@ -57,34 +56,20 @@ layer = HummingLayer(
     torch_dtype=torch.float16,
 ).cuda()
 
-torch.cuda.manual_seed(0)
-inputs = torch.randn((8192, 8192), dtype=torch.float16, device="cuda:0")
 weight = torch.randn((8192, 8192), dtype=torch.float16, device="cuda:0")
-# load unquantized weight and quantize to layer quantization format
+inputs = torch.randn((128, 8192), dtype=torch.float16, device="cuda:0")
+
+# Load unquantized weight and quantize to layer quantization format
 layer.load_from_unquantized(weight)
-# transform weight to humming format
+# Transform weight to humming format and prepare default kernels
 layer.transform()
-# you can add a kernel for a shape_m range (min_shape_m, max_shape_m]
-layer.add_kernel_config(
-    # min_shape_m (not included)
-    min_shape_m=64,
-    # max_shape_m (included)
-    max_shape_m=128,
-    # block_shape and warp_shape are required
-    block_shape=(64, 128, 128),
-    warp_shape=(64, 64, 32),
-    # other args are optional
-    num_stages=3,
-    use_stream_k=False,
-    use_f16_accum=True,
-)
-# or use default kernels
-layer.prepare_default_kernel_configs()
 
+# Run quantized GEMM (tuning_config is optional, auto-selected by default)
+output = layer(inputs)
 
-print("\n\nQuantized GEMM Output:\n")
-print(layer(inputs))
-print("\n\nUnquantized GEMM Output:\n")
+print("Quantized GEMM Output:")
+print(output)
+print("\nReference Output:")
 print(inputs.matmul(weight.T))
 ```
 
