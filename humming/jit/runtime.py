@@ -59,10 +59,17 @@ class KernelRuntime:
 
     @staticmethod
     def _get_compiler():
-        compiler = os.environ.get("HUMMING_COMPILER", "nvcc").lower()
-        if compiler == "nvrtc":
+        compiler = os.environ.get("HUMMING_COMPILER", "").lower()
+        if compiler == "nvcc":
+            return NVCCCompiler
+        elif compiler == "nvrtc":
             return NVRTCCompiler
-        return NVCCCompiler
+        else:
+            try:
+                from cuda.bindings import nvrtc  # noqa
+                return NVRTCCompiler
+            except Exception:
+                return NVCCCompiler
 
     @staticmethod
     def _ensure_cuda_context():

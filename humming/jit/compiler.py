@@ -4,6 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import torch
 from cuda.bindings import nvrtc
 from filelock import FileLock
 
@@ -176,7 +177,17 @@ class NVRTCCompiler(Compiler):
 
     @classmethod
     def _compile(cls, source_path, cache_dirname, sm_version, kernel_expr):
-        from cuda.bindings import nvrtc
+        try:
+            from cuda.bindings import nvrtc
+        except Exception as e:
+            torch_cuda_version_major = int(torch.version.cuda.split("."))
+            packages = ["nvidia-cuda-nvrtc", "nvidia-cuda-runtime"]
+            if torch_cuda_version_major == 12:
+                packages = [x + "-cu12" for x in packages]
+            raise RuntimeError(
+                "Error when loading nvrtc library. "
+                f"Try install nvrtc module 'pip install -U {' '.join(packages)}'"
+            ) from e
 
         with open(source_path, "r") as f:
             code = f.read()
