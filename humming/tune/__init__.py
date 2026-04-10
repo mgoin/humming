@@ -71,20 +71,3 @@ def get_heuristics_config(
             use_batch_invariant=use_batch_invariant,
             gemm_type=gemm_type,
         )
-
-
-def get_default_moe_block_size_configs(
-    meta: "HummingLayerMeta | dict",
-    use_f16_accum: bool = False,
-    use_batch_invariant: bool = False,
-):
-    assert meta.num_experts is not None and meta.num_experts > 0
-    kernel_configs = get_heuristics_config(
-        meta=meta,
-        use_f16_accum=use_f16_accum,
-        use_batch_invariant=use_batch_invariant,
-    )
-    block_size_configs = []
-    for min_shape_m, max_shape_m, config in kernel_configs:
-        block_size_configs += [min_shape_m, max_shape_m, config["block_shape"][0]]
-    return block_size_configs
