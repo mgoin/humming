@@ -95,47 +95,51 @@ def _quant_tensor_kernel(
     N: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
     dtype: tl.constexpr,
 ):
     block_id = tl.program_id(0)
     tl.static_assert(N % GROUP_SIZE == 0)
 
     row_num_blocks = N // GROUP_SIZE
-    row_id = block_id // row_num_blocks
-    col_block_id = block_id % row_num_blocks
-    offset = row_id * stride_x + col_block_id * GROUP_SIZE
 
-    if dtype == "int4" or dtype == "float4e2m1":
-        cols = tl.arange(0, BLOCK // 2)
-        mask = cols < GROUP_SIZE // 2
-        cols1 = cols * 2
-        cols2 = cols * 2 + 1
+    for g in tl.static_range(GROUPS_PER_BLOCK):
+        group_id = block_id * GROUPS_PER_BLOCK + g
+        row_id = group_id // row_num_blocks
+        col_block_id = group_id % row_num_blocks
+        offset = row_id * stride_x + col_block_id * GROUP_SIZE
 
-        x1 = tl.load(x_ptr + (offset + cols1), mask=mask, other=0.0).to(tl.float32)
-        x2 = tl.load(x_ptr + (offset + cols2), mask=mask, other=0.0).to(tl.float32)
+        if dtype == "int4" or dtype == "float4e2m1":
+            cols = tl.arange(0, BLOCK // 2)
+            mask = cols < GROUP_SIZE // 2
+            cols1 = cols * 2
+            cols2 = cols * 2 + 1
 
-        scale = (
-            tl.maximum(calc_scale(x1, dtype), calc_scale(x2, dtype))
-            if is_dynamic
-            else tl.load(scale_ptr + col_block_id)
-        )
-        inv_scale = 1 / scale
-        x_q = quant_tensor_x2(x1 * inv_scale, x2 * inv_scale, dtype)
-        tl.store(xq_ptr + block_id * GROUP_SIZE // 2 + cols, x_q, mask=mask)
+            x1 = tl.load(x_ptr + (offset + cols1), mask=mask, other=0.0).to(tl.float32)
+            x2 = tl.load(x_ptr + (offset + cols2), mask=mask, other=0.0).to(tl.float32)
 
-        if is_dynamic:
-            tl.store(scale_ptr + row_id, scale)
-    else:
-        cols = tl.arange(0, BLOCK)
-        mask = cols < GROUP_SIZE
-        x = tl.load(x_ptr + offset + cols, mask=mask, other=0.0).to(tl.float32)
-        scale = calc_scale(x, dtype) if is_dynamic else tl.load(scale_ptr + col_block_id)
-        inv_scale = 1 / scale
-        x_q = quant_tensor(x * inv_scale, dtype)
-        tl.store(xq_ptr + block_id * GROUP_SIZE + cols, x_q, mask=mask)
+            scale = (
+                tl.maximum(calc_scale(x1, dtype), calc_scale(x2, dtype))
+                if is_dynamic
+                else tl.load(scale_ptr + col_block_id)
+            )
+            inv_scale = 1 / scale
+            x_q = quant_tensor_x2(x1 * inv_scale, x2 * inv_scale, dtype)
+            tl.store(xq_ptr + group_id * GROUP_SIZE // 2 + cols, x_q, mask=mask)
 
-        if is_dynamic:
-            tl.store(scale_ptr + row_id * row_num_blocks + col_block_id, scale)
+            if is_dynamic:
+                tl.store(scale_ptr + row_id, scale)
+        else:
+            cols = tl.arange(0, BLOCK)
+            mask = cols < GROUP_SIZE
+            x = tl.load(x_ptr + offset + cols, mask=mask, other=0.0).to(tl.float32)
+            scale = calc_scale(x, dtype) if is_dynamic else tl.load(scale_ptr + col_block_id)
+            inv_scale = 1 / scale
+            x_q = quant_tensor(x * inv_scale, dtype)
+            tl.store(xq_ptr + group_id * GROUP_SIZE + cols, x_q, mask=mask)
+
+            if is_dynamic:
+                tl.store(scale_ptr + row_id * row_num_blocks + col_block_id, scale)
 
 
 def quant_input(
@@ -176,9 +180,17 @@ def quant_input(
     if not isinstance(inputs, FakeTensor):
         assert inputs.is_cuda
         BLOCK = triton.next_power_of_2(group_size)
-        num_warps = min(max(BLOCK // 256, 1), 8)
+        # Merge multiple groups per block to reduce scheduling overhead.
+        groups_per_block = 1
+        if group_size <= 256 and num_blocks >= 131072:
+            # Small group_size (e.g. 128) with massive block count
+            groups_per_block = min(1024 // group_size, num_blocks)
+        grid_blocks = (num_blocks + groups_per_block - 1) // groups_per_block
+        effective_block = BLOCK // 2 if dtype in ("int4", "float4e2m1") else BLOCK
+        num_warps = min(max(effective_block // 256, 1), 8)
+        num_stages = 1
 
-        _quant_tensor_kernel[(num_blocks,)](
+        _quant_tensor_kernel[(grid_blocks,)](
             inputs,
             outputs,
             scales,
@@ -187,9 +199,10 @@ def quant_input(
             inputs.size(1),
             group_size,
             BLOCK,
+            groups_per_block,
             dtype,
             num_warps=num_warps,
-            num_stages=1,
+            num_stages=num_stages,
         )
 
     if scales is None:
