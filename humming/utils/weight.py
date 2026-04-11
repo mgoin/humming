@@ -232,7 +232,7 @@ def prepare_humming_weight(
         zero_point=zero_point,
         weight_bits=b_dtype.num_bits,
         activation_bits=a_dtype.num_bits,
-        is_weight_pakced=packed,
+        is_weight_packed=packed,
         should_preprocess_for_int2fp=should_preprocess_for_int2fp,
         should_preprocess_with_zp=should_preprocess_with_zp,
         use_wgmma=use_wgmma,

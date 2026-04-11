@@ -146,22 +146,30 @@ def quant_input(
     inputs: torch.Tensor,
     dtype: str,
     scales: torch.Tensor | None = None,
+    outputs: torch.Tensor | None = None,
     group_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if dtype in ["int4", "float4e2m1"]:
-        outputs = torch.empty(
-            (*inputs.shape[:-1], inputs.size(-1) // 2),
-            dtype=torch.uint8,
-            device=inputs.device,
-        )
+        output_shape = (*inputs.shape[:-1], inputs.size(-1) // 2)
+        output_dtype = torch.uint8
     elif dtype == "int8":
-        outputs = torch.empty_like(inputs, dtype=torch.int8)
+        output_shape = inputs.shape
+        output_dtype = torch.int8
     elif dtype == "float8e4m3":
-        outputs = torch.empty_like(inputs, dtype=torch.float8_e4m3fn)
+        output_shape = inputs.shape
+        output_dtype = torch.float8_e4m3fn
     elif dtype == "float8e5m2":
-        outputs = torch.empty_like(inputs, dtype=torch.float8_e5m2)
+        output_shape = inputs.shape
+        output_dtype = torch.float8_e5m2
     else:
         raise ValueError("unsupported dtype: " + dtype)
+
+    if outputs is None:
+        outputs = torch.empty(output_shape, dtype=output_dtype, device=inputs.device)
+
+    assert outputs.shape == output_shape
+    assert outputs.dtype == output_dtype
+    assert outputs.device == inputs.device
 
     is_dynamic = scales is None
     inputs = inputs.view(-1, inputs.size(-1))

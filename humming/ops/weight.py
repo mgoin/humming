@@ -103,7 +103,7 @@ def repack_weight(
     inputs: torch.Tensor,
     weight_bits: int,
     activation_bits: int,
-    is_weight_pakced: bool,
+    is_weight_packed: bool,
     should_preprocess_for_int2fp: bool = False,
     should_preprocess_with_zp: bool = False,
     use_wgmma: bool = False,
@@ -120,7 +120,7 @@ def repack_weight(
     num_experts = 1 if inputs.ndim == 2 else inputs.size(0)
     shape_n = inputs.size(-2)
     shape_k = inputs.size(-1)
-    if is_weight_pakced:
+    if is_weight_packed:
         assert shape_k * 32 % weight_bits == 0
         shape_k = shape_k * 32 // weight_bits
 
@@ -129,7 +129,7 @@ def repack_weight(
         group_size_zp = shape_k if group_size_zp == 0 else group_size_zp
         zero_point_shape = inputs.shape[:-1] + (math.ceil(shape_k / group_size_zp),)
 
-        if is_weight_pakced:
+        if is_weight_packed:
             assert shape_n * weight_bits % 32 == 0
             packed_shape_n = shape_n * weight_bits // 32
             zero_point_shape = zero_point_shape[:-2] + (packed_shape_n,) + zero_point_shape[-1:]
@@ -150,7 +150,7 @@ def repack_weight(
         kernel = RepackWeightKernel(
             weight_bits=weight_bits,
             activation_bits=activation_bits,
-            is_weight_pakced=is_weight_pakced,
+            is_weight_packed=is_weight_packed,
             should_preprocess_for_int2fp=should_preprocess_for_int2fp,
             should_preprocess_with_zp=should_preprocess_with_zp,
             use_wgmma=use_wgmma,

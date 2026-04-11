@@ -20,7 +20,7 @@ class RepackWeightKernel(KernelRuntime):
     name: ClassVar[str] = "weight_repack_nk"
     weight_bits: int
     activation_bits: int
-    is_weight_pakced: bool
+    is_weight_packed: bool
     should_preprocess_for_int2fp: bool = False
     should_preprocess_with_zp: bool = False
     use_wgmma: bool = False
@@ -33,7 +33,7 @@ class RepackWeightKernel(KernelRuntime):
         self.code = CODE_TEMPLATE.render(
             weight_bits=self.weight_bits,
             activation_bits=self.activation_bits,
-            is_weight_pakced=int(self.is_weight_pakced),
+            is_weight_packed=int(self.is_weight_packed),
             should_preprocess_for_int2fp=int(self.should_preprocess_for_int2fp),
             should_preprocess_with_zp=int(self.should_preprocess_with_zp),
             use_wgmma=int(self.use_wgmma),
@@ -43,7 +43,7 @@ class RepackWeightKernel(KernelRuntime):
             f"weight_repack_nk<\n"
             f"    {self.weight_bits},\n"
             f"    {self.activation_bits},\n"
-            f"    {int(self.is_weight_pakced)},\n"
+            f"    {int(self.is_weight_packed)},\n"
             f"    {int(self.should_preprocess_for_int2fp)},\n"
             f"    {int(self.should_preprocess_with_zp)},\n"
             f"    {int(self.use_wgmma)},\n"
@@ -72,7 +72,7 @@ class RepackWeightKernel(KernelRuntime):
         num_experts = 1 if inputs.ndim == 2 else inputs.size(0)
         shape_n = inputs.size(-2)
         shape_k = inputs.size(-1)
-        if self.is_weight_pakced:
+        if self.is_weight_packed:
             assert shape_k * 32 % self.weight_bits == 0
             shape_k = shape_k * 32 // self.weight_bits
 

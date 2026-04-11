@@ -394,7 +394,7 @@ class HummingLayerMethod:
             return inputs, None
         if input_scale is not None:
             return inputs, input_scale
-        quanted_input = ops.quant_input(
+        quanted_input, input_scale = ops.quant_input(
             inputs=inputs,
             outputs=quanted_input,
             dtype=str(meta.a_dtype),

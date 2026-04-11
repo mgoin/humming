@@ -361,9 +361,11 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
 
         if isinstance(tuning_config_obj, dict):
             config = layer_config_obj | compute_config_obj | tuning_config_obj
+            num_sms = config.pop("num_sms", 0)
             kernel = HummingKernel(**config)
-            cls._str2kernel_cache[cache_key] = kernel.kernel_id
-            return kernel.kernel_id
+            res = [0, 1 << 30, kernel.kernel_id, num_sms]
+            cls._str2kernel_cache[cache_key] = res
+            return res
 
         def prepare_kernel(data):
             _, _, tuning_config_obj_single = data
