@@ -182,16 +182,16 @@ public:
     if (pred) {
       uint64_t *mbar_ptr = nullptr;
       if constexpr (kUseMBarrier) mbar_ptr = &smem.load_mbar[mbar_index];
-      loader_a.load<kShouldAdvance>(smem.a[stage_id], mbar_ptr);
-      loader_b.load<kShouldAdvance>(smem.b[stage_id], mbar_ptr);
+      loader_a.template load<kShouldAdvance>(smem.a[stage_id], mbar_ptr);
+      loader_b.template load<kShouldAdvance>(smem.b[stage_id], mbar_ptr);
       if constexpr (kIsGroupInputScale) {
-        loader_as.load<kShouldAdvance>(smem.as[stage_id], mbar_ptr);
+        loader_as.template load<kShouldAdvance>(smem.as[stage_id], mbar_ptr);
       };
       if constexpr (kIsGroupWeightScale || kIsBlockWeightScale) {
-        loader_bs.load<kShouldAdvance>(smem.bs[stage_id], mbar_ptr);
+        loader_bs.template load<kShouldAdvance>(smem.bs[stage_id], mbar_ptr);
       };
       if constexpr (kHasZeroPoint && (kIsGroupWeightScale || kIsFirst)) {
-        loader_bzp.load<kShouldAdvance>(smem.bzp[stage_id], mbar_ptr);
+        loader_bzp.template load<kShouldAdvance>(smem.bzp[stage_id], mbar_ptr);
       }
       load_bytes = get_stage_load_bytes<kIsFirst>();
     }

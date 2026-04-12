@@ -107,14 +107,14 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     epilogue.set_streamk_state(scheduler.slice_count, scheduler.slice_id, scheduler.locks_offset);
 
     if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
-    producer.load_stage<true, true>(0);
+    producer.template load_stage<true, true>(0);
     PRAGMA_UNROLL
     for (uint32_t stage_id = 1; stage_id < MAX(kNumStages - 1, 2); stage_id++) {
       producer.load_stage(stage_id, stage_id < slice_iters);
     };
 
-    consumer.wait_stage<true>(kNumStages);
-    s2r_pipe.load_stage_iter<true>(0, 0);
+    consumer.template wait_stage<true>(kNumStages);
+    s2r_pipe.template load_stage_iter<true>(0, 0);
     mma.transform_b(0);
 
     while (slice_iters) {
