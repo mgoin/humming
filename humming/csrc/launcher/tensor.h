@@ -109,7 +109,7 @@ inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_da
   uint32_t group_size = kernel_data.input_scale_group_size;
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(problem_shape_k, group_size);
 
-  std::vector<int64_t> expected_shape = {shape_m * (kernel_data.gemm_type_id == 1 ? top_k : 1)};
+  std::vector<int64_t> expected_shape = {shape_m};
   expected_shape.push_back(num_groups);
   check_tensor_common(tensor.value(), "as", dev, ScalarType::Float, expected_shape);
 };

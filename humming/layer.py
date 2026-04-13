@@ -190,8 +190,8 @@ class HummingLayerMethod:
             b_dtype=weight_schema.b_dtype,
             bs_dtype=weight_schema.bs_dtype or f16_dtype,
             c_dtype=f16_dtype,
-            shape_n=shape_n,
-            shape_k=shape_k,
+            shape_n=shape_n + pad_shape_n,
+            shape_k=shape_k + pad_shape_k,
             pad_shape_n=pad_shape_n,
             pad_shape_k=pad_shape_k,
             num_experts=num_experts or 0,
@@ -237,16 +237,16 @@ class HummingLayerMethod:
 
         schema.validate_tensors(
             tensors,
-            shape_n=meta.shape_n,
-            shape_k=meta.shape_k,
+            shape_n=meta.shape_n - meta.pad_shape_n,
+            shape_k=meta.shape_k - meta.pad_shape_k,
             num_experts=meta.num_experts,
             param_dtype=meta.param_dtype,
             has_bias=meta.has_bias,
         )
 
         tensors_attrs = schema.get_tensors_attrs(
-            shape_n=meta.shape_n + meta.pad_shape_n,
-            shape_k=meta.shape_k + meta.pad_shape_k,
+            shape_n=meta.shape_n,
+            shape_k=meta.shape_k,
             num_experts=meta.num_experts,
             param_dtype=meta.param_dtype,
             has_bias=meta.has_bias,
