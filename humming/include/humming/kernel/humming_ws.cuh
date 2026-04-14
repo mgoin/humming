@@ -102,6 +102,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       uint32_t &slice_iters = scheduler.slice_iters;
 
       producer.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.k_block_id, scheduler.current_shape_m, scheduler.m_offset);
+      producer.wait_math_epilogue();
       producer.load_stage<true, true>(0);
       PRAGMA_UNROLL
       for (uint32_t stage_id = 1; stage_id < kNumStages - 1; stage_id++) {
@@ -111,10 +112,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       while (slice_iters) {
         PRAGMA_UNROLL
         for (uint32_t stage_id = 0; stage_id < kNumStages; stage_id++) {
-          if (slice_iters == 1) {
-            producer.wait_channel();
-            producer.load_channel();
-          }
+          if (slice_iters == 1) producer.load_channel();
           producer.wait_stage(stage_id);
           producer.load_stage(stage_id + kNumStages - 1, slice_iters >= kNumStages);
           slice_iters--;
@@ -142,7 +140,6 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
     while (scheduler.get_next_block()) {
       mma.zero_accum();
-      if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
 
       uint32_t &slice_iters = scheduler.slice_iters;
       epilogue.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.current_shape_m, scheduler.m_offset);
@@ -179,8 +176,9 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
       consumer.wait_channel();
       s2r_pipe.load_channel(scheduler.slice_id);
-      consumer.arrive(kNumStages);
       epilogue.call(mma.final_regs_c_as_ptr());
+      if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
+      consumer.arrive(kNumStages);
     }
   }
 

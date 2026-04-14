@@ -50,6 +50,7 @@ public:
 
   CUDA_INLINE
   void call(uint32_t *regs_c_ptr) {
+    sync_math_threads();
     if constexpr (BlockShape::K > WarpShape::K) smem_reducer.reduce(regs_c_ptr);
     static_assert(kNumWriteSplits == 1 || kNumWriteSplits == 2);
     if constexpr (kNumWriteSplits > 1) {

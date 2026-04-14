@@ -6,7 +6,7 @@
 template <class BlockShape, class WarpShape, class ElementA, class ElementB, class TuningConfig>
 class S2RMemoryLoaderB {
 private:
-  static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
+  static constexpr uint32_t kNumMathThreads = TuningConfig::kNumMathThreads;
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kWarpItersK = WarpShape::K / kPartMmaShapeK;
 
@@ -33,7 +33,7 @@ public:
     uint32_t idx = warp_weight_blocks * 32 * n_warp_id + lane_id;
 
     if constexpr (K_WARPS > 1) {
-      uint32_t k_warp_id = (threadIdx.x / (kNumThreads / K_WARPS));
+      uint32_t k_warp_id = (threadIdx.x / (kNumMathThreads / K_WARPS));
       idx = TRUE_N_WARPS * 32 * warp_weight_blocks * kWarpItersK * k_warp_id + idx;
     }
 

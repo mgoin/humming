@@ -216,8 +216,11 @@ def generate_random_moe_tensors(
             expert_layout = expert_num_tokens.int()
         else:
             expert_first_token_offset = expert_num_tokens.cumsum(0)
-            expert_first_token_offset[1:] = expert_first_token_offset[:-1].clone()
-            expert_first_token_offset[0] = 0
+            expert_first_token_offset = torch.nn.functional.pad(
+                expert_first_token_offset,
+                pad=(1, 0),
+                value=0,
+            )
             expert_layout = expert_first_token_offset.long()
         return topk_ids, expert_layout, None, None, None
     else:

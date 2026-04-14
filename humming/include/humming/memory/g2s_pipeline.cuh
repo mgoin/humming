@@ -167,8 +167,10 @@ public:
       }
 
       if (thread_id < kNumStages + 2) __mbarrier_init(&smem.load_mbar[thread_id], count);
-      uint32_t factor = (kMultiCastSize > 1 && cluster_rank == 0) ? kMultiCastSize : 1;
-      if (thread_id < kNumStages + 1) __mbarrier_init(&smem.math_mbar[thread_id], TuningConfig::kNumMathThreads * factor / 32);
+      uint32_t factor = (kMultiCastSize > 1 && cluster_rank == 0 && thread_id < kNumStages) ? kMultiCastSize : 1;
+      if constexpr (TuningConfig::kUseWarpSpec) {
+        if (thread_id < kNumStages + 1) __mbarrier_init(&smem.math_mbar[thread_id], TuningConfig::kNumMathThreads * factor / 32);
+      }
     }
   }
 
@@ -242,6 +244,11 @@ public:
       mbarrier_wait(&smem.math_mbar[kNumStages], phases[kNumStages]);
       phases[kNumStages] ^= 1;
     }
+  }
+
+  CUDA_INLINE void wait_math_epilogue() {
+    mbarrier_wait(&smem.math_mbar[kNumStages], phases[kNumStages]);
+    phases[kNumStages] ^= 1;
   }
 
   CUDA_INLINE void seek(
@@ -325,7 +332,7 @@ public:
     if (lane_id == 0) {
       mbarrier_arrive(&smem.math_mbar[stage_id]);
       if constexpr (kMultiCastSize > 1) {
-        if (cluster_rank >= 1) {
+        if (cluster_rank >= 1 && stage_id < kNumStages) {
           void *aa = __cluster_map_shared_rank(&smem.math_mbar[stage_id], 0);
           mbarrier_arrive<true>(aa);
         }

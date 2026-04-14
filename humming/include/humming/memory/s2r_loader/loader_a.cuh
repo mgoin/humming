@@ -7,7 +7,7 @@ template <class MmaOpClass, class BlockShape, class WarpShape, class ElementA, c
 class S2RMemoryLoaderA {
 private:
   using MmaShape = typename MmaOpClass::MmaShape;
-  static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
+  static constexpr uint32_t kNumMathThreads = TuningConfig::kNumMathThreads;
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
   static constexpr uint32_t N_WARPS = BlockShape::N / WarpShape::N;
@@ -27,7 +27,7 @@ public:
     for (uint32_t load_iter_id = 0; load_iter_id < CEIL_DIV(WarpShape::M, 16); load_iter_id++) {
 
       uint32_t row = m_iter_id * (BlockShape::M / M_WARPS) + load_iter_id * 16;
-      uint32_t col = 2 * kWarpItersK * (threadIdx.x / (kNumThreads / K_WARPS)) + iter_id * 2;
+      uint32_t col = 2 * kWarpItersK * (threadIdx.x / (kNumMathThreads / K_WARPS)) + iter_id * 2;
 
       if constexpr (MmaShape::M == 8) {
         row += (lane_id / 16) * 8 + lane_id % 8;

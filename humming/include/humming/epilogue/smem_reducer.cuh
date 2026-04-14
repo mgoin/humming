@@ -13,7 +13,6 @@ private:
   using ValTypeC32 = std::conditional_t<sizeof(MmaTypeC) == 2, OutputType32, MmaTypeC>;
 
   static constexpr bool kUseWgmma = MmaOpClass::kMmaType == MmaType::WGMMA;
-  static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
   using CRegistersType = typename MmaOpClass::CRegisters;
   using MMA_CRegistersArrayType = CRegistersType[WarpShape::M / MmaShape::M][WarpShape::N / MmaShape::N];
   using WGMMA_CRegistersArrayType = CRegistersType[WarpShape::N * 4 / MmaShape::M][WarpShape::M / MmaShape::N];
@@ -32,7 +31,7 @@ public:
     constexpr uint32_t num_int4s = sizeof(CRegistersArrayType) / 16;
     constexpr uint32_t num_int4s_per_time = num_int4s / MAX(WarpShape::M / 16, 1);
     constexpr uint32_t group_num_warps = BlockShape::K / WarpShape::K;
-    constexpr uint32_t num_groups = kNumThreads / 32 / group_num_warps;
+    constexpr uint32_t num_groups = TuningConfig::kNumMathThreads / 32 / group_num_warps;
     uint32_t group_id = threadIdx.x / 32 % num_groups;
     uint32_t group_warp_id = threadIdx.x / (32 * num_groups);
     uint32_t laneid = threadIdx.x % 32;

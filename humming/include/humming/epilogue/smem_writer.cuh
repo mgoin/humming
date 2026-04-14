@@ -87,7 +87,7 @@ private:
   using CRegistersArrayType = std::conditional_t<kUseWgmma, WGMMA_CRegistersArrayType, MMA_CRegistersArrayType>;
 
   static constexpr uint32_t kNumWriteSplits = TuningConfig::kNumWriteSplits;
-  static constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
+  static constexpr uint32_t kNumMathThreads = TuningConfig::kNumMathThreads;
   static constexpr bool kHasInputScale = ElementA::kBits != 16;
   static constexpr bool kIsGroupInputScale = kHasInputScale && LayerConfig::kInputScaleGroupSize > 0;
   static constexpr bool kIsGroupWeightScale = LayerConfig::kIsGroupWeightScale;
@@ -112,7 +112,7 @@ public:
 
   CUDA_INLINE
   void write(uint32_t *regs_ptr, uint32_t slice_count, uint32_t split_idx) {
-    if (threadIdx.x >= kNumThreads / K_WARPS) return;
+    if (threadIdx.x >= kNumMathThreads / K_WARPS) return;
 
     auto &regs = *reinterpret_cast<CRegistersArrayType *>(regs_ptr);
     scalar_t2 *smem_half2_ptr = reinterpret_cast<scalar_t2 *>(smem_ptr);

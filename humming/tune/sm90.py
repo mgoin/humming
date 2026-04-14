@@ -14,7 +14,11 @@ if TYPE_CHECKING:
 class Sm90Heuristics(DeviceHeuristics):
     max_smem_size: int = 227 * 1024
     b16_allowed_dtypes: list[dtypes.DataType] = [dtypes.float16, dtypes.bfloat16]
-    b8_allowed_dtypes: list[dtypes.DataType] = [dtypes.int8, dtypes.float8e4m3, dtypes.float8e5m2]
+    b8_allowed_dtypes: list[dtypes.DataType] = [
+        dtypes.int8,
+        dtypes.float8e4m3,
+        dtypes.float8e5m2,
+    ]
     b4_allowed_dtypes: list[dtypes.DataType] = []
     sm_version: int = 90
 
@@ -37,7 +41,7 @@ class Sm90Heuristics(DeviceHeuristics):
         warp_shape_n = 32
         warp_shape_k = 1024 // meta.a_dtype.num_bits
 
-        if meta.shape_n <= 4096 and not use_batch_invariant:
+        if meta.shape_n <= 4096 and not use_batch_invariant and block_shape_m <= 64:
             block_shape_n = 128
             block_shape_k = warp_shape_k * 2
             if block_shape_m <= 32:
@@ -61,7 +65,7 @@ class Sm90Heuristics(DeviceHeuristics):
             "num_stages": 4,
         }
 
-        if not meta.num_experts:
+        if gemm_type != GemmType.INDEXED:
             config["use_warp_spec"] = True
             config["use_tma"] = True
             config["use_mbarrier"] = True
@@ -102,7 +106,7 @@ class Sm90Heuristics(DeviceHeuristics):
             "num_stages": 4,
         }
 
-        if not meta.num_experts:
+        if gemm_type != GemmType.INDEXED:
             config["use_warp_spec"] = True
             config["use_tma"] = True
             config["use_mbarrier"] = True
@@ -129,10 +133,12 @@ class Sm90Heuristics(DeviceHeuristics):
             counts = np.bincount(samples)
             for i in range(max_block_m // 8):
                 block_m = i * 8 + 8
-                num_blocks = np.ceil(counts * 1.1 / block_m) * block_m
+                num_blocks = np.ceil(counts * 1.1 / block_m).sum() * block_m
                 num_blocks_list.append(num_blocks)
 
         for i in range(max_block_m // 8):
+            num_blocks = num_blocks_list[i]
+            block_m = i * 8 + 8
             if meta.a_dtype == dtypes.int8 and num_blocks % 16 == 8 and block_m > 32:
                 num_blocks_list[i] = 10000
 
