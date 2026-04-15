@@ -82,7 +82,7 @@ private:
   using MmaShape = typename MmaOpClass::MmaShape;
   using ValTypeC = typename MmaOpClass::ValTypeC;
   using CRegistersType = typename MmaOpClass::CRegisters;
-  using MMA_CRegistersArrayType = CRegistersType[WarpShape::M / MmaShape::M][WarpShape::N / MmaShape::N];
+  using MMA_CRegistersArrayType = CRegistersType[MAX(WarpShape::M / MmaShape::M, 1)][MAX(WarpShape::N / MmaShape::N, 1)];
   using WGMMA_CRegistersArrayType = CRegistersType[WarpShape::N * 4 / MmaShape::M][WarpShape::M / MmaShape::N];
   using CRegistersArrayType = std::conditional_t<kUseWgmma, WGMMA_CRegistersArrayType, MMA_CRegistersArrayType>;
 

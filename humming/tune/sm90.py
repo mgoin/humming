@@ -66,12 +66,13 @@ class Sm90Heuristics(DeviceHeuristics):
         }
 
         if gemm_type != GemmType.INDEXED:
-            config["use_warp_spec"] = True
+            # config["use_warp_spec"] = True
             config["use_tma"] = True
             config["use_mbarrier"] = True
 
             if meta.shape_n % (block_shape_n * 2) == 0 and shape_m / block_shape_m >= 4:
-                config["multi_cast_size_a"] = 2
+                if gemm_type == GemmType.DENSE:
+                    config["multi_cast_size_a"] = 2
 
         return config
 
@@ -107,11 +108,11 @@ class Sm90Heuristics(DeviceHeuristics):
         }
 
         if gemm_type != GemmType.INDEXED:
-            config["use_warp_spec"] = True
+            # config["use_warp_spec"] = True
             config["use_tma"] = True
             config["use_mbarrier"] = True
 
-            if shape_m / block_shape_m >= 4:
+            if shape_m / block_shape_m >= 4 and gemm_type == GemmType.DENSE:
                 config["multi_cast_size_a"] = 2
 
         return config
