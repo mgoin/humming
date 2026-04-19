@@ -338,5 +338,6 @@ public:
         }
       }
     }
+    __syncwarp();
   }
 };

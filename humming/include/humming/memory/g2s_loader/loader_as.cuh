@@ -106,11 +106,15 @@ public:
       col_offset = 0;
     }
 
-    if constexpr (kIsGroupedGemm) shape_m = current_shape_m;
-    row_offset = m_block_id * BlockShape::M + m_offset;
+    if constexpr (kIsGroupedGemm) {
+      shape_m = current_shape_m;
+      row_offset = m_offset;
+    } else {
+      row_offset = m_block_id * BlockShape::M;
+    }
     block_shape_m = MIN((shape_m - row_offset), BlockShape::M);
     if constexpr (!kIsIndexedGemm) {
-      gmem_ptr = gmem_ptr_raw + (m_block_id * (BlockShape::M * kProblemNumGroups) + col_offset);
+      gmem_ptr = gmem_ptr_raw + ((row_offset * kProblemNumGroups) + col_offset);
     } else {
       gmem_ptr = gmem_ptr_raw;
 

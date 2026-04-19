@@ -3,15 +3,14 @@
 #include <humming/utils/base.cuh>
 
 
-template <uint32_t kNumSyncThreads, uint32_t kNumThreads>
+template <uint32_t kNumSyncThreads, uint32_t kNumThreads, uint32_t kBarrierId = 1>
 CUDA_INLINE uint32_t sync_part_threads() {
   if constexpr (kNumSyncThreads == kNumThreads) {
     __syncthreads();
   } else {
     static_assert(kNumThreads >= kNumSyncThreads);
     static_assert(kNumSyncThreads > 0);
-    constexpr uint32_t barrier_id = 1;
-    asm volatile("bar.sync %0, %1;":: "r"(barrier_id), "r"(kNumSyncThreads));
+    asm volatile("bar.sync %0, %1;":: "r"(kBarrierId), "r"(kNumSyncThreads));
   }
 }
 
@@ -46,7 +45,7 @@ CUDA_INLINE void barrier_release(int *lock, bool reset = false) {
   sync_part_threads<kNumSyncThreads, kNumThreads>();
   if (threadIdx.x == 0) {
     if (reset) {
-      lock[0] = 0;
+      __stcg(&lock[0], 0);
     } else {
       int32_t val = 1;
       asm volatile("fence.acq_rel.gpu;\n");
@@ -62,7 +61,7 @@ CUDA_INLINE void barrier_release2(int *lock, int32_t val) {
   sync_part_threads<kNumSyncThreads, kNumThreads>();
   if (threadIdx.x == 0) {
     if (val < 0) {
-      lock[0] = val;
+      __stcg(&lock[0], val);
     } else {
       int32_t val = 1;
       asm volatile("fence.acq_rel.gpu;\n");

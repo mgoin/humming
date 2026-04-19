@@ -84,7 +84,7 @@ public:
         row_index_blocks(row_index_blocks), expert_ids(expert_ids) {
 
     if constexpr (kIsGroupedGemm && TuningConfig::kUseTmaC) {
-      if (threadIdx.x == kLoadThreadOffset) smem.tensor_map_buffer[0] = reinterpret_cast<const CUtensorMap *>(output_ptr)[0];
+      if (threadIdx.x == 0) smem.tensor_map_buffer[0] = reinterpret_cast<const CUtensorMap *>(output_ptr)[0];
       __syncwarp();
     }
 
@@ -294,7 +294,7 @@ public:
     if constexpr (kUseCpAsync) cp_async_commit_group();
     if constexpr (kUseCpAsync) cp_async_wait_group<0>();
 
-    sync_part_threads<kNumLoadThreads, kNumThreads>();
+    sync_part_threads<kNumLoadThreads, kNumThreads, 2>();
 
     uint32_t thread_id = threadIdx.x;
     if constexpr (kUseWarpSpec) thread_id = thread_id - kNumMathThreads;
@@ -307,19 +307,22 @@ public:
       };
     }
 
-    sync_part_threads<kNumLoadThreads, kNumThreads>();
+    sync_part_threads<kNumLoadThreads, kNumThreads, 2>();
   };
 
   CUDA_INLINE
   void update_tensor_map_c() {
     if constexpr (kIsGroupedGemm && TuningConfig::kUseTmaC) {
-      if (threadIdx.x == kLoadThreadOffset) {
-        tensor_map_replace_global_dim<1>(smem.tensor_map_buffer, current_shape_m);
-        tensor_map_buffer[blockIdx.x] = smem.tensor_map_buffer[0];
-        tensor_map_release_cta();
-        tensor_map_acquire_cta(tensor_map_buffer + blockIdx.x);
+      if (threadIdx.x < 32) {
+        __syncwarp();
+        if (threadIdx.x == 0) {
+          tensor_map_replace_global_dim<1>(smem.tensor_map_buffer, current_shape_m);
+          tensor_map_buffer[blockIdx.x] = smem.tensor_map_buffer[0];
+          tensor_map_release_cta();
+          tensor_map_acquire_cta(tensor_map_buffer + blockIdx.x);
+        }
+        __syncwarp();
       }
-      __syncthreads();
     }
   }
 };

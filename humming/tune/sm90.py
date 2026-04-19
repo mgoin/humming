@@ -66,7 +66,7 @@ class Sm90Heuristics(DeviceHeuristics):
         }
 
         if gemm_type != GemmType.INDEXED:
-            # config["use_warp_spec"] = True
+            config["use_warp_spec"] = True
             config["use_tma"] = True
             config["use_mbarrier"] = True
 
@@ -108,7 +108,7 @@ class Sm90Heuristics(DeviceHeuristics):
         }
 
         if gemm_type != GemmType.INDEXED:
-            # config["use_warp_spec"] = True
+            config["use_warp_spec"] = True
             config["use_tma"] = True
             config["use_mbarrier"] = True
 
@@ -154,7 +154,7 @@ class Sm90Heuristics(DeviceHeuristics):
         use_batch_invariant: bool = False,
         gemm_type: GemmType = GemmType.DENSE,
     ):
-        if meta.b_dtype.num_bits == 16:
+        if meta.a_dtype.num_bits == 16:
             func = cls.get_config1
         elif meta.input_scale_group_size == 0 and meta.weight_scale_group_size == 0:
             func = cls.get_config1
