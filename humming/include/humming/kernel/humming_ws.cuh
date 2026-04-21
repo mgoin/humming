@@ -43,7 +43,8 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     CUtensorMap *tensor_map_buffer,
     int32_t *locks,
     uint32_t shape_m,
-    uint32_t top_k) {
+    uint32_t top_k,
+    bool use_int64_expert_layout) {
 
   constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
   constexpr uint32_t kNumStages = TuningConfig::kNumStages;
@@ -85,7 +86,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   auto pbs = [&]() {if constexpr (TuningConfig::kUseTmaBS) return &BS; else return BS; };
   auto pbzp = [&]() {if constexpr (TuningConfig::kUseTmaBZP) return &BZP; else return BZP; };
   auto pbias = [&]() {if constexpr (TuningConfig::kUseTmaBias) return &Bias; else return Bias; };
-  auto scheduler = Scheduler(smem, pc(), tensor_map_buffer, shape_m, top_k, sorted_ids_ptr, expert_ids_ptr, num_tokens_padded_ptr, expert_layout_ptr);
+  auto scheduler = Scheduler(smem, pc(), tensor_map_buffer, shape_m, top_k, sorted_ids_ptr, expert_ids_ptr, num_tokens_padded_ptr, expert_layout_ptr, use_int64_expert_layout);
   if (threadIdx.x >= TuningConfig::kNumMathThreads) {
     if constexpr (TuningConfig::kNumMathThreads > 256) {
       asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(40));

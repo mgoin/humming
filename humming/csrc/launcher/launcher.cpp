@@ -133,6 +133,10 @@ Tensor launch_kernel(
   auto tensor_map_bias = make_tma_desc_bias(bias_, kernel_data);
   auto to_void_ptr = [&](void *ptr) { return ptr; };
   uint32_t top_k_val = top_k.expect_int();
+  bool use_int64_expert_layout = false;
+  if (expert_layout_.has_value()) {
+    use_int64_expert_layout = expert_layout_.value().scalar_type() == ScalarType::Long;
+  }
 
   void *kernel_args[] = {
       kernel_data.use_tma_a ? to_void_ptr(&tensor_map_a) : to_void_ptr(&a_ptr),
@@ -150,7 +154,8 @@ Tensor launch_kernel(
       &tensor_map_buffer_ptr,
       &locks_ptr,
       &shape_m,
-      &top_k_val};
+      &top_k_val,
+      &use_int64_expert_layout};
 
   CUlaunchConfig config = {};
   config.gridDimX = num_ctas;

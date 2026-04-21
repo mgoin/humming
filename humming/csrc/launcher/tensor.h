@@ -200,13 +200,17 @@ inline void check_tensor_moe(
   }
   if (kernel_data.gemm_type_id == 2) {
     ASSERT_CHECK(expert_layout.has_value(), "expert_layout must not be none for grouped gemm");
+    ASSERT_CHECK(expert_layout.value().scalar_type() == ScalarType::Int || expert_layout.value().scalar_type() == ScalarType::Long,
+                 "expert_layout.dtype must be int32 or int64, got ", DTYPE_TO_STRING(expert_layout.value().scalar_type()));
     std::vector<int64_t> expected_shape = {kernel_data.num_experts + 1};
-    check_tensor_common(expert_layout.value(), "expert_token_offset", dev, ScalarType::Long, expected_shape);
+    check_tensor_common(expert_layout.value(), "expert_token_offset", dev, expert_layout.value().scalar_type(), expected_shape);
   }
   if (kernel_data.gemm_type_id == 3) {
     ASSERT_CHECK(expert_layout.has_value(), "expert_layout must not be none for grouped gemm");
+    ASSERT_CHECK(expert_layout.value().scalar_type() == ScalarType::Int || expert_layout.value().scalar_type() == ScalarType::Long,
+                 "expert_layout.dtype must be int32 or int64, got ", DTYPE_TO_STRING(expert_layout.value().scalar_type()));
     std::vector<int64_t> expected_shape = {kernel_data.num_experts};
-    check_tensor_common(expert_layout.value(), "expert_num_tokens", dev, ScalarType::Int, expected_shape);
+    check_tensor_common(expert_layout.value(), "expert_num_tokens", dev, expert_layout.value().scalar_type(), expected_shape);
   }
 };
 

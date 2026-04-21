@@ -72,6 +72,7 @@ public:
   uint32_t expert_max_num_tokens;
   uint32_t offset_in_expert = 0;
   uint32_t m_offset = 0;
+  bool use_int64_expert_layout;
 
   CUtensorMap *tensor_map_buffer;
 
@@ -79,9 +80,9 @@ public:
   Scheduler(
       SharedStorage &smem, const void *output_ptr, CUtensorMap *tensor_map_buffer,
       uint32_t shape_m, uint32_t top_k, const uint32_t *row_index_blocks, const uint32_t *expert_ids,
-      const uint32_t *num_tokens_padded_ptr, const uint32_t *expert_layout_ptr)
+      const uint32_t *num_tokens_padded_ptr, const uint32_t *expert_layout_ptr, bool use_int64_expert_layout)
       : smem(smem), tensor_map_buffer(tensor_map_buffer), shape_m(shape_m), top_k(top_k),
-        row_index_blocks(row_index_blocks), expert_ids(expert_ids) {
+        row_index_blocks(row_index_blocks), expert_ids(expert_ids), use_int64_expert_layout(use_int64_expert_layout) {
 
     if constexpr (kIsGroupedGemm && TuningConfig::kUseTmaC) {
       if (threadIdx.x == 0) smem.tensor_map_buffer[0] = reinterpret_cast<const CUtensorMap *>(output_ptr)[0];
@@ -143,9 +144,15 @@ public:
       m_blocks = CEIL_DIV(padded_shape_m, BlockShape::M * kMultiCastSizeB);
     } else if constexpr (kIsGroupedGemm) {
       if constexpr (ComputeConfig::kGemmType == GemmType::GROUPED_CONTIGUOUS) {
-        legacy_load_2d<kUseCpAsync, kNumExperts + 1, kNumThreads, 2, 1>(expert_layout, smem.expert_offset);
+        if (use_int64_expert_layout)
+          legacy_load_2d<kUseCpAsync, kNumExperts + 1, kNumThreads, 2, 1>(expert_layout, smem.expert_offset);
+        else
+          legacy_load_2d<kUseCpAsync, kNumExperts + 1, kNumThreads, 1, 1>(expert_layout, smem.expert_offset);
       } else {
-        legacy_load_1d<kUseCpAsync, kNumExperts, kNumThreads>(expert_layout, smem.expert_tokens);
+        if (use_int64_expert_layout)
+          legacy_load_2d<kUseCpAsync, kNumExperts, kNumThreads, 2, 1>(expert_layout, smem.expert_tokens);
+        else
+          legacy_load_2d<kUseCpAsync, kNumExperts, kNumThreads, 1, 1>(expert_layout, smem.expert_tokens);
       }
       if constexpr (kUseCpAsync) cp_async_commit_group();
       if constexpr (kUseCpAsync) cp_async_wait_group<0>();
