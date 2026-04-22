@@ -4,29 +4,26 @@
 #include "./torch_api.h"
 #include "./tma.h"
 #include "./utils.h"
-#include <ATen/EmptyTensor.h>
 
-inline Tensor may_make_tensor_c(std::optional<Tensor> &c, const Tensor &a, KernelData& kernel_data, at::SymInt top_k) {
+inline Tensor may_make_tensor_c(std::optional<Tensor> &c, const Tensor &a, KernelData& kernel_data, int64_t top_k) {
   if (c.has_value()) return c.value();
 
-  at::SymInt shape_m = a.sym_size(0);
-  at::SymInt shape_n = kernel_data.problem_shape_n - kernel_data.pad_shape_n;
+  int64_t shape_m = a.size(0);
+  int64_t shape_n = kernel_data.problem_shape_n - kernel_data.pad_shape_n;
   if (kernel_data.gemm_type_id == 1) shape_m = shape_m * top_k;
 
   auto c_dtype = dtype_id_to_tensor_dtype(kernel_data.c_dtype_id);
-  auto options = a.options().dtype(c_dtype);
-  return at::empty_symint({shape_m, shape_n}, options);
+  return torch_empty({shape_m, shape_n}, c_dtype, a.device());
 }
 
 inline Tensor make_tensor_map_buffer(const Tensor &a, KernelData& kernel_data, uint32_t num_ctas) {
-  at::SymInt size = 0;
+  int64_t size = 0;
 
   if (kernel_data.use_tma_c && (kernel_data.gemm_type_id == 2 || kernel_data.gemm_type_id == 3)) {
     size = 32;  // 32 int32 = 128 bytes
   }
 
-  auto options = a.options().dtype(ScalarType::Int);
-  return at::empty_symint({size * num_ctas}, options);
+  return torch_empty({size * num_ctas}, ScalarType::Int, a.device());
 }
 
 inline void check_tensor_common(
@@ -228,7 +225,7 @@ inline CUtensorMap make_tma_desc_a(Tensor tensor, KernelData &kernel_data) {
     tma_block_shape_k = 1024 / a_dtype_num_bits;
   }
 
-  tensor = tensor.view({-1, tensor.size(-1)});
+  tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
   return make_tma_desc(tensor, {tma_block_shape_k, tma_block_shape_m}, swizzle_bytes);
 }
 
@@ -240,15 +237,15 @@ inline CUtensorMap make_tma_desc_b(Tensor &tensor, KernelData &kernel_data) {
   uint32_t block_shape_n = kernel_data.block_shape_n;
   uint32_t block_shape_k = kernel_data.block_shape_k;
 
-  tensor = tensor.view({-1, tensor.size(-1)});
-  tensor = tensor.view({tensor.size(0), -1, num_bits * pack_size_k});
+  tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
+  tensor = torch_view_shape(tensor, {tensor.size(0), -1, num_bits * pack_size_k});
 
   return make_tma_desc(tensor, {num_bits * pack_size_k, block_shape_n / 32, block_shape_k / pack_size_k});
 }
 
 inline CUtensorMap make_tma_desc_c(Tensor tensor, KernelData &kernel_data) {
   if (!kernel_data.use_tma_c) return CUtensorMap();
-  tensor = tensor.view({-1, tensor.size(-1)});
+  tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
   return make_tma_desc(tensor, {64, kernel_data.block_shape_m}, 128);
 }
 
@@ -261,8 +258,8 @@ inline CUtensorMap make_tma_desc_bs(std::optional<Tensor> &tensor_, KernelData &
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(block_shape_k, group_size);
 
   auto tensor = tensor_.value();
-  tensor = tensor.view({-1, tensor.size(-1)});
-  tensor = tensor.view({tensor.size(0), -1, 16});
+  tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
+  tensor = torch_view_shape(tensor, {tensor.size(0), -1, 16});
 
   return make_tma_desc(tensor, {16, block_shape_n / 16, num_groups});
 }
@@ -290,7 +287,7 @@ inline CUtensorMap make_tma_desc_bias(std::optional<Tensor> &tensor_, KernelData
   uint32_t block_shape_n = kernel_data.block_shape_n;
 
   auto tensor = tensor_.value();
-  tensor = tensor.view({-1, 64});
+  tensor = torch_view_shape(tensor, {-1, 64});
 
   return make_tma_desc(tensor, {64, block_shape_n / 64});
 }

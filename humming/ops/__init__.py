@@ -38,7 +38,7 @@ def launch_kernel(
     locks: torch.Tensor | None = None,
     top_k: int = 1,
     valid_shape_m: int = 0,
-):
+) -> torch.Tensor:
     return torch.ops.humming.launch_kernel(
         configs,
         inputs,

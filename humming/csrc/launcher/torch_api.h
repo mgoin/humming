@@ -4,10 +4,12 @@
 
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/tensor_inl.h>
+#include <torch/csrc/stable/ops.h>
 
 using Tensor = torch::stable::Tensor;
 using IntArrayRef = torch::headeronly::IntHeaderOnlyArrayRef;
 using ScalarType = torch::headeronly::ScalarType;
+using Device = torch::stable::Device;
 
 #define ASSERT_CHECK STD_TORCH_CHECK
 #define COMMON_TORCH_LIBRARY STABLE_TORCH_LIBRARY
@@ -15,21 +17,31 @@ using ScalarType = torch::headeronly::ScalarType;
 #define COMMON_TORCH_BOX TORCH_BOX
 #define DTYPE_TO_STRING torch::headeronly::toString
 
+inline Tensor torch_empty(IntArrayRef shape, ScalarType dtype, Device device) { return torch::stable::empty(shape, dtype, std::nullopt, device, std::nullopt, std::nullopt); };
+inline Tensor torch_view_shape(const Tensor tensor, IntArrayRef shape) { return torch::stable::view(tensor, shape); };
+inline Tensor torch_contiguous(const Tensor tensor) { return torch::stable::contiguous(tensor); };
+
 #else
 
 #include <ATen/core/Tensor.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/library.h>
 #include <ATen/ops/empty.h>
+#include <ATen/EmptyTensor.h>
 
 using Tensor = at::Tensor;
 using IntArrayRef = at::IntArrayRef;
 using ScalarType = at::ScalarType;
+using Device = at::Device;
 
 #define ASSERT_CHECK TORCH_CHECK
 #define COMMON_TORCH_LIBRARY TORCH_LIBRARY
 #define COMMON_TORCH_LIBRARY_IMPL TORCH_LIBRARY_IMPL
 #define COMMON_TORCH_BOX
 #define DTYPE_TO_STRING at::toString
+
+inline Tensor torch_empty(IntArrayRef shape, ScalarType dtype, Device device) { return at::empty(shape, dtype, std::nullopt, device, std::nullopt, std::nullopt); };
+inline Tensor torch_view_shape(const Tensor tensor, IntArrayRef shape) { return tensor.view(shape); };
+inline Tensor torch_contiguous(const Tensor tensor) { return tensor.contiguous(); };
 
 #endif

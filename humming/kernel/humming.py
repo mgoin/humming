@@ -103,6 +103,7 @@ extern "C" __constant__ uint32_t BS_DTYPE_ID = {{bs_dtype}}::kId;
 class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
     name: ClassVar[str] = "humming"
     _str2kernel_cache: ClassVar[dict[tuple[str, str, str], int | list[int]]] = {}
+    _id2kernel: ClassVar[dict[int, "HummingKernel"]] = {}
 
     def __post_init__(self):
         LayerConfig.__post_init__(self)
@@ -165,6 +166,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         kernel_filename = self.kernel_filename
         kernel_name = self.kernel_name
         self.kernel_id = ops.register_kernel(kernel_filename, kernel_name)
+        self._id2kernel[self.kernel_id] = self
         self.kernel_dirname = os.path.dirname(kernel_filename)
         ref_kernel_id = zlib.crc32(kernel_filename.encode()) << 30
         ref_kernel_id += zlib.crc32(kernel_name.encode())

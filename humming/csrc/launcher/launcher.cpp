@@ -72,36 +72,32 @@ Tensor launch_kernel(
     std::optional<Tensor> num_tokens_padded_,
     std::optional<Tensor> expert_layout_,
     std::optional<Tensor> locks_,
-    at::SymInt top_k,
-    at::SymInt valid_shape_m,
+    int64_t top_k,
+    int64_t valid_shape_m,
     bool should_check_tensor = true) {
 
   KernelLaunchData base_kernel_launch_data = find_kernel_launch_data(configs, 1);
   KernelData& base_kernel_data = base_kernel_launch_data.kernel_data;
-  if (a.is_meta()) {
-    return may_make_tensor_c(c_, a, base_kernel_data, top_k);
-  }
 
   int64_t dev = a.get_device();
   int64_t shape_m = a.size(0);
   int64_t num_experts = b.dim() == 3 ? b.size(0) : 0;
-  int64_t valid_shape_m_val = valid_shape_m.expect_int();
-  if (valid_shape_m_val <= 0) {
-    valid_shape_m_val = shape_m * (base_kernel_data.gemm_type_id == 1 ? top_k.expect_int() : 1);
+  if (valid_shape_m <= 0) {
+    valid_shape_m = shape_m * (base_kernel_data.gemm_type_id == 1 ? top_k : 1);
   }
-  KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, valid_shape_m_val);
+  KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, valid_shape_m);
   KernelData& kernel_data = kernel_launch_data.kernel_data;
   int64_t &num_sms = kernel_launch_data.num_sms;
   Tensor c = may_make_tensor_c(c_, a, kernel_data, top_k);
   uint32_t num_ctas = kernel_data.num_ctas_per_sm * get_num_sms(num_sms, dev);
   Tensor tensor_map_buffer = make_tensor_map_buffer(a, kernel_data, num_ctas);
-  a = a.contiguous();
+  a = torch_contiguous(a);
 
   if (should_check_tensor) {
     check_tensor_a(a, kernel_data, dev);
     check_tensor_b(b, kernel_data, dev);
-    check_tensor_c(c, kernel_data, dev, shape_m, top_k.expect_int());
-    check_tensor_as(as_, kernel_data, dev, shape_m, top_k.expect_int());
+    check_tensor_c(c, kernel_data, dev, shape_m, top_k);
+    check_tensor_as(as_, kernel_data, dev, shape_m, top_k);
     check_tensor_bs(bs_, kernel_data, dev);
     check_tensor_bzp(bzp_, kernel_data, dev);
     check_tensor_bias(bias_, kernel_data, dev);
@@ -132,7 +128,6 @@ Tensor launch_kernel(
   auto tensor_map_bzp = make_tma_desc_bzp(bzp_, kernel_data);
   auto tensor_map_bias = make_tma_desc_bias(bias_, kernel_data);
   auto to_void_ptr = [&](void *ptr) { return ptr; };
-  uint32_t top_k_val = top_k.expect_int();
   bool use_int64_expert_layout = false;
   if (expert_layout_.has_value()) {
     use_int64_expert_layout = expert_layout_.value().scalar_type() == ScalarType::Long;
@@ -154,7 +149,7 @@ Tensor launch_kernel(
       &tensor_map_buffer_ptr,
       &locks_ptr,
       &shape_m,
-      &top_k_val,
+      &top_k,
       &use_int64_expert_layout};
 
   CUlaunchConfig config = {};
@@ -256,10 +251,6 @@ COMMON_TORCH_LIBRARY(humming, m) {
 };
 
 COMMON_TORCH_LIBRARY_IMPL(humming, CUDA, m) {
-  m.impl("launch_kernel", COMMON_TORCH_BOX(&launch_kernel));
-};
-
-COMMON_TORCH_LIBRARY_IMPL(humming, Meta, m) {
   m.impl("launch_kernel", COMMON_TORCH_BOX(&launch_kernel));
 };
 
