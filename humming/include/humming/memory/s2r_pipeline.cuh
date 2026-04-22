@@ -60,9 +60,9 @@ public:
     iter_id = iter_id % kWarpItersK;
     uint32_t buffer_id = iter_id % 2;
 
+    loader_b.load(smem.b[stage_id], mma.regs_qb_as_ptr(buffer_id), iter_id);
     if constexpr (!kUseWgmma)
       loader_a.load(smem.a[stage_id], mma.regs_a_as_ptr(buffer_id), iter_id);
-    loader_b.load(smem.b[stage_id], mma.regs_qb_as_ptr(buffer_id), iter_id);
     if constexpr (kIsGroupInputScale)
       loader_as.load(smem.as[stage_id], mma.arith.regs_as_as_ptr(buffer_id), iter_id);
     if constexpr (kIsGroupOrBlockWeightScale)
