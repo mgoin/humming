@@ -41,7 +41,7 @@ inline KernelLaunchData find_kernel_launch_data(IntArrayRef &configs, int64_t sh
 };
 
 inline cudaStream_t get_current_cuda_stream(int64_t dev) {
-#ifdef USE_TORCH_STABLE_API
+#if USE_TORCH_STABLE_API
   void *stream_ptr = nullptr;
   aoti_torch_get_current_cuda_stream(dev, &stream_ptr);
   return static_cast<cudaStream_t>(stream_ptr);

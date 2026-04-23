@@ -20,6 +20,7 @@ public:
     const uint32_t lane_id = threadIdx.x % 32;
     const uint32_t warp_id = threadIdx.x / 32;
     const uint32_t m_iter_id = M_WARPS > 1 ? warp_id / N_WARPS % M_WARPS : 0;
+    const uint32_t k_warp_id = warp_id / (M_WARPS * N_WARPS);
     constexpr uint32_t row_stride_m_iter = BlockShape::M / M_WARPS;
     uint32_t smem = cast_smem_ptr_to_uint(smem_ptr) / 128;
 
@@ -27,7 +28,7 @@ public:
     for (uint32_t load_iter_id = 0; load_iter_id < CEIL_DIV(WarpShape::M, 16); load_iter_id++) {
 
       uint32_t row = m_iter_id * (BlockShape::M / M_WARPS) + load_iter_id * 16;
-      uint32_t col = 2 * kWarpItersK * (threadIdx.x / (kNumMathThreads / K_WARPS)) + iter_id * 2;
+      uint32_t col = iter_id * 2 + k_warp_id * (kWarpItersK * 2);
 
       if constexpr (MmaShape::M == 8) {
         row += (lane_id / 16) * 8 + lane_id % 8;

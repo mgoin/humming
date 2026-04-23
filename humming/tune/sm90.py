@@ -134,7 +134,7 @@ class Sm90Heuristics(DeviceHeuristics):
             counts = np.bincount(samples)
             for i in range(max_block_m // 8):
                 block_m = i * 8 + 8
-                num_blocks = np.ceil(counts * 1.1 / block_m).sum() * block_m
+                num_blocks = int(np.ceil(counts * 1.1 / block_m).sum().item())
                 num_blocks_list.append(num_blocks)
 
         for i in range(max_block_m // 8):

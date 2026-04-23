@@ -109,7 +109,8 @@ public:
     fs.read((char *)syms.data(), symtab.sh_size);
 
     for (const auto &sym : syms) {
-      if (sym.st_name == 0) continue;
+      if (sym.st_name == 0 || sym.st_name >= names.size()) continue;
+      if (sym.st_shndx >= shdrs.size()) continue;
       std::string sName = &names[sym.st_name];
 
       const auto& shdr = shdrs[sym.st_shndx];

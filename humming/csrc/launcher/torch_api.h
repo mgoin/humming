@@ -1,6 +1,10 @@
 #pragma once
 
-#ifdef USE_TORCH_STABLE_API
+#ifndef USE_TORCH_STABLE_API
+#define USE_TORCH_STABLE_API 0
+#endif
+
+#if USE_TORCH_STABLE_API
 
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/tensor_inl.h>
