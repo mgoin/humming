@@ -396,6 +396,97 @@ def test_int_weight_scale(
     torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=0.5)
 
 
+@pytest.mark.parametrize("c_dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("weight_scale_group_size", [32, 64])
+@pytest.mark.parametrize("has_global_scale", [True, False])
+def test_fused_e8m0_weight_scale(c_dtype, weight_scale_group_size, has_global_scale):
+    a_dtype = dtypes.float8e4m3
+    b_dtype = dtypes.float4e2m1
+    c_dtype = dtypes.DataType.from_str(c_dtype)
+    bs_dtype = dtypes.float8e8m0
+
+    random_weight_data = generate_random_weight(
+        n=1024,
+        k=1024,
+        group_size=weight_scale_group_size,
+        dtype=b_dtype,
+        scale_dtype=bs_dtype,
+        has_global_scale=has_global_scale,
+    )
+
+    _, weight_ref, weight, weight_scale, _, global_scale = random_weight_data
+
+    bs_dtype = dtypes.float8e8m0
+
+    origin_dtype = weight_scale.dtype
+    weight_scale = weight_scale.view(torch.uint8)
+    scale_max = weight_scale.max()
+    scale_min = weight_scale.min()
+    scale_range = scale_max - scale_min
+    max_range = 12
+    if a_dtype == dtypes.float8e5m2:
+        max_range = max_range - 1
+    max_range = torch.tensor(max_range, dtype=torch.uint8, device=scale_range.device)
+    scale_range = scale_range.minimum(max_range)
+    scale_min_new = scale_max - scale_range
+    weight_scale = weight_scale.maximum(scale_min_new) - scale_min_new
+    weight_scale = weight_scale & 0xF
+    weight_scale = weight_scale.view(origin_dtype)
+
+    scale_factor = 2 ** (scale_min_new.view(-1).float() - 127)
+    weight = prepare_humming_weight(weight, b_dtype, a_dtype)
+    weight_scale = prepare_humming_weight_scale(weight_scale, to_apply_on_c=False)
+    if has_global_scale:
+        global_scale = global_scale * scale_factor
+    else:
+        global_scale = scale_factor
+
+    _, inputs_ref, inputs, input_scale = generate_random_inputs(
+        m=1024,
+        k=1024,
+        dtype=a_dtype,
+    )
+
+    humming_kernel = HummingKernel(
+        shape_n=1024,
+        shape_k=1024,
+        block_shape=(16, a_dtype.num_bits * 16, 512 // a_dtype.num_bits),
+        warp_shape=(16, a_dtype.num_bits * 4, 512 // a_dtype.num_bits),
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        c_dtype=c_dtype,
+        bs_dtype=bs_dtype,
+        num_stages=3,
+        use_warp_spec=False,
+        weight_scale_group_size=weight_scale_group_size,
+        weight_scale_type="group_tensor",
+        use_fused_e8m0_scale=True,
+        use_tma=False,
+        use_cp_async=False,
+        mma_type="mma",
+        use_stream_k=False,
+    )
+
+    torch_dtype = dtypes.torch_dtype_map[c_dtype]
+    outputs = torch.zeros((1024, 1024), dtype=torch_dtype, device=inputs.device)
+
+    outputs = ops.launch_kernel(
+        configs=[humming_kernel.kernel_id],
+        inputs=inputs,
+        weight=weight,
+        outputs=outputs,
+        input_scale=input_scale,
+        weight_scale=weight_scale,
+        global_scale=global_scale,
+    )
+
+    if a_dtype.num_bits == 16 and weight_scale.size(-2) > 1:
+        weight_ref = weight_ref.to(torch_dtype).float()
+
+    outputs_ref = inputs_ref.matmul(weight_ref.T).to(torch_dtype)
+    torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=0.5)
+
+
 @pytest.mark.parametrize("a_dtype", ["float8e4m3", "int8", "int4"])
 @pytest.mark.parametrize("b_dtype", ["uint3", "int8", "float4e1m2", "float8e1m6"])
 @pytest.mark.parametrize("c_dtype", ["float16", "bfloat16"])

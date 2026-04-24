@@ -61,9 +61,8 @@ def quantize_weight(
         weight_scale = None
         quanted_weight = quanted_weight.view(e, n, k)
     elif has_global_scale and scale_dtype == dtypes.float8e8m0:
-        assert (weight_scale > 0).all()
-        global_scale = weight_scale.view(e, -1).log2().mean(1).exp2()
-        weight_scale = (weight_scale / global_scale.view(e, 1, 1)).to(torch.float8_e8m0fnu)
+        global_scale = weight_scale.float().view(e, -1).log2().mean(1).exp2()
+        weight_scale = (weight_scale.float() / global_scale.view(e, 1, 1)).to(torch.float8_e8m0fnu)
     elif scale_dtype in [dtypes.float16, dtypes.bfloat16]:
         if has_global_scale:
             global_scale = weight_scale.view(e, -1).abs().mean(1)

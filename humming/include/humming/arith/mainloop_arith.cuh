@@ -34,6 +34,7 @@ private:
   static constexpr bool kHasZeroPoint = LayerConfig::kHasZeroPoint;
   static constexpr bool kIsFpZeroPoint = LayerConfig::kIsFpZeroPoint;
   static constexpr bool kUseIntWeightScale = LayerConfig::kUseIntWeightScale;
+  static constexpr bool kUseFusedE8m0Scale = LayerConfig::kUseFusedE8m0Scale;
 
   static constexpr uint32_t kInputScaleGroupSize = kIsGroupInputScale ? LayerConfig::kInputScaleGroupSize : 1;
   static constexpr uint32_t kWeightScaleGroupSize = kIsGroupOrBlockWeightScale ? LayerConfig::kWeightScaleGroupSize : 1;
@@ -45,7 +46,7 @@ private:
   static constexpr uint32_t kNumSubBlocksM = CEIL_DIV(WarpShape::M, 16);
   static constexpr uint32_t kNumSubBlocksN = WarpShape::N / 16;
   static constexpr uint32_t kNumASPerSubBlock = kUseWgmma ? 4 : 2;
-  static constexpr uint32_t kNumBSPerSubBlock = !kUseWgmma && ElementA::kBits < 16 ? 4 : 2;
+  static constexpr uint32_t kNumBSPerSubBlock = !kUseFusedE8m0Scale && (!kUseWgmma && ElementA::kBits) < 16 ? 4 : 2;
   static constexpr uint32_t kNumASPerGroup = kNumSubBlocksM * kNumASPerSubBlock;
   static constexpr uint32_t kNumBSPerGroup = kNumSubBlocksN * kNumBSPerSubBlock;
 
@@ -87,7 +88,7 @@ public:
   CUDA_INLINE
   void may_process_bs_before_apply_on_b(uint32_t j, uint32_t buffer_id) {
     if (j % 2 == 0) {
-      if constexpr (ElementA::kBits == 16 && ElementBS::kBits == 8 && kIsGroupWeightScale) {
+      if constexpr (ElementA::kBits == 16 && ElementBS::kBits == 8 && kIsGroupWeightScale && !kUseFusedE8m0Scale) {
         dequant<ElementBS, ElementA>(bs[buffer_id], dq_bs, 0);
 
         scalar_t *dq_bs_scalar_ptr = reinterpret_cast<scalar_t *>(dq_bs);
@@ -177,6 +178,25 @@ public:
             scalar_t2 bs_single = bs_f16_ptr[MmaOpClass::kMmaType == MmaType::WGMMA ? k : i];
             b_f16_ptr[i * 2 + k] = __hmul2(b_f16_ptr[i * 2 + k], bs_single);
           }
+        };
+      };
+    };
+
+    if constexpr (kUseFusedE8m0Scale) {
+      static_assert(std::is_same<ElementA, Float8E4M3>::value || std::is_same<ElementA, Float8E5M2>::value);
+      static_assert(std::is_same<ElementBS, Float8E8M0>::value);
+      constexpr uint32_t kExpMask = std::is_same<ElementA, Float8E4M3>::value ? 0x78787878 : 0x7C7C7C7C;
+
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < 2; i++) {
+        uint32_t exp_offset = bs[buffer_id][j / 2] >> (((j % 2) * 2 + i) * 8);
+        exp_offset = exp_offset & 0xFF;
+
+        PRAGMA_UNROLL
+        for (uint32_t k = 0; k < 2; k++) {
+          uint32_t exp_mask = lop3_and_or(regs_b[i * 2 + k], kExpMask, 0x80808080) - 0x01010101;
+          exp_mask = (exp_mask & 0x80808080) >> ElementA::kExponentBits;
+          regs_b[i * 2 + k] += exp_mask * exp_offset;
         };
       };
     };
@@ -299,6 +319,7 @@ public:
     if constexpr (ElementA::kBits == 16) return;
     if constexpr (!kIsGroupInputScale && !kIsGroupWeightScale && !kIsBlockWeightScale) return;
     if constexpr (kUseWgmma) return;
+    if constexpr (kUseFusedE8m0Scale) return;
 
     may_process_as_and_bs_before_apply_on_c(m, n, k, iter_id);
 
@@ -399,6 +420,7 @@ public:
     if constexpr (ElementA::kBits == 16) return;
     if constexpr (!kIsGroupInputScale && !kIsGroupWeightScale && !kIsBlockWeightScale) return;
     if constexpr (!kUseWgmma) return;
+    if constexpr (kUseFusedE8m0Scale) return;
 
     may_process_as_and_bs_before_apply_on_c(m, 0, k, iter_id);
 

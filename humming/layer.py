@@ -74,7 +74,9 @@ class HummingLayerMeta(LayerConfig):
 
     @property
     def should_apply_bs_on_c(self):
-        if self.mma_type == MmaType.MMA:
+        if self.use_fused_e8m0_scale:
+            return False
+        elif self.mma_type == MmaType.MMA:
             return self.weight_scale_group_size == 0 or self.a_dtype.num_bits != 16
         elif self.mma_type == MmaType.WGMMA:
             return self.weight_scale_group_size == 0
@@ -127,16 +129,26 @@ class HummingLayerMeta(LayerConfig):
 
         msg = "don't set use_int_weight_scale to True directly"
         assert self.use_int_weight_scale is not True, msg
-        if self.use_int_weight_scale is None:
+        if not self.use_int_weight_scale:
             self.use_int_weight_scale = (
                 self.a_dtype in [dtypes.int8, dtypes.int4]
                 and self.input_scale_group_size == 0
                 and self.weight_scale_group_size > 0
             )
 
+        if not self.use_fused_e8m0_scale:
+            self.use_fused_e8m0_scale = (
+                self.a_dtype in [dtypes.float8e4m3]
+                and self.weight_scale_group_size > 0
+                and self.b_dtype in [dtypes.float4e2m1]
+            )
+
         if self.use_int_weight_scale:
             self.weight_scale_type = WeightScaleType.GROUP_TENSOR
             self.bs_dtype = self.c_dtype
+
+        if self.use_fused_e8m0_scale:
+            self.weight_scale_type = WeightScaleType.GROUP_TENSOR
 
         self._meta_str = self.to_str()
 
@@ -235,6 +247,14 @@ class HummingLayerMethod:
                     dtype=torch.float32,
                 )
 
+        if meta.use_fused_e8m0_scale:
+            if "global_scale" not in tensors:
+                tensors["global_scale"] = torch.ones(
+                    (meta.num_experts or 1),
+                    device=tensors["weight_scale"].device,
+                    dtype=torch.float32,
+                )
+
         schema.validate_tensors(
             tensors,
             shape_n=meta.shape_n - meta.pad_shape_n,
@@ -293,6 +313,40 @@ class HummingLayerMethod:
                 fill_value=scale_factor.item(),
                 device=weight_scale.device,
             )
+
+        return weight_scale, out_global_scale
+
+    @classmethod
+    def may_process_fused_e8m0_scale(
+        cls,
+        meta: HummingLayerMeta,
+        weight_scale: torch.Tensor,
+        global_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        origin_dtype = weight_scale.dtype
+        origin_shape = weight_scale.shape
+        assert origin_dtype in [torch.uint8, torch.float8_e8m0fnu]
+        weight_scale = weight_scale.view(torch.uint8).view(meta.num_experts or 1, -1)
+
+        scale_max = weight_scale.max(1)[0].unsqueeze(-1)
+        scale_min = weight_scale.min(1)[0].unsqueeze(-1)
+        scale_range = scale_max - scale_min
+        max_range = 2**meta.a_dtype.exponent_bits - 2**meta.b_dtype.exponent_bits
+        if meta.a_dtype == dtypes.float8e5m2:
+            max_range = max_range - 1
+        max_range = torch.tensor(max_range, dtype=torch.uint8, device=scale_range.device)
+        scale_range = scale_range.minimum(max_range)
+        scale_min_new = scale_max - scale_range
+        weight_scale = weight_scale.maximum(scale_min_new) - scale_min_new
+        weight_scale = weight_scale.view(origin_dtype).view(origin_shape)
+
+        scale_factor = 2 ** (scale_min_new.view(-1).float() - 127)
+        if global_scale is not None:
+            assert global_scale is not None
+            out_global_scale = global_scale * scale_factor
+        else:
+            meta.weight_scale_type = WeightScaleType.GROUP_TENSOR
+            out_global_scale = scale_factor
 
         return weight_scale, out_global_scale
 
@@ -369,6 +423,14 @@ class HummingLayerMethod:
         if meta.use_int_weight_scale:
             assert weight_scale is not None
             weight_scale, global_scale = cls.may_process_int_weight_scale(
+                meta,
+                weight_scale=weight_scale,
+                global_scale=global_scale,
+            )
+
+        if meta.use_fused_e8m0_scale:
+            assert weight_scale is not None
+            weight_scale, global_scale = cls.may_process_fused_e8m0_scale(
                 meta,
                 weight_scale=weight_scale,
                 global_scale=global_scale,

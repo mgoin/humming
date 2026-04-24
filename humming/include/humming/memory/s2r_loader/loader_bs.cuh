@@ -16,6 +16,7 @@ private:
   static constexpr bool kIsChannel = LayerConfig::kIsChannelWeightScale;
   static constexpr bool kIsGroup = LayerConfig::kIsGroupWeightScale;
   static constexpr bool kIsBlock = LayerConfig::kIsBlockWeightScale;
+  static constexpr bool kUseFusedE8m0Scale = LayerConfig::kUseFusedE8m0Scale;
   static constexpr uint32_t kGroupSize = kIsChannel ? BlockShape::K : LayerConfig::kWeightScaleGroupSize;
   static constexpr uint32_t kGroupSizeN = LayerConfig::kWeightScaleGroupSizeN;
 
@@ -25,7 +26,7 @@ private:
   static constexpr uint32_t K_WARPS = BlockShape::K / WarpShape::K;
 
   static constexpr uint32_t kNumSubBlocks = WarpShape::N / 16;
-  static constexpr uint32_t kNumScalesPerSubBlock = kIsChannel || (ElementA::kBits != 16 && !kUseWgmma) ? 4 : 2;
+  static constexpr uint32_t kNumScalesPerSubBlock = !kUseFusedE8m0Scale && (kIsChannel || (ElementA::kBits != 16 && !kUseWgmma)) ? 4 : 2;
   static constexpr uint32_t kNumScales = kNumSubBlocks * kNumScalesPerSubBlock;
   static constexpr uint32_t kNumBytesPerThread = kNumScales * ElementBS::kBits / 8;
 
@@ -74,7 +75,9 @@ public:
     constexpr uint32_t warp_load_delta = (16 / kNumScalesPerSubBlock);
     uint32_t s_sh_rd = (kLoadItersPerGroup * warp_load_delta * kNumWarpsPerMiniBlock) * n_warp_id;
 
-    if constexpr (kUseWgmma && kIsChannel) {
+    if constexpr (kUseFusedE8m0Scale) {
+      s_sh_rd += (threadIdx.x % 32) / 4 * kNumWarpsPerMiniBlock + warp_id % kNumWarpsPerMiniBlock;
+    } else if constexpr (kUseWgmma && kIsChannel) {
       s_sh_rd += (threadIdx.x % 32) / 8 * kNumWarpsPerMiniBlock + warp_id % kNumWarpsPerMiniBlock;
     } else if constexpr (kUseWgmma && ElementA::kBits != 16) {
       s_sh_rd += (threadIdx.x % 32) / 4 * kNumWarpsPerMiniBlock + warp_id % kNumWarpsPerMiniBlock;

@@ -104,8 +104,13 @@ public:
     constexpr bool kIsGroupInputScale = LayerConfig::kInputScaleGroupSize > 0;
     constexpr bool kIsGroupWeightScale = LayerConfig::kIsGroupWeightScale;
     constexpr bool kIsBlockWeightScale = LayerConfig::kIsBlockWeightScale;
+    constexpr bool kUseFusedE8m0Scale = LayerConfig::kUseFusedE8m0Scale;
 
-    if constexpr (ElementA::kBits < 16 && (kIsGroupInputScale || kIsGroupWeightScale || kIsBlockWeightScale)) {
+    if constexpr (ElementA::kBits < 16 && kIsGroupInputScale) {
+      index = 1;
+    }
+
+    if constexpr (ElementA::kBits < 16 && !kUseFusedE8m0Scale && (kIsGroupWeightScale || kIsBlockWeightScale)) {
       index = 1;
     }
 

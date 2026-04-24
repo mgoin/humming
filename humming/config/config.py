@@ -30,6 +30,7 @@ class LayerConfig(BaseHummingConfig):
     weight_scale_group_size_n: int = 0
     weight_scale_type: WeightScaleType | None = None
     use_int_weight_scale: bool = False
+    use_fused_e8m0_scale: bool = False
     has_zero_point: bool = False
     is_fp_zero_point: bool = False
 
