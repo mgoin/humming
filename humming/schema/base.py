@@ -178,9 +178,6 @@ class BaseWeightSchema:
         from humming.schema import WEIGHT_SCHEMA_MAP
 
         quant_method = config["quant_method"]
-        if quant_method == "gpt_oss_mxfp4":
-            config["quant_method"] = "mxfp4"
-            quant_method = "mxfp4"
         if cls is BaseWeightSchema:
             quant_method = config["quant_method"]
             if quant_method in WEIGHT_SCHEMA_MAP:

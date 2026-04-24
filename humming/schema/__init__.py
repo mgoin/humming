@@ -6,6 +6,7 @@ from humming.schema.compressed_tensors import (
     CompressedTensorsWeightSchema,
 )
 from humming.schema.fp8 import Fp8InputSchema, Fp8WeightSchema
+from humming.schema.gpt_oss_mxfp4 import GptOssMxfp4WeightSchema
 from humming.schema.gptq import GPTQWeightSchema
 from humming.schema.humming import HummingInputSchema, HummingWeightSchema
 from humming.schema.modelopt import ModeloptInputSchema, ModeloptWeightSchema
@@ -20,6 +21,7 @@ WEIGHT_SCHEMA_MAP: dict[str, type[BaseWeightSchema]] = {
     "humming": HummingWeightSchema,
     "modelopt": ModeloptWeightSchema,
     "mxfp4": Mxfp4WeightSchema,
+    "gpt_oss_mxfp4": GptOssMxfp4WeightSchema,
 }
 
 INPUT_SCHEMA_MAP: dict[str, type[BaseInputSchema]] = {
