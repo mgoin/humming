@@ -35,8 +35,8 @@ class Compiler:
         return json.dumps(data, ensure_ascii=False)
 
     @classmethod
-    def compile(cls, code, sm_version, kernel_expr):
-        flags = cls.get_flags(sm_version)
+    def compile(cls, code, sm_version, kernel_expr, disable_fast_math=False):
+        flags = cls.get_flags(sm_version, disable_fast_math)
         signature = f"{cls.__name__}$${cls.signature()}$${flags}$${kernel_expr}$${code}"
         signature += "$$" + Compiler.cuh_last_update_time()
         hash_hex = jit_utils.hash_to_hex(signature)
@@ -57,7 +57,7 @@ class Compiler:
             with open(cache_dirname / "signature.txt", "w") as f:
                 f.write(signature)
 
-            compile_res = cls._compile(source_path, cache_dirname, sm_version, kernel_expr)
+            compile_res = cls._compile(source_path, cache_dirname, sm_version, kernel_expr, flags)
             returncode, stdout, stderr = compile_res
 
             with open(cache_dirname / "stdout.log", "w") as f:
@@ -74,7 +74,7 @@ class Compiler:
         return cache_filename.as_posix()
 
     @classmethod
-    def get_flags(cls, sm_version):
+    def get_flags(cls, sm_version, disable_fast_math=False):
         raise NotImplementedError
 
     @classmethod
@@ -140,7 +140,7 @@ class NVRTCCompiler(Compiler):
         return f"nvrtc+{major}.{minor}"
 
     @classmethod
-    def get_flags(cls, sm_version):
+    def get_flags(cls, sm_version, disable_fast_math=False):
         flags = [
             f"--gpu-architecture=sm_{sm_version}",
             "-std=c++17",
@@ -154,6 +154,8 @@ class NVRTCCompiler(Compiler):
         ]
         for d in cls._get_include_dirs():
             flags.append(f"-I{d}")
+        if disable_fast_math:
+            flags.remove("--use_fast_math")
         return flags
 
     @classmethod
@@ -176,7 +178,7 @@ class NVRTCCompiler(Compiler):
         return dirs
 
     @classmethod
-    def _compile(cls, source_path, cache_dirname, sm_version, kernel_expr):
+    def _compile(cls, source_path, cache_dirname, sm_version, kernel_expr, flags):
         try:
             from cuda.bindings import nvrtc
         except Exception as e:
@@ -191,8 +193,6 @@ class NVRTCCompiler(Compiler):
 
         with open(source_path, "r") as f:
             code = f.read()
-
-        flags = cls.get_flags(sm_version)
 
         shim_names, shim_sources = cls._get_std_header_shims()
         err, prog = nvrtc.nvrtcCreateProgram(
@@ -243,7 +243,7 @@ class NVCCCompiler(Compiler):
         return "nvcc+" + nvcc_version
 
     @classmethod
-    def get_flags(cls, sm_version):
+    def get_flags(cls, sm_version, disable_fast_math=False):
         cxx_flags = [
             "-fPIC",
             "-O3",
@@ -253,7 +253,7 @@ class NVCCCompiler(Compiler):
             "-lgomp",
         ]
 
-        return [
+        flags = [
             "-std=c++17",
             "--ptxas-options=--register-usage-level=10",
             "--use_fast_math",
@@ -266,9 +266,12 @@ class NVCCCompiler(Compiler):
             "--expt-extended-lambda",
             f"--compiler-options={','.join(cxx_flags)}",
         ]
+        if disable_fast_math:
+            flags.remove("--use_fast_math")
+        return flags
 
     @classmethod
-    def _compile(cls, source_path, cache_dirname, sm_version, kernel_expr):
+    def _compile(cls, source_path, cache_dirname, sm_version, kernel_expr, flags):
         if kernel_expr:
             with open(source_path, "a") as f:
                 f.write(f"\nauto ptr = reinterpret_cast<void*>(&{kernel_expr});\n")
@@ -276,7 +279,7 @@ class NVCCCompiler(Compiler):
         nvcc_path = jit_utils.get_cuda_command_path("nvcc")
         target_path = (cache_dirname / "kernel_tmp.cubin").as_posix()
 
-        cmd = [nvcc_path, source_path, "-o", target_path] + cls.get_flags(sm_version)
+        cmd = [nvcc_path, source_path, "-o", target_path] + flags
         with open(cache_dirname / "cmdline.json", "w") as f:
             json.dump(cmd, f, ensure_ascii=False)
 

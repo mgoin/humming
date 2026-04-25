@@ -16,6 +16,7 @@ CODE_TEMPLATE = """
 
 @dataclasses.dataclass(kw_only=True)
 class DequantKernel(KernelRuntime):
+    disable_fast_math: ClassVar[bool] = True
     name: ClassVar[str] = "dequant_unpacked_fp_type"
 
     def init_kernel(self):

@@ -13,6 +13,7 @@ from humming.jit.compiler import NVCCCompiler, NVRTCCompiler
 
 @dataclasses.dataclass(kw_only=True)
 class KernelRuntime:
+    disable_fast_math: ClassVar[bool] = False
     _instances: ClassVar[dict[tuple[str, tuple[Any, ...]], "KernelRuntime"]] = {}
 
     def __new__(cls, *args, **kwargs):
@@ -83,6 +84,7 @@ class KernelRuntime:
             self.code,
             sm_version=self.sm_version_str,
             kernel_expr=kernel_expr,
+            disable_fast_math=self.disable_fast_math,
         )
         kernel_name = jit_utils.find_kernel_name_in_cubin(kernel_filename, self.name)
         self.kernel_name = kernel_name

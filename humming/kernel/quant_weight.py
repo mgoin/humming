@@ -17,6 +17,7 @@ CODE_TEMPLATE = jinja2.Template("""
 
 @dataclasses.dataclass(kw_only=True)
 class QuantWeightKernel(KernelRuntime):
+    disable_fast_math: ClassVar[bool] = True
     name: ClassVar[str] = "quant_weight"
     source_dtype: dtypes.DataType
     target_dtype: dtypes.DataType
