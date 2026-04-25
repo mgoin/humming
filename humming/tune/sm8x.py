@@ -17,6 +17,7 @@ class Sm80Heuristics(DeviceHeuristics):
         b_dtype: dtypes.DataType,
         group_size: int,
         use_f16_accum: bool,
+        use_fused_e8m0_scale: bool,
         gemm_type: GemmType,
     ):
         if a_dtype.num_bits == 16 or group_size == 0 and a_dtype == b_dtype:
@@ -57,6 +58,7 @@ class Sm86Heuristics(DeviceHeuristics):
         b_dtype: dtypes.DataType,
         group_size: int,
         use_f16_accum: bool,
+        use_fused_e8m0_scale: bool,
         gemm_type: GemmType,
     ):
         if a_dtype.num_bits == 16 and use_f16_accum:
@@ -71,6 +73,13 @@ class Sm86Heuristics(DeviceHeuristics):
             return {
                 "block_shape": (128, 256, 64),
                 "warp_shape": (64, 64, 64),
+            }
+        elif use_fused_e8m0_scale:
+            return {
+                "block_shape": (128, 128, 512 // a_dtype.num_bits),
+                "warp_shape": (128, 32, 512 // a_dtype.num_bits),
+                "num_stages": 2,
+                "num_warps_per_sm": 2,
             }
         elif group_size == 0 and a_dtype == b_dtype:
             return {

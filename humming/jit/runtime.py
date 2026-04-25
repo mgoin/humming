@@ -68,6 +68,7 @@ class KernelRuntime:
         else:
             try:
                 from cuda.bindings import nvrtc  # noqa
+
                 return NVRTCCompiler
             except Exception:
                 return NVCCCompiler

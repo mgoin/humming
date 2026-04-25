@@ -13,6 +13,7 @@ from humming.tune.sm8x import (
 )
 from humming.tune.sm75 import Sm75Heuristics
 from humming.tune.sm90 import Sm90Heuristics
+from humming.tune.sm90_h20 import Sm90H20Heuristics
 
 if TYPE_CHECKING:
     from humming.layer import HummingLayerMeta
@@ -36,6 +37,9 @@ def get_heuristics_class(
     if isinstance(sm_version, tuple):
         sm_version = sm_version[0] * 10 + sm_version[1]
     assert isinstance(sm_version, int)
+    name = torch.cuda.get_device_name(device)
+    if "H20" in name and "H200" not in name:
+        return Sm90H20Heuristics
 
     return heuristics_map[sm_version]
 

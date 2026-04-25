@@ -26,6 +26,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
         b_dtype: dtypes.DataType,
         group_size: int,
         use_f16_accum: bool,
+        use_fused_e8m0_scale: bool,
         gemm_type: GemmType,
     ):
         is_moe = gemm_type != GemmType.DENSE
@@ -33,6 +34,12 @@ class Sm90H20Heuristics(DeviceHeuristics):
             return {
                 "block_shape": (64, 256, 512 // a_dtype.num_bits),
                 "warp_shape": (64, 64, 512 // a_dtype.num_bits),
+                "num_ctas_per_sm": 2,
+            }
+        elif use_fused_e8m0_scale:
+            return {
+                "block_shape": (128, 128, 1024 // a_dtype.num_bits),
+                "warp_shape": (128, 32, 1024 // a_dtype.num_bits),
                 "num_ctas_per_sm": 2,
             }
         elif group_size == 0 and not is_moe:
@@ -77,6 +84,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
             meta.b_dtype,
             group_size,
             use_f16_accum,
+            meta.use_fused_e8m0_scale,
             gemm_type,
         )
         block_shape_m, block_shape_n, block_shape_k = config["block_shape"]

@@ -158,6 +158,8 @@ class Sm90Heuristics(DeviceHeuristics):
             func = cls.get_config1
         elif meta.input_scale_group_size == 0 and meta.weight_scale_group_size == 0:
             func = cls.get_config1
+        elif meta.use_fused_e8m0_scale:
+            func = cls.get_config1
         else:
             func = cls.get_config2
 

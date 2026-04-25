@@ -26,6 +26,7 @@ class DeviceHeuristics:
         b_dtype: dtypes.DataType,
         group_size: int,
         use_f16_accum: bool,
+        use_fused_e8m0_scale: bool,
         gemm_type: GemmType,
     ):
         raise NotImplementedError
@@ -48,6 +49,7 @@ class DeviceHeuristics:
             meta.b_dtype,
             group_size,
             use_f16_accum,
+            meta.use_fused_e8m0_scale,
             gemm_type,
         )
         block_shape_m, block_shape_n, block_shape_k = config["block_shape"]

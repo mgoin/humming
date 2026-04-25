@@ -16,6 +16,7 @@ class Sm75Heuristics(DeviceHeuristics):
         b_dtype: dtypes.DataType,
         group_size: int,
         use_f16_accum: bool,
+        use_fused_e8m0_scale: bool,
         gemm_type: GemmType,
     ):
         if a_dtype.num_bits == 16:

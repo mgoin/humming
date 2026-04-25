@@ -106,11 +106,12 @@ public:
       constexpr uint32_t kNumIters = WarpShape::N / (MmaShape::M / 4);
 
       bool scale_d = true;
+      constexpr bool kUseFusedE8m0Scale = LayerConfig::kUseFusedE8m0Scale;
       constexpr bool kApplyScaleOnC = ElementA::kBits != 16 && (LayerConfig::kInputScaleGroupSize > 0 || LayerConfig::kWeightScaleGroupSize > 0);
-      if constexpr (ElementA::kBits != 16 && LayerConfig::kInputScaleGroupSize > 0) {
+      if constexpr (!kUseFusedE8m0Scale && ElementA::kBits != 16 && LayerConfig::kInputScaleGroupSize > 0) {
         scale_d = (iter_id * kPartMmaShapeK) % LayerConfig::kInputScaleGroupSize > 0;
       }
-      if constexpr (ElementA::kBits != 16 && LayerConfig::kWeightScaleGroupSize > 0) {
+      if constexpr (!kUseFusedE8m0Scale && ElementA::kBits != 16 && LayerConfig::kWeightScaleGroupSize > 0) {
         scale_d = scale_d && (iter_id * kPartMmaShapeK) % LayerConfig::kWeightScaleGroupSize > 0;
       }
 
