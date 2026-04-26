@@ -404,6 +404,7 @@ class HummingLayerMethod:
             a_dtype=meta.a_dtype,
             zero_point=zero_point,
             use_wgmma=meta.mma_type == MmaType.WGMMA,
+            use_fused_e8m0_scale=meta.use_fused_e8m0_scale,
             packed=True,
         )
 

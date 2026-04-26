@@ -107,6 +107,7 @@ def repack_weight(
     should_preprocess_for_int2fp: bool = False,
     should_preprocess_with_zp: bool = False,
     use_wgmma: bool = False,
+    use_fused_e8m0_scale: bool = False,
     group_size_zp: int = 0,
     padded_shape_n: int | None = None,
     padded_shape_k: int | None = None,
@@ -154,6 +155,7 @@ def repack_weight(
             should_preprocess_for_int2fp=should_preprocess_for_int2fp,
             should_preprocess_with_zp=should_preprocess_with_zp,
             use_wgmma=use_wgmma,
+            use_fused_e8m0_scale=use_fused_e8m0_scale,
             group_size_zp=group_size_zp,
         )
 

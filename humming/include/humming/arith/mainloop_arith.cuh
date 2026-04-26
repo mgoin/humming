@@ -181,31 +181,6 @@ public:
         };
       };
     };
-
-    if constexpr (kUseFusedE8m0Scale) {
-      static_assert(std::is_same<ElementA, Float8E4M3>::value);
-      static_assert(std::is_same<ElementB, Float4E2M1>::value);
-      static_assert(std::is_same<ElementBS, Float8E8M0>::value);
-      constexpr uint32_t kValMask = 0x07070707 << 2;
-
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < 2; i++) {
-        uint32_t exp_offset = bs[buffer_id][j / 2] >> (((j % 2) * 2 + i) * 8);
-        exp_offset = exp_offset & 0xFF;
-
-        exp_offset = exp_offset << 2;
-        uint32_t val1 = (exp_offset * 0x02020200) + (exp_offset ? -0x00000400 : 0);
-        uint32_t val2 = exp_offset * 0x02020202;
-
-        PRAGMA_UNROLL
-        for (uint32_t k = 0; k < 2; k++) {
-          uint32_t index = regs_b[i * 2 + k] >> 2;
-          index = lop3_and_or(index >> 12, 0x7070, index & 0x0707);
-          uint32_t val = __byte_perm(val1, val2, index);
-          regs_b[i * 2 + k] += __byte_perm(val, val, 0x3120);
-        };
-      };
-    };
   };
 
   CUDA_INLINE

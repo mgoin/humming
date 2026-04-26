@@ -32,6 +32,7 @@ public:
 
   static constexpr bool kHasZeroPoint = LayerConfig::kHasZeroPoint;
   static constexpr bool kIsFpZeroPoint = LayerConfig::kIsFpZeroPoint;
+  static constexpr bool kUseFusedE8m0Scale = LayerConfig::kUseFusedE8m0Scale;
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
@@ -79,6 +80,12 @@ public:
   void transform_b(uint32_t buffer_id) {
     if constexpr (std::is_same<ElementA, ElementB>::value) return;
 
+    if constexpr (kUseFusedE8m0Scale) {
+      uint32_t *regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id]);
+      fused_dequant_for_mxfp4_fp8<WarpShape::N / 16, true>(regs_qb[buffer_id], regs_b_ptr, arith.bs[buffer_id][0]);
+      return;
+    }
+
     if constexpr (ElementB::kBits == 1 && kNumWarpShapeNSplits == 2) {
       regs_qb[buffer_id][0] = regs_qb[buffer_id][0] >> (threadIdx.x / 32 % 2 * 8);
     }
@@ -106,7 +113,6 @@ public:
       constexpr uint32_t kNumIters = WarpShape::N / (MmaShape::M / 4);
 
       bool scale_d = true;
-      constexpr bool kUseFusedE8m0Scale = LayerConfig::kUseFusedE8m0Scale;
       constexpr bool kApplyScaleOnC = ElementA::kBits != 16 && (LayerConfig::kInputScaleGroupSize > 0 || LayerConfig::kWeightScaleGroupSize > 0);
       if constexpr (!kUseFusedE8m0Scale && ElementA::kBits != 16 && LayerConfig::kInputScaleGroupSize > 0) {
         scale_d = (iter_id * kPartMmaShapeK) % LayerConfig::kInputScaleGroupSize > 0;
@@ -156,7 +162,6 @@ public:
     constexpr bool kIsGroupInputScale = LayerConfig::kInputScaleGroupSize > 0;
     constexpr bool kIsGroupWeightScale = LayerConfig::kIsGroupWeightScale;
     constexpr bool kIsBlockWeightScale = LayerConfig::kIsBlockWeightScale;
-    constexpr bool kUseFusedE8m0Scale = LayerConfig::kUseFusedE8m0Scale;
 
     if constexpr (ElementA::kBits < 16 && kIsGroupInputScale) {
       index = 1;

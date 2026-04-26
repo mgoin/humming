@@ -480,9 +480,6 @@ def test_fused_e8m0_weight_scale(c_dtype, weight_scale_group_size, has_global_sc
         global_scale=global_scale,
     )
 
-    if a_dtype.num_bits == 16 and weight_scale.size(-2) > 1:
-        weight_ref = weight_ref.to(torch_dtype).float()
-
     outputs_ref = inputs_ref.matmul(weight_ref.T).to(torch_dtype)
     torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=0.5)
 
