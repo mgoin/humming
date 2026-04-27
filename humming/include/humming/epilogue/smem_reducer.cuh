@@ -6,7 +6,8 @@ template <class MmaOpClass, class BlockShape, class WarpShape, class ElementC, c
 class EpilogueSmemReducer {
 private:
   static constexpr bool kHasGroupScale = LayerConfig::kWeightScaleGroupSize > 0 || LayerConfig::kInputScaleGroupSize > 0;
-  static constexpr bool kForceFloatAccum = std::is_same<typename MmaOpClass::ValTypeC, int32_t>::value && kHasGroupScale && !LayerConfig::kUseIntWeightScale;
+  static constexpr bool kUseFusedE8m0Scale = LayerConfig::kUseFusedE8m0Scale;
+  static constexpr bool kForceFloatAccum = std::is_same<typename MmaOpClass::ValTypeC, int32_t>::value && kHasGroupScale && !LayerConfig::kUseIntWeightScale && !kUseFusedE8m0Scale;
   using MmaTypeC = std::conditional_t<kForceFloatAccum, float, typename MmaOpClass::ValTypeC>;
   using MmaShape = typename MmaOpClass::MmaShape;
   using OutputType32 = std::conditional_t<std::is_same<ElementC, Float16>::value, half2, nv_bfloat162>;

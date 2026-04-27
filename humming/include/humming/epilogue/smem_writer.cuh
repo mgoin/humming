@@ -93,8 +93,9 @@ private:
   static constexpr bool kIsGroupWeightScale = LayerConfig::kIsGroupWeightScale;
   static constexpr bool kIsBlockWeightScale = LayerConfig::kIsBlockWeightScale;
   static constexpr bool kUseIntWeightScale = LayerConfig::kUseIntWeightScale;
+  static constexpr bool kUseFusedE8m0Scale = LayerConfig::kUseFusedE8m0Scale;
   static constexpr bool kHasGroupScale = kIsGroupInputScale || kIsGroupWeightScale || kIsBlockWeightScale;
-  static constexpr bool kIsIntAccum = std::is_same<ValTypeC, int32_t>::value && (!kHasGroupScale || kUseIntWeightScale);
+  static constexpr bool kIsIntAccum = std::is_same<ValTypeC, int32_t>::value && (!kHasGroupScale || kUseIntWeightScale || kUseFusedE8m0Scale);
 
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
   static constexpr uint32_t N_WARPS = BlockShape::N / WarpShape::N;

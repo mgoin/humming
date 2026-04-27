@@ -6,6 +6,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 from humming import dtypes
 from humming.kernel.dequant_weight import DequantKernel
 from humming.kernel.pack_weight import PackWeightKernel
+from humming.kernel.process_mxfp4 import ProcessMxfp4W4A8Kernel
 from humming.kernel.quant_weight import QuantWeightKernel
 from humming.kernel.repack_weight import RepackWeightKernel
 from humming.kernel.unpack_weight import UnpackWeightKernel
@@ -183,5 +184,29 @@ def unpack_weight(inputs: torch.Tensor, num_bits: int) -> torch.Tensor:
     if not isinstance(inputs, FakeTensor):
         kernel = UnpackWeightKernel(num_bits=num_bits)
         kernel(inputs=inputs, outputs=outputs)
+
+    return outputs
+
+
+def process_mxfp4_w4a8_weight(
+    inputs: torch.Tensor,
+    delta_scale_offsets: torch.Tensor,
+    inplace: bool = False,
+) -> torch.Tensor:
+    assert inputs.dtype == torch.int32
+    assert delta_scale_offsets.dtype == torch.uint8
+    assert inputs.nelement() >= delta_scale_offsets.nelement() * 4
+
+    def is_power_of_two(n: int) -> bool:
+        return n > 0 and (n & (n - 1)) == 0
+
+    repeat_count = inputs.nelement() // delta_scale_offsets.nelement() // 4
+    assert is_power_of_two(repeat_count)
+    delta_scale_offsets = delta_scale_offsets.repeat_interleave(repeat_count, -1)
+
+    outputs = inputs if inplace else torch.empty_like(inputs)
+
+    kernel = ProcessMxfp4W4A8Kernel()
+    kernel(inputs, outputs, delta_scale_offsets)
 
     return outputs

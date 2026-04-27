@@ -127,6 +127,7 @@ CUDA_INLINE uint32_t dequant_single(uint32_t val, const uint32_t &zp_val) {
       return normalized_uint_to_fp<SourceType, TargetType, kHasZeroPoint, kIsFpZeroPoint>(val, zp_val);
     }
   } else if constexpr (TargetType::kIsIntegerType) {
+    static_assert(SourceType::kIsIntegerType);
     return uint_to_int<SourceType, TargetType, kHasZeroPoint>(val, zp_val);
   };
 };
