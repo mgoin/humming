@@ -177,7 +177,6 @@ class BaseWeightSchema:
     def from_config(cls, config: dict[str, Any]) -> "BaseWeightSchema":
         from humming.schema import WEIGHT_SCHEMA_MAP
 
-        quant_method = config["quant_method"]
         if cls is BaseWeightSchema:
             quant_method = config["quant_method"]
             if quant_method in WEIGHT_SCHEMA_MAP:
@@ -295,7 +294,6 @@ class BaseInputSchema:
     def from_config(cls, config: dict[str, Any]) -> "BaseInputSchema":
         from humming.schema import INPUT_SCHEMA_MAP
 
-        quant_method = config["quant_method"]
         if cls is BaseInputSchema:
             quant_method = config["quant_method"]
             if quant_method in INPUT_SCHEMA_MAP:

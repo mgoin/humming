@@ -38,8 +38,8 @@ class Sm90H20Heuristics(DeviceHeuristics):
             }
         elif use_fused_e8m0_scale:
             return {
-                "block_shape": (128, 128, 1024 // a_dtype.num_bits),
-                "warp_shape": (128, 32, 1024 // a_dtype.num_bits),
+                "block_shape": (64, 256, 1024 // a_dtype.num_bits),
+                "warp_shape": (64, 64, 1024 // a_dtype.num_bits),
                 "num_ctas_per_sm": 2,
             }
         elif group_size == 0 and not is_moe:
