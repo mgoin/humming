@@ -73,7 +73,12 @@ def bench_humming(
         inputs = torch.randn((actual_shape_m, shape_k), dtype=torch_dtype, device="cuda:0")
         input_scale: torch.Tensor | None = None
         if a_dtype not in ["float16", "bfloat16"]:
-            inputs, input_scale = ops.quant_input(inputs, a_dtype, None, input_scale_group_size)
+            inputs, input_scale = ops.quant_input(
+                inputs,
+                a_dtype,
+                None,
+                group_size=input_scale_group_size,
+            )
 
         tuning_config = get_heuristics_config(
             meta=meta,
