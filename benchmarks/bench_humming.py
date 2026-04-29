@@ -86,13 +86,14 @@ def bench_humming(
             gemm_type=gemm_type,
         )
 
-        block_size_config: list[int] | None = None
+        block_size_config: int | None = None
         if gemm_type == GemmType.INDEXED:
-            block_size_config = []
+            routed_shape_m = shape_m * top_k
             for min_shape_m, max_shape_m, config in tuning_config:
-                if shape_m * top_k > min_shape_m and shape_m * top_k < max_shape_m:
-                    block_shape_m = config["block_shape"][0]
-                    block_size_config += [min_shape_m, max_shape_m, block_shape_m]
+                if routed_shape_m > min_shape_m and routed_shape_m <= max_shape_m:
+                    block_size_config = config["block_shape"][0]
+                    break
+            assert block_size_config is not None
 
         moe_tensors = generate_random_moe_tensors(
             shape_m=shape_m,
