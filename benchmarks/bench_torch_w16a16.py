@@ -28,8 +28,10 @@ def bench_torch_w16a16(
     for shape_m in tqdm(shape_m_list or default_shape_m_list):
         inputs = torch.randn((shape_m, shape_k), dtype=torch_dtype, device="cuda:0")
 
+        weight_t = weight.T
+
         def run():
-            return inputs.matmul(weight)  # noqa
+            return inputs.matmul(weight_t)  # noqa
 
         outputs = run()
         torch.cuda.synchronize()
