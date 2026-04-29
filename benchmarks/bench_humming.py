@@ -95,17 +95,22 @@ def bench_humming(
                     break
             assert block_size_config is not None
 
-        moe_tensors = generate_random_moe_tensors(
-            shape_m=shape_m,
-            num_experts=num_experts,
-            top_k=top_k,
-            gemm_type=gemm_type,
-            balanced=balanced,
-            block_size_config=block_size_config,
-        )
-
         torch.cuda.manual_seed(shape_m)
-        _, expert_layout, sorted_ids, expert_ids, num_tokens_padded = moe_tensors
+        if gemm_type == GemmType.DENSE:
+            expert_layout = None
+            sorted_ids = None
+            expert_ids = None
+            num_tokens_padded = None
+        else:
+            moe_tensors = generate_random_moe_tensors(
+                shape_m=shape_m,
+                num_experts=num_experts,
+                top_k=top_k,
+                gemm_type=gemm_type,
+                balanced=balanced,
+                block_size_config=block_size_config,
+            )
+            _, expert_layout, sorted_ids, expert_ids, num_tokens_padded = moe_tensors
 
         def run():
             return layer(
@@ -115,7 +120,12 @@ def bench_humming(
                 expert_ids=expert_ids,  # noqa
                 num_tokens_padded=num_tokens_padded,  # noqa
                 expert_layout=expert_layout,  # noqa
-                compute_config=json.dumps({"use_f16_accum": use_f16_accum}),
+                compute_config=json.dumps(
+                    {
+                        "use_f16_accum": use_f16_accum,
+                        "gemm_type": gemm_type.value,
+                    }
+                ),
                 tuning_config=tuning_config,  # noqa
                 top_k=top_k if not is_moe_down else 1,
             )
@@ -178,17 +188,10 @@ def main():
     parser.add_argument("--balanced", default=False, action="store_true")
     parser.add_argument("--expert_max_tokens", type=int, default=None)
     parser.add_argument("--shape_m_list", type=int, default=None, nargs="+")
-    gemm_type_list = [
-        "dense",
-        "indexed_1tok",
-        "indexed_ktok",
-        "grouped_contiguous",
-        "grouped_masked",
-    ]
     parser.add_argument(
         "--gemm_type",
         type=GemmType,
-        choices=gemm_type_list,
+        choices=list(GemmType),
         default=GemmType.DENSE,
     )
     parser.add_argument("--output_file", type=str, default=None)
@@ -212,6 +215,7 @@ def main():
         is_moe_down=args.is_moe_down,
         balanced=args.balanced,
         expert_max_tokens=args.expert_max_tokens,
+        gemm_type=args.gemm_type,
     )
 
     save_benchmark_result(benchmark_result, args)
