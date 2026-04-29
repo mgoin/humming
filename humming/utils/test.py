@@ -1,3 +1,4 @@
+import enum
 import importlib.metadata
 import json
 import math
@@ -278,6 +279,9 @@ def save_benchmark_result(result, args, packages: list[str] | None = None):
     if output_file is None:
         return
     kwargs.pop("shape_m_list", None)
+    for key, value in list(kwargs.items()):
+        if isinstance(value, enum.Enum):
+            kwargs[key] = value.value
     if "num_experts" in kwargs and kwargs["num_experts"] is None:
         del kwargs["num_experts"]
         del kwargs["top_k"]
