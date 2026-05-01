@@ -164,6 +164,9 @@ class NVRTCCompiler(Compiler):
         cuda_include = jit_utils.get_cuda_include_path()
         if os.path.isdir(cuda_include):
             dirs.append(cuda_include)
+            cccl = os.path.join(cuda_include, "cccl")
+            if os.path.isdir(cccl):
+                dirs.append(cccl)
 
         try:
             import nvidia
@@ -173,6 +176,9 @@ class NVRTCCompiler(Compiler):
                     inc = os.path.join(pkg_path, sub, "include")
                     if os.path.isdir(inc):
                         dirs.append(inc)
+                        cccl = os.path.join(inc, "cccl")
+                        if os.path.isdir(cccl):
+                            dirs.append(cccl)
         except (ImportError, OSError):
             pass
         return dirs
