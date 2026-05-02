@@ -72,10 +72,10 @@ CUDA_INLINE uint2 fused_dequant_single_for_mxfp4<Int8>(const uint32_t qb, const 
 }
 
 template <class TargetType, uint32_t kCount, bool kUseWgmma>
-CUDA_INLINE void fused_dequant_for_mxfp4(const uint32_t *qb_ptrs, uint32_t *res_ptrs, uint32_t scales) {
+CUDA_INLINE void fused_dequant_for_mxfp4(const uint32_t *qb_ptrs, uint32_t *res_ptrs, uint32_t *scales_ptr) {
   PRAGMA_UNROLL
   for (uint32_t i = 0; i < kCount * 2; i++) {
-    uint32_t exp_offset = reinterpret_cast<uint8_t*>(&scales)[i];
+    uint32_t exp_offset = reinterpret_cast<uint8_t*>(scales_ptr)[i];
     uint2 res = fused_dequant_single_for_mxfp4<TargetType>(qb_ptrs[i], exp_offset);
     res_ptrs[i * 2] = res.x;
     res_ptrs[i * 2 + 1] = res.y;

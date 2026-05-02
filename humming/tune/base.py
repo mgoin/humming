@@ -228,7 +228,10 @@ class DeviceHeuristics:
         configs: list[list[int | dict]] = []
         last_config_str: str = ""
 
-        max_shape_m = 8192
+        if not meta.num_experts:
+            max_shape_m = 8192
+        else:
+            max_shape_m = 65536
 
         shape_m_candidates = [1, 2, 4, 8]
         if cls.sm_version == 90:
@@ -242,6 +245,8 @@ class DeviceHeuristics:
             if shape_m > 2048 and shape_m % 32 != 0:
                 continue
             if shape_m > 4096 and shape_m % 64 != 0:
+                continue
+            if shape_m > 16384 and shape_m % 128 != 0:
                 continue
 
             config = cls.get_config(

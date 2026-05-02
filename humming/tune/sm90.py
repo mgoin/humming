@@ -130,7 +130,8 @@ class Sm90Heuristics(DeviceHeuristics):
                 block_m = i * 8 + 8
                 num_blocks_list.append(math.ceil(shape_m / block_m))
         else:
-            samples = np.random.randint(0, meta.num_experts, size=shape_m)
+            random_state = np.random.RandomState(seed=0)
+            samples = random_state.randint(0, meta.num_experts, size=shape_m)
             counts = np.bincount(samples)
             for i in range(max_block_m // 8):
                 block_m = i * 8 + 8
