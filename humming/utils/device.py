@@ -45,7 +45,16 @@ def estimate_tensorcore_max_tops(gpu_index=0):
         max_clock_mhz = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_SM)
         sm_count = torch.cuda.get_device_properties(gpu_index).multi_processor_count
 
-        ops_map = {75: 1024, 80: 2048, 86: 1024, 87: 2048, 89: 1024, 90: 4096}
+        ops_map = {
+            75: 1024, 80: 2048, 86: 1024, 87: 2048, 89: 1024, 90: 4096,
+            # Blackwell datacenter (B100/B200/B300). 100/103 covered for cc
+            # 10.0 and 10.3 respectively. The value matches sm_90 for the
+            # *legacy* mma.sync path that humming uses today; the Sablefish
+            # tcgen05 baseline shows ~2x effective throughput is reachable,
+            # but estimate_compute_bound_threshold only cares about the
+            # order-of-magnitude crossover so the conservative value is fine.
+            100: 4096, 101: 4096, 102: 4096, 103: 4096,
+        }
         ops_per_clock = ops_map[sm_version]
 
         # 1. This function returns the dense FP16 Tensor Core performance (FP16 accumulator).

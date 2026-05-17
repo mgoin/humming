@@ -246,6 +246,80 @@ to write a small smoke test under `humming/tests/` that calls our new
 TCGEN05 config explicitly (bypassing the heuristic, to validate the path
 before tuning).
 
+## Work log
+
+### Phase A — heuristic dispatch on B300
+
+* Added `tune/sm100.py` (`Sm100Heuristics` inheriting `Sm89Heuristics`,
+  227 KiB SMEM, `sm_version=100`). Registered 100/101/102/103 in
+  `tune/__init__.py:heuristics_map` so B100 (cc 10.0), B200 (10.0), B300
+  (10.3) all resolve. **Decision: inherit from Sm89 not write fresh.** Sm89
+  is the most semantically-similar code path (mma.sync m16n8k16, cp.async,
+  fp32 acc), and the cached kernel.cu artifacts already used those
+  configs successfully on B300 via hand-built bench scripts. Sticking with
+  Sm89's tuning curve gives us a known-good baseline; we tune Phase A
+  configs in-place later if needed.
+* Found and patched a second `KeyError: 103` in `utils/device.py:48`
+  (`ops_map[sm_version]` inside `estimate_tensorcore_max_tops`). Added
+  100/101/102/103 entries reusing sm90's 4096 ops/clock/SM — only used by
+  `estimate_compute_bound_threshold`, which is an order-of-magnitude
+  heuristic so the conservative value is fine.
+* Editable install was stale (`humming.__file__` returned `None` because
+  Python's cwd-based namespace shadowed the meta-path finder when invoked
+  from `~/code/vllm`). Reinstall via `uv pip install -e . --no-deps` fixed
+  it.
+
+### Phase A perf observations (BIG surprise)
+
+Humming's existing mma.sync path is much stronger on B300 than I expected.
+On AWQ W4A16 (uint4 + gs=128 + zp, bf16 in/out), 6-shape sweep saved at
+`tests/baseline_phaseA.tsv`. Headline pattern (N×K=4096²):
+
+```
+   B   humming us  Sablefish us  Marlin us | sf/hum  mar/hum
+  16        15.6         40.7        13.0   2.61x    0.83x
+ 256        35.4         43.6        33.5   1.23x    0.95x
+1024        94.8         68.6        96.6   0.72x    1.02x
+4096       343.1        227.5       351.0   0.66x    1.02x
+```
+
+Same pattern on all 6 LLM shapes. Highlights from the big-shape end:
+
+```
+        B          shape    hum_us   sf_us  mar_us | sf/hum
+     4096   14336 ×  4096   1163     651    1230     0.56x
+     4096    4096 × 14336   1140     708    1159     0.62x
+     4096   28672 ×  8192   4536    2363    4717     0.52x   ← biggest single win
+     4096    8192 × 28672   4486    2289    4616     0.51x
+```
+
+* **Low batch (B ≤ ~64)**: humming wins. mma.sync's small fragments give it
+  the same low-batch advantage Marlin has, AND humming is within 30 % of
+  Marlin — close enough that the existing path is "the answer" here.
+* **Mid batch (B ≈ 256)**: humming ≈ Marlin. Sablefish is behind by ~25 %.
+* **High batch (B ≥ 1024)**: Sablefish wins by 1.3–1.5×. Humming ≈ Marlin.
+
+What this means for Phase B:
+
+1. The **only place tcgen05 buys anything is B ≥ ~512** (and humming has to
+   stay below Sablefish's ~227 µs at B=4096 to be worth shipping).
+2. **Humming at B=16 (18.6 µs) is already very close to Marlin (12.7 µs)** —
+   we don't need to write a new low-batch kernel. The crossover heuristic
+   in `Sm100Heuristics.get_config*` should keep returning the existing
+   mma.sync configs below the crossover.
+3. The Phase B target is a ~115 µs speedup vs humming-today at the largest
+   shapes (humming 343 → tcgen05 ~227 us at B=4096, N=K=4096), or roughly
+   matching Sablefish's curve. Full bench across the 6 LLM shapes saved at
+   `/tmp/humming_baseline.tsv` for diffing.
+
+### Phase A files added / changed
+
+* `humming/tune/sm100.py` (new)
+* `humming/tune/__init__.py` (heuristics_map registration)
+* `humming/utils/device.py` (ops_map entries)
+* `tests/test_sm100_smoke.py` (new — exercises HummingLayer through heuristics)
+* `tests/bench_w4a16_baseline.py` (new — 3-way perf comparison)
+
 ## Open questions to revisit
 
 1. **One mainloop file vs. two?** Sticking with the existing `humming.cuh`
