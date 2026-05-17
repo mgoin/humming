@@ -4,6 +4,9 @@ import enum
 class MmaType(enum.Enum):
     MMA = "mma"
     WGMMA = "wgmma"
+    # Blackwell tcgen05.mma -- accumulator in TMEM, both operands in SMEM.
+    # Wired up for sm_100+; see kernel/tcgen05_mma.cuh.
+    TCGEN05 = "tcgen05"
 
 
 class WeightScaleType(enum.Enum):

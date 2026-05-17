@@ -278,6 +278,78 @@ class WgmmaOpClassImpl:
         return asm_code
 
 
+class Tcgen05OpClassImpl:
+    """Blackwell tcgen05.mma (UMMA) instruction descriptor.
+
+    Differences from MmaOpClassImpl / WgmmaOpClassImpl:
+      * Both operands are read from SMEM (descriptors), so there are no
+        A/B register-tile counts to emit.
+      * Accumulator lives in TMEM (column allocation), not RMEM. The
+        epilogue does its own t2r load, so we still emit a CRegisters
+        alias for the RMEM-side tile shape, but the in-mainloop fma() does
+        not touch C registers directly.
+
+    The actual PTX `tcgen05.mma` emission lives in
+    `include/humming/utils/ptx/tcgen05.cuh` and is invoked by
+    `mma/tcgen05_mma.cuh` rather than inlined here, because the
+    instruction takes a runtime instruction-descriptor that must be
+    constructed at kernel time (not at codegen time).
+    """
+
+    def __init__(self, m, n, k, a_dtype, b_dtype, cd_dtype):
+        self.shape = (m, n, k)
+        self.a_dtype = a_dtype if isinstance(a_dtype, str) else DTYPE_MAP[a_dtype]
+        self.b_dtype = b_dtype if isinstance(b_dtype, str) else DTYPE_MAP[b_dtype]
+        self.cd_dtype = cd_dtype if isinstance(cd_dtype, str) else DTYPE_MAP[cd_dtype]
+
+        # Same RMEM C-register count as MMA -- the t2r path lands accumulators
+        # in the same register footprint the epilogue expects.
+        self.reg_cd_count = calc_reg_count(m, n, self.cd_dtype) // 4
+        if self.cd_dtype == "f16":
+            self.val_type_cd = "half"
+            self.reg_cd_type = "uint32_t"
+        elif self.cd_dtype == "bf16":
+            self.val_type_cd = "nv_bfloat16"
+            self.reg_cd_type = "uint32_t"
+        elif self.cd_dtype == "f32":
+            self.val_type_cd = "float"
+            self.reg_cd_type = "float"
+        elif self.cd_dtype == "s32":
+            self.val_type_cd = "int32_t"
+            self.reg_cd_type = "uint32_t"
+        else:
+            raise ValueError(f"Invalid cd_dtype for tcgen05: {cd_dtype}")
+
+    def to_cpp_str(self, include_class_name=False):
+        lines = [
+            "static constexpr MmaType kMmaType = MmaType::TCGEN05;",
+            f"using MmaShape = Shape<{self.shape[0]}, {self.shape[1]}, {self.shape[2]}>;",
+            "",
+            f"using ValTypeC = {self.val_type_cd};",
+            f"using ValTypeD = {self.val_type_cd};",
+            "",
+            f"static constexpr uint32_t kATypeBits = {DTYPE_BIT_WIDTH_MAP[self.a_dtype]};",
+            f"static constexpr uint32_t kBTypeBits = {DTYPE_BIT_WIDTH_MAP[self.b_dtype]};",
+            f"static constexpr uint32_t kCTypeBits = {DTYPE_BIT_WIDTH_MAP[self.cd_dtype]};",
+            f"static constexpr uint32_t kDTypeBits = {DTYPE_BIT_WIDTH_MAP[self.cd_dtype]};",
+            "",
+            # tcgen05.mma operands come from SMEM/TMEM descriptors, not
+            # per-warp register tiles. The TCGEN05 class in
+            # mma/tcgen05_mma.cuh constructs descriptors at runtime; we
+            # only need to expose the C-register footprint here so the
+            # epilogue path can size its t2r staging.
+            f"using CRegisters = {self.reg_cd_type}[{self.reg_cd_count}];",
+            f"using DRegisters = {self.reg_cd_type}[{self.reg_cd_count}];",
+            "",
+            "// fma() not emitted here -- see TCGEN05::run() in",
+            "// mma/tcgen05_mma.cuh for the tcgen05.mma issue path.",
+        ]
+        code = "\n".join("  " + x if x else x for x in lines)
+        if include_class_name:
+            code = f"class MmaOpClass {{\n{code}\n}};"
+        return code
+
+
 class MmaOpClass:
     @classmethod
     def from_config(cls, mma_type, m, n, k, a_dtype, b_dtype, cd_dtype):
@@ -287,5 +359,7 @@ class MmaOpClass:
             return MmaOpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype)
         elif mma_type == MmaType.WGMMA:
             return WgmmaOpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype)
+        elif mma_type == MmaType.TCGEN05:
+            return Tcgen05OpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype)
         else:
             raise ValueError(f"Invalid MMA Type: {mma_type}")
