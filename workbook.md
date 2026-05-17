@@ -405,19 +405,36 @@ untouched.
 Known-correct issues to fix in this path (recorded so next iteration
 doesn't re-discover):
 
-1. **r2s lane mapping doesn't match tcgen05.mma SMEM swizzle.** The
-   current `transform_b` writes the dequantised bf16 tile into SMEM with
-   a naive `threadIdx.x * stride` layout; tcgen05.mma expects a specific
-   128B/64B swizzled layout (the same wgmma uses) for the operand
-   descriptor `tcgen05_smem_desc<128>` to read correctly. Math will be
-   wrong even when the kernel runs.
-2. **No mbarrier-based commit.** `TCGEN05::run()` falls back to
-   `__syncthreads()` after `tcgen05_fence`. Correct but slow; needed
-   for Phase C.
+1. **HANG AT LAUNCH (currently blocking)**. The kernel.cubin (20 KB)
+   builds cleanly through nvrtc/ptxas for sm_103a but pytest hangs once
+   the kernel actually launches. The most plausible cause:
+   `tcgen05.mma` is async, and our temporary `tcgen05_fence +
+   __syncthreads` stand-in does NOT actually wait for the MMA to retire.
+   The subsequent `tcgen05.ld` (in `final_regs_c_as_ptr`) and
+   `tcgen05.dealloc<128>` (at kernel exit) then collide with an
+   in-flight MMA and the device blocks. **Resolution: must land the
+   mbarrier-based `tcgen05.commit.cta_group::1.mbarrier::arrive::one`
+   + matching `mbarrier.try_wait` before this test can run.** Pattern
+   to copy from CUTLASS: `include/cute/arch/mma_sm100_desc.hpp` and the
+   pipeline classes nearby.
+2. **r2s lane mapping doesn't match tcgen05.mma SMEM swizzle.** Even
+   once (1) is fixed, math will be wrong: `transform_b` writes the
+   dequantised bf16 tile into SMEM with a naive `threadIdx.x * stride`
+   layout. tcgen05.mma expects the same 128B/64B swizzled layout wgmma
+   uses; the descriptor we build via `tcgen05_smem_desc<128>` has the
+   swizzle bits set, so the kernel-side reader assumes swizzled data.
 3. **Wasted A→RMEM hop.** s2r_pipe still loads A into `regs_a` (now a
    small dummy array on the TCGEN05 class). The actual A operand comes
    from SMEM via `tcgen05_smem_desc(&smem.a[stage_id][0])`. Profile to
    see if this hurts.
+4. **TMEM column count fixed at 128.** Currently `tcgen05_alloc<128>`
+   at kernel entry, irrespective of BlockN. Works for BlockN ≤ 128 with
+   f32 acc; BlockN=256 will need 256. Make it constexpr-derived from
+   the actual tile.
+
+The test (`tests/test_tcgen05.py::test_tcgen05_w4a16_smallest`) is marked
+`xfail(run=False)` until (1) lands. Run with
+`pytest --runxfail tests/test_tcgen05.py` once the mbarrier path is up.
 
 ### Phase B.2 (still pending) — `mma/tcgen05_mma.cuh`
 
