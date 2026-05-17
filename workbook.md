@@ -373,6 +373,52 @@ What this means for Phase B:
   The wrapper is `#if 0`'d out in tcgen05.cuh under
   `tcgen05_commit_to_mbarrier`; a clear TODO comment marks the work.
 
+### Phase B.2b/B.3 — TCGEN05 class wired in and compiling
+
+* **`mma/tcgen05_mma.cuh`** (new, ~200 lines): `TCGEN05` template with
+  same interface as `WMMA` / `WGMMA`. Three-way dispatch wired through
+  `humming.cuh:71` and `humming_ws.cuh:71`.
+* **`utils/storage.cuh`**: added `b_dequant[kNumStages][kStageSizeBDequant]`
+  bf16 staging buffer, `tcgen05_tmem_col`, and `tcgen05_mbar` SMEM
+  slots, all under `IF_USE_TCGEN05(...)`.
+* **`config/config.py`**: `use_tcgen05: bool` field on TuningConfig
+  (auto-generates `HUMMING_USE_TCGEN05` macro + `kUseTcgen05` constexpr).
+* **`kernel/humming.cuh`**: `tcgen05_alloc<128>` at kernel entry,
+  matching `tcgen05_dealloc<128>` + `relinquish_alloc_permit` at exit;
+  both gated by `if constexpr (MmaOpClass::kMmaType == MmaType::TCGEN05)`.
+* **`ops/utils.py`**: fixed `humming.__file__ = None` resolution bug
+  (running from repo root made cwd shadow the editable install; falls
+  back to `__path__[0]` now).
+
+**The TCGEN05 path compiles end-to-end through nvrtc/ptxas.** Existing
+mma.sync and wgmma tests (`test_shape`, `test_sm100_smoke`) still pass
+after the dispatch edits, confirming the non-tcgen05 paths are
+untouched.
+
+### Phase B.4 — first correctness attempt
+
+`tests/test_tcgen05.py` exercises the smallest viable instance:
+  - `bf16 A x uint4 B`, gs=128, has_zero_point=True
+  - block (64, 128, 128), warp (64, 64, 32), num_stages=2, 1-CTA
+  - `mma_type='tcgen05'`, `use_tcgen05=True`
+
+Known-correct issues to fix in this path (recorded so next iteration
+doesn't re-discover):
+
+1. **r2s lane mapping doesn't match tcgen05.mma SMEM swizzle.** The
+   current `transform_b` writes the dequantised bf16 tile into SMEM with
+   a naive `threadIdx.x * stride` layout; tcgen05.mma expects a specific
+   128B/64B swizzled layout (the same wgmma uses) for the operand
+   descriptor `tcgen05_smem_desc<128>` to read correctly. Math will be
+   wrong even when the kernel runs.
+2. **No mbarrier-based commit.** `TCGEN05::run()` falls back to
+   `__syncthreads()` after `tcgen05_fence`. Correct but slow; needed
+   for Phase C.
+3. **Wasted A→RMEM hop.** s2r_pipe still loads A into `regs_a` (now a
+   small dummy array on the TCGEN05 class). The actual A operand comes
+   from SMEM via `tcgen05_smem_desc(&smem.a[stage_id][0])`. Profile to
+   see if this hurts.
+
 ### Phase B.2 (still pending) — `mma/tcgen05_mma.cuh`
 
 The `TCGEN05` MMA class. Mirrors the `WMMA` / `WGMMA` shape. Roughly:

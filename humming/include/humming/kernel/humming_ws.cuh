@@ -11,6 +11,7 @@
 #include <humming/memory/s2r_pipeline.cuh>
 #include <humming/mma/wgmma.cuh>
 #include <humming/mma/wmma.cuh>
+#include <humming/mma/tcgen05_mma.cuh>
 
 #include <humming/datatype/dequant.cuh>
 
@@ -68,7 +69,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       LayerConfig, TuningConfig>;
   using WMMA = WMMA<MmaOpClass, SharedStorage, MainloopArithmetic, WarpShape, ElementA, ElementB, LayerConfig>;
   using WGMMA = WGMMA<MmaOpClass, SharedStorage, MainloopArithmetic, BlockShape, WarpShape, ElementA, ElementB, LayerConfig>;
-  using MMA = std::conditional_t<MmaOpClass::kMmaType == MmaType::WGMMA, WGMMA, WMMA>;
+  using TCGEN05 = TCGEN05<MmaOpClass, SharedStorage, MainloopArithmetic, BlockShape, WarpShape, ElementA, ElementB, LayerConfig>;
+  using MMA = std::conditional_t<
+      MmaOpClass::kMmaType == MmaType::TCGEN05, TCGEN05,
+      std::conditional_t<MmaOpClass::kMmaType == MmaType::WGMMA, WGMMA, WMMA>>;
   using Epilogue = EpiloguePipeline<
       MmaOpClass, SharedStorage, EpilogueArithmetic, ProblemShape, BlockShape, WarpShape, PadShape,
       ElementA, ElementC, LayerConfig, ComputeConfig, TuningConfig>;

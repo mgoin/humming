@@ -70,6 +70,12 @@
 #define IF_USE_WARP_SPEC(x)
 #endif
 
+#if HUMMING_USE_TCGEN05
+#define IF_USE_TCGEN05(x) x
+#else
+#define IF_USE_TCGEN05(x)
+#endif
+
 
 template <
     class MmaOpClass,
@@ -131,6 +137,15 @@ public:
   static constexpr uint32_t kChannelBytesBS = kChannelSizeBS * sizeof(int4);
   static constexpr uint32_t kBiasBytes = kBiasSize * sizeof(int4);
 
+  // Staging buffer for the tcgen05 path: dequantised B operand in bf16/fp16
+  // staged from registers back to SMEM before the tcgen05.mma reads it.
+  // Sized as one full (BlockN x BlockK) tile per pipeline stage. The
+  // element type matches ElementA (= MMA operand type) so the descriptor
+  // construction in TCGEN05::run() uses the same swizzle as A.
+  static constexpr uint32_t kSmemStrideBDequant = BlockShape::N * BlockShape::K * ElementA::kBits / 32 / 4;
+  static constexpr uint32_t kStageSizeBDequant = kSmemStrideBDequant;
+  static constexpr uint32_t kStageBytesBDequant = kStageSizeBDequant * sizeof(int4);
+
   static constexpr bool kUseWarpSpec = TuningConfig::kUseWarpSpec;
   static constexpr bool kUseMBarrier = TuningConfig::kUseMBarrier;
   static constexpr bool kIsIndexedGemm = ComputeConfig::kGemmType == GemmType::INDEXED;
@@ -146,6 +161,11 @@ public:
       IF_HAS_CHANNEL_WEIGHT_SCALE(int4 bs_c[kChannelSizeBS];)
       IF_HAS_BIAS(int4 bias[kBiasSize];)
       IF_HAS_CHANNEL_INPUT_SCALE(int4 as_c[kChannelSizeAS];)
+      // Dequantised bf16 B staging for the tcgen05 path. Only emitted
+      // when `use_tcgen05` is set in the TuningConfig; otherwise the
+      // mma.sync / wgmma paths dequant directly into RMEM and need no
+      // SMEM here.
+      IF_USE_TCGEN05(int4 b_dequant[kNumStages][kStageSizeBDequant];)
     };
     int4 reduce[MAX(kWarpReduceSize, kBlockOutputSize)];
   };
@@ -160,4 +180,10 @@ public:
 
   IF_USE_MBARRIER(alignas(128) uint64_t load_mbar[kNumStages + 2];)
   IF_USE_WARP_SPEC(uint64_t math_mbar[kNumStages + 1];)
+
+  // Per-CTA TMEM column index returned by `tcgen05.alloc`. The issuing
+  // thread writes this; all warps in the CTA read it after the alloc
+  // sync.  Only present when use_tcgen05 is set.
+  IF_USE_TCGEN05(alignas(16) uint32_t tcgen05_tmem_col;)
+  IF_USE_TCGEN05(alignas(8) uint64_t tcgen05_mbar;)
 };

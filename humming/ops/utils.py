@@ -50,7 +50,19 @@ def init_humming_launcher():
     with FileLock(lock_filename):
         import humming
 
-        dirname = os.path.dirname(humming.__file__)
+        # `humming.__file__` can be None when the package is resolved as a
+        # namespace package -- this happens if Python's cwd contains a
+        # `humming/` directory (e.g. running from the repo root with the
+        # editable install shadowed). Fall back to `__path__[0]/..` which
+        # points at the editable source tree regardless of resolution mode.
+        if humming.__file__ is not None:
+            dirname = os.path.dirname(humming.__file__)
+        else:
+            dirname = list(humming.__path__)[0]
+            # If __path__ pointed at the top-level repo dir, walk into the
+            # `humming` subpackage so the join below finds csrc/launcher.
+            if not os.path.exists(os.path.join(dirname, "csrc")):
+                dirname = os.path.join(dirname, "humming")
         filename = os.path.join(dirname, "csrc/launcher/launcher.cpp")
 
         torch.utils.cpp_extension.load(

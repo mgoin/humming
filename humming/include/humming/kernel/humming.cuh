@@ -11,6 +11,7 @@
 #include <humming/memory/s2r_pipeline.cuh>
 #include <humming/mma/wgmma.cuh>
 #include <humming/mma/wmma.cuh>
+#include <humming/mma/tcgen05_mma.cuh>
 
 #include <humming/datatype/dequant.cuh>
 
@@ -68,7 +69,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       LayerConfig, TuningConfig>;
   using WMMA = WMMA<MmaOpClass, SharedStorage, MainloopArithmetic, WarpShape, ElementA, ElementB, LayerConfig>;
   using WGMMA = WGMMA<MmaOpClass, SharedStorage, MainloopArithmetic, BlockShape, WarpShape, ElementA, ElementB, LayerConfig>;
-  using MMA = std::conditional_t<MmaOpClass::kMmaType == MmaType::WGMMA, WGMMA, WMMA>;
+  using TCGEN05 = TCGEN05<MmaOpClass, SharedStorage, MainloopArithmetic, BlockShape, WarpShape, ElementA, ElementB, LayerConfig>;
+  using MMA = std::conditional_t<
+      MmaOpClass::kMmaType == MmaType::TCGEN05, TCGEN05,
+      std::conditional_t<MmaOpClass::kMmaType == MmaType::WGMMA, WGMMA, WMMA>>;
   using Epilogue = EpiloguePipeline<
       MmaOpClass, SharedStorage, EpilogueArithmetic, ProblemShape, BlockShape, WarpShape, PadShape,
       ElementA, ElementC, LayerConfig, ComputeConfig, TuningConfig>;
@@ -97,6 +101,19 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
   producer.init_mbarrir();
   __syncthreads();
+
+  // TMEM allocation for the tcgen05 path. One warp issues the alloc; the
+  // column index lands in smem.tcgen05_tmem_col which all warps observe
+  // after the sync. Size for now: 128 columns (covers BlockN up to 128
+  // with f32 acc). Revisit when we support BlockN > 128.
+  if constexpr (MmaOpClass::kMmaType == MmaType::TCGEN05) {
+    if (threadIdx.x == 0) {
+      uint32_t smem_addr =
+          cast_smem_ptr_to_uint(&smem.tcgen05_tmem_col);
+      tcgen05_alloc<128>(smem_addr);
+    }
+    __syncthreads();
+  }
 
   while (scheduler.get_next_block()) {
     mma.zero_accum();
@@ -152,5 +169,14 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     s2r_pipe.load_channel(scheduler.slice_id);
     __syncthreads();
     epilogue.call(mma.final_regs_c_as_ptr());
+  }
+
+  // Release the TMEM column allocation before kernel exit.
+  if constexpr (MmaOpClass::kMmaType == MmaType::TCGEN05) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      tcgen05_relinquish_alloc_permit();
+      tcgen05_dealloc<128>(smem.tcgen05_tmem_col);
+    }
   }
 };
