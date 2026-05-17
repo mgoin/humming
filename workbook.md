@@ -319,6 +319,103 @@ What this means for Phase B:
 * `humming/utils/device.py` (ops_map entries)
 * `tests/test_sm100_smoke.py` (new — exercises HummingLayer through heuristics)
 * `tests/bench_w4a16_baseline.py` (new — 3-way perf comparison)
+* `tests/baseline_phaseA.tsv` (committed baseline numbers; diff against this for Phase C)
+
+### Phase B.1 — `MmaType.TCGEN05` enum + Python codegen scaffold
+
+* Added `TCGEN05 = "tcgen05"` to `MmaType` (Python `config/enum.py` + C++
+  `include/humming/utils/enum.cuh`).
+* `Tcgen05OpClassImpl` in `config/mma.py` — emits the `MmaShape` / type-bits /
+  `CRegisters` footprint but *does not* inline an `fma()` body. tcgen05.mma
+  takes a runtime instruction descriptor and operates on SMEM/TMEM, so the
+  emit happens inside `TCGEN05::run()` in the C++ side (see B.2b).
+* `MmaOpClass.from_config(MmaType.TCGEN05, ...)` returns the new impl.
+* **Nothing selects TCGEN05 yet.** Existing MMA/WGMMA dispatch lines (e.g.
+  `humming.cuh:71`) unchanged.
+
+### Phase B.2a — `utils/ptx/tcgen05.cuh` PTX wrappers (compile-verified)
+
+* New file `include/humming/utils/ptx/tcgen05.cuh` (~170 lines). Exposes:
+  - `tcgen05_alloc<NumColumns>(smem_addr_for_col_index)`
+  - `tcgen05_dealloc<NumColumns>(tmem_col_index)`
+  - `tcgen05_relinquish_alloc_permit()`
+  - `tcgen05_smem_desc<SwizzleBytes>(smem_ptr)` — same descriptor layout as
+    wgmma's `make_wgmma_smem_desc`; kept under a neutral name so the
+    tcgen05 path doesn't pull in the wgmma header.
+  - `tcgen05_instr_desc_bf16_bf16_f32(M, N)` — packs the instruction
+    descriptor bits per PTX ISA 8.7 §9.7.16.6.
+  - `tcgen05_mma_ss_bf16(d_tmem, a_desc, b_desc, idesc, scale_d)`
+  - `tcgen05_fence_view_async_tmem_store()`
+  - `tcgen05_ld_32x32b_x32(tmem_addr, uint32_t[32])` — t2r for the epilogue.
+* **Verified**: `nvcc -arch=sm_103a -std=c++17 -ptx` round-trip compiles
+  the wrappers through `ptxas` without errors. Test fixture (TODO: move
+  into `tests/`):
+  ```
+  /tmp/tcgen05_compile_check.cu  (a 50-line standalone TU)
+  ```
+  produces a 1.96 KB `.ptx` containing the expected `tcgen05.alloc /
+  tcgen05.mma.cta_group::1.kind::f16 / tcgen05.ld / tcgen05.dealloc`
+  instructions.
+
+* **Sharp edge found and recorded**: `tcgen05.commit` is **NOT** the
+  wgmma-style commit_group. Real form is
+  `tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [mbar_smem_addr]`
+  — completion is signaled via an *mbarrier*, not a numbered group. That
+  means:
+
+  > Adding tcgen05 commit/wait properly requires allocating an mbarrier
+  > in `SharedStorage` and threading its SMEM address into the commit
+  > callsite. Humming's `g2s_pipeline` / `ConsumerPipeline` already
+  > manage mbarriers for cp.async/TMA loads, so the right move is to add
+  > another mbarrier slot alongside them (NOT to invent a parallel
+  > scheme).
+
+  The wrapper is `#if 0`'d out in tcgen05.cuh under
+  `tcgen05_commit_to_mbarrier`; a clear TODO comment marks the work.
+
+### Phase B.2 (still pending) — `mma/tcgen05_mma.cuh`
+
+The `TCGEN05` MMA class. Mirrors the `WMMA` / `WGMMA` shape. Roughly:
+
+```
+struct TCGEN05 {
+  // members
+  SharedStorage& smem;
+  ArithClass& arith;
+  uint32_t regs_qb[2][...];                   // int4 codes loaded by S2R
+  uint32_t tmem_col_base;                     // TMEM allocation start
+  uint32_t mbar_smem_addr;                    // for commit_to_mbarrier
+  typename MmaOpClass::CRegisters regs_c[2][...][...];  // post-t2r RMEM
+
+  // interface (matches WMMA/WGMMA)
+  void zero_accum();        // zero TMEM tile via tcgen05.mma scale_d=0?
+                            // or just set scale_d=false on first issue
+  void transform_b(buffer_id);  // dequant + r2s into smem.b_bf16_staging
+  void run(stage_id, iter_id);  // issue tcgen05.mma (single instr per K-blk)
+  uint32_t* final_regs_c_as_ptr();  // t2r from TMEM into regs_c, return ptr
+};
+```
+
+Open structural questions:
+1. **SMEM bf16 staging buffer** — add `smem.b_bf16_staging[NumStages][...]`
+   to `utils/storage.cuh::SharedStorage`. Sized as `BlockN × BlockK × 2 B
+   / num_stages`. For (M=128, N=128, K=128) at num_stages=2 that's 32 KB
+   per stage = 64 KB total. Fits comfortably in the 227 KiB budget.
+2. **TMEM allocation site** — must happen in the kernel entry (one warp
+   issues `tcgen05.alloc<N>`, all warps sync before reading the col
+   index). Probably belongs in `humming.cuh` body just before
+   `while (scheduler.get_next_block())`, before `mma.zero_accum()`.
+3. **Where does `tcgen05_fence` live?** — at the end of every k-iter
+   `mma.run()`, before the next `transform_b` reads the SMEM staging
+   buffer. Should be inside `TCGEN05::run()`.
+4. **A operand handling** — for W4A16 with bf16 A, A is *already* in SMEM
+   (after the cp.async/TMA G2S step). The existing `s2r_pipe` also pulls
+   it into `regs_a` for the WMMA path; for TCGEN05 we ignore that and
+   build a `tcgen05_smem_desc` for `smem.a[stage_id]` directly. Wasted
+   reg-load on a hop tcgen05 doesn't use — workbook decision is to leave
+   it for v1 and profile.
+
+## Open questions to revisit
 
 ## Open questions to revisit
 
