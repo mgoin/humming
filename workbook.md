@@ -455,38 +455,77 @@ Also resolved this iteration:
    `static_assert(sizeof(regs_c) == kCallsM*kCallsN*32*4)` catches
    codegen-to-runtime drift.
 
-Still pending (current blocker, kernel hangs in `mbarrier_wait`):
+Phase B.6 progress this iteration (multiple real bugs fixed by reading
+CUTLASS source):
 
-7. **SMEM matrix-descriptor stride fields aren't filled in.** The
-   64-bit tcgen05.mma operand descriptor encodes not just
-   `(addr, swizzle)` but also `leading_dim_byte_offset` (bits 16-29)
-   and `stride_dim_byte_offset` (bits 32-45), each `>> 4`. Humming's
-   existing `make_wgmma_smem_desc` hardcodes those to values that
-   only make sense for `swizzle_bytes` in {64, 128}. My
-   `tcgen05_smem_desc<0>` (swizzle=0 for B) inherits the hardcoded
-   stride constants -- so the descriptor says "no swizzle, but with
-   stride values from a 128B swizzle" -- garbage. tcgen05.mma never
-   retires, the post-commit `mbarrier_wait` spins forever.
+7a. ~~**SmemDescriptor stride fields**~~ FIXED. SM100 layout is at
+    bits [61,63] (3-bit, not 2-bit like SM90), and SBO is
+    tile-dependent (= `BlockKElems` uint128_t units), not
+    swizzle-dependent. New parameterised
+    `tcgen05_smem_desc<SwizzleBytes, BlockKElems>` mirrors CUTLASS's
+    `make_umma_desc`. Bit-by-bit construction, not the
+    happy-coincidence-of-overlap that humming's wgmma helper relied on.
 
-   *Fix path:* write a proper `tcgen05_smem_desc(SmemPtr, ldb_bytes,
-   sdb_bytes, swizzle)` that takes the tile's actual byte dimensions
-   and fills LDB/SDB. CUTLASS
-   `include/cute/arch/mma_sm100_umma.hpp::make_smem_desc(SmemPtr,
-   Layout)` does this; mirror its logic. OR switch to
-   `swizzle=128` for B and refactor `transform_b` to write the
-   swizzled layout (the "B2" path from the walkthrough).
+7b. ~~**K-iter pointer advancement**~~ FIXED. `TCGEN05::run(iter_id)`
+    now advances `smem_ptr += iter_id * kKChunkUint128` (2 uint128_t
+    per .kind::f16 iter). Was always reading the first K-chunk.
 
-8. **r2s lane mapping for B.** Independent of (7): `transform_b`
-   currently writes a naive thread-contiguous scatter. Even after
-   the descriptor is fixed, the SMEM contents won't be in the order
-   tcgen05.mma expects. Real fix: either (a) compute per-thread
-   (row, col) from the m16n8k16 B-fragment register layout and
-   scatter accordingly, or (b) bypass humming's fragment-layout
-   dequant and write a row-major dequant directly into
-   `smem.b_dequant`.
+7c. ~~**WarpShape::K mismatch**~~ FIXED. Test now uses
+    `WarpShape::K == BlockShape::K = 128`, so `K_WARPS = 1` and one
+    warp drives all K-iters. tcgen05.mma is CTA-level so multiple
+    K-warps would stomp on the same TMEM column.
 
-9. **TMEM column count hardcoded 128.** Constexpr-derive from
-   `BlockN * cd_bits / 32` once (7) + (8) land.
+7d. ~~**Missing `.shared::cluster` qualifier on `tcgen05.commit`**~~
+    FIXED. CUTLASS uses
+    `tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64`
+    -- I had the unqualified `.b64`. ptxas accepts both but hardware
+    treats them differently; without the qualifier the commit never
+    actually arrives on the mbar.
+
+**Despite all four fixes the kernel still hangs in `mbarrier_wait`.**
+SASS inspection (`cuobjdump --dump-sass`) confirms:
+  * `UTCATOMSWS.FIND_AND_SET.ALIGN` = tcgen05.alloc -- emitted
+  * `UTCHMMA` = tcgen05.mma -- emitted, one per K-iter
+  * `UTCBAR` = tcgen05.commit -- emitted (predicate `@!UP1` resolves
+    to true for our 32-thread kernel)
+  * `UTCATOMSWS.AND` = tcgen05.dealloc -- emitted
+
+Instructions look right at SASS level. Remaining suspects (each is
+real debug work):
+
+8. **Mbarrier wait-side scope.** Humming's `mbarrier_wait` uses
+   `mbarrier.try_wait.parity.shared::cta.b64`, my commit uses
+   `.shared::cluster`. The hardware may require both sides to agree.
+   Try `mbarrier.try_wait.parity.shared::cluster.b64`.
+
+9. **Mbarrier init scope.** `__mbarrier_init` is generic;
+   `tcgen05.commit.shared::cluster.b64` reads the mbar as cluster-
+   scoped. May need an explicit
+   `mbarrier.init.shared::cluster.b64 [mbar], count` instead of the
+   intrinsic.
+
+10. **Producer fence before tcgen05.mma.** Humming's existing path
+    uses `consumer.wait_stage()` which fences cp.async. The
+    tcgen05.mma reads SMEM via descriptor; if cp.async loads aren't
+    yet visible to the proxy that tcgen05.mma uses, the MMA reads
+    garbage and might silently never retire. Try adding a
+    `fence.proxy.async.shared::cta` before the MMA issue.
+
+11. **r2s lane mapping for B.** Independent of the hang: even after
+    the kernel runs, `transform_b` writes a naive thread-contiguous
+    scatter; the SMEM contents won't match what tcgen05.mma reads
+    via the 128B-swizzle descriptor. The "B2" path from the
+    walkthrough -- compute per-thread (row, col) from m16n8k16
+    B-fragment, scatter to swizzled SMEM positions. Or "B3": bypass
+    the fragment-layout dequant and write directly into row-major
+    SMEM with the descriptor declaring swizzle=NONE.
+
+12. **TMEM column count hardcoded 128.** Constexpr-derive from
+    `BlockN * cd_bits / 32` once the kernel runs.
+
+Diagnostic next step: add a tiny print or a write to gmem of a
+sentinel value right before `mbarrier_wait` -- if the print appears
+but the post-wait code doesn't, we know the commit never fires.
 
 Concrete next-iteration plan:
 

@@ -58,12 +58,18 @@ public:
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kNumWarpShapeNSplits = WarpShape::N == ElementA::kBits * 2 ? 2 : 1;
 
-  // SMEM descriptor swizzle for A and B. Phase B.4 picks B1 from the
-  // workbook: B's r2s writes a plain row-major layout (swizzle=0). A's
-  // SMEM is already loaded by humming's TMA/cp.async loader with the
-  // wgmma-compatible 128B swizzle, so we keep that.
+  // SMEM descriptor swizzle for A and B. Picking B2 from the workbook:
+  // both A and B use 128B swizzle so the descriptor math is shared with
+  // humming's existing TMA/cp.async A loader. (The r2s in transform_b
+  // must produce data in the swizzled layout for this to be correct;
+  // see workbook §"Phase B.6.3" for the lane-mapping spec.)
   static constexpr uint32_t kSwizzleBytesA = 128;
-  static constexpr uint32_t kSwizzleBytesB = 0;
+  static constexpr uint32_t kSwizzleBytesB = 128;
+
+  // Each tcgen05.mma.kind::f16 consumes 16 bf16 of K per issue. The
+  // 128B-swizzle atom is 8 bf16 K-wide, so 16 bf16 = 2 atoms = 2 uint128_t.
+  // Per-K-iter SMEM pointer offset (in int4 / uint128_t units).
+  static constexpr uint32_t kKChunkUint128 = 2;
 
   SharedStorage &smem;
   ArithClass &arith;
@@ -164,11 +170,15 @@ public:
   void run(uint32_t stage_id, uint32_t iter_id) {
     uint32_t buffer_id = iter_id % 2;
 
-    // A descriptor reads from smem.a[stage_id] (128B swizzle, written by
-    // the existing TMA/cp.async loader); B descriptor reads from
-    // smem.b_dequant (swizzle=0, written by transform_b's r2s).
-    uint64_t a_desc = tcgen05_smem_desc<kSwizzleBytesA>(&smem.a[stage_id][0]);
-    uint64_t b_desc = tcgen05_smem_desc<kSwizzleBytesB>(&smem.b_dequant[buffer_id][0]);
+    // A descriptor reads from smem.a[stage_id]; advance the pointer by
+    // `iter_id * kKChunkUint128` so this MMA processes K-chunk `iter_id`.
+    // (tcgen05.mma.kind::f16 only sees 16 bf16 of K per issue; the
+    // outer mainloop's K-loop drives `iter_id` over the BlockK range.)
+    int4 *a_ptr = &smem.a[stage_id][0] + iter_id * kKChunkUint128;
+    int4 *b_ptr = &smem.b_dequant[buffer_id][0] + iter_id * kKChunkUint128;
+
+    uint64_t a_desc = tcgen05_smem_desc<kSwizzleBytesA, BlockShape::K>(a_ptr);
+    uint64_t b_desc = tcgen05_smem_desc<kSwizzleBytesB, BlockShape::K>(b_ptr);
 
     uint32_t idesc =
         tcgen05_instr_desc_bf16_bf16_f32(BlockShape::M, BlockShape::N);

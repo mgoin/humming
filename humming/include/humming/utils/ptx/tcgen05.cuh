@@ -129,26 +129,65 @@ CUDA_INLINE void tcgen05_dealloc(uint32_t tmem_col_index) {
 // mma/wgmma.cuh:7-20. We expose it under a more neutral name here so the
 // tcgen05 path can build descriptors without depending on the wgmma header.
 
-template <uint32_t SwizzleBytes = 128>
-CUDA_INLINE uint64_t tcgen05_smem_desc(const void *smem_ptr) {
-  static_assert(SwizzleBytes == 128 || SwizzleBytes == 64 ||
-                SwizzleBytes == 32 || SwizzleBytes == 0,
-                "tcgen05_smem_desc: SwizzleBytes must be 128/64/32/0");
+// SM100 SmemDescriptor layout (per CUTLASS
+// `include/cute/arch/mma_sm100_desc.hpp:98`):
+//
+//   bits [0, 14)  start_address (>> 4)
+//   bits [16,30)  leading_byte_offset (>> 4)
+//   bits [32,46)  stride_byte_offset (>> 4)
+//   bits [46,48)  version  (we set to 1 for blackwell)
+//   bits [49,52)  base_offset
+//   bit  52       lbo_mode (0 = legacy)
+//   bits [61,64)  layout_type:
+//       0 = NONE
+//       1 = 128B_BASE32B
+//       2 = 128B           (3-bit: 010)
+//       4 = 64B            (3-bit: 100)
+//       6 = 32B            (3-bit: 110)
+//
+// For our K-major bf16 tiles with 128B swizzle the canonical UMMA-K
+// layout is `Swizzle<3,4,3> o ((8,n),2):((8,SBO),1)` (uint128_t units).
+// Mapping to descriptor fields:
+//   SBO = stride between successive 8-N-row blocks (in uint128_t units)
+//       = 8_rows * row_byte_stride / 16
+//       = 8 * BlockK * sizeof(bf16) / 16
+//       = BlockK  (bf16 elements)
+//   LBO = stride between the two K-chunks of the swizzle atom = 1
+//
+// Humming's existing `make_wgmma_smem_desc` hardcodes SBO = 64
+// (correct only for BlockK <= 64 bf16); we parameterise on BlockK here.
 
-  // Encode swizzle in bits 62-63.
-  constexpr uint64_t swizzle_type =
-      SwizzleBytes == 128 ? 1ULL :
-      SwizzleBytes == 64  ? 2ULL :
-      SwizzleBytes == 32  ? 3ULL :
+template <uint32_t SwizzleBytes, uint32_t BlockKElems>
+CUDA_INLINE uint64_t tcgen05_smem_desc(const void *smem_ptr) {
+  static_assert(SwizzleBytes == 128 || SwizzleBytes == 64,
+                "tcgen05_smem_desc: only 128/64 B swizzle wired up so far");
+  static_assert(BlockKElems > 0 && (BlockKElems % 8) == 0,
+                "BlockK must be a positive multiple of 8 bf16 elements");
+
+  // Layout type (3 bits at [61,63]).
+  constexpr uint64_t layout_type =
+      SwizzleBytes == 128 ? 2ULL :
+      SwizzleBytes == 64  ? 4ULL :
                             0ULL;
-  // Leading-dim offset (defaults: matches a 128-wide stage, override
-  // per-config when needed). Keep stride sentinel 0 for now; caller fills.
-  constexpr uint64_t stride_imm = (SwizzleBytes * 8) >> 4;
-  constexpr uint64_t desc_base = (swizzle_type << 62) | (stride_imm << 32);
+
+  // SBO in uint128_t units. For K-major bf16 with the canonical
+  // `((8,n),2):((8,SBO),1)` layout:
+  //   SBO_uint128 = BlockKElems (bf16) / 8 * 8 = BlockKElems
+  // Wait, derivation: 8 N-rows * BlockKElems bf16/row * 2 bytes/bf16
+  //                   / 16 bytes/uint128_t = BlockKElems
+  constexpr uint64_t sbo = BlockKElems;
+  // LBO = stride between the two K-chunks of the swizzle atom.
+  // In K-major, the second K-chunk is one uint128_t (= 8 bf16) away.
+  constexpr uint64_t lbo = 1;
 
   uint32_t smem_addr = cast_smem_ptr_to_uint(smem_ptr);
-  uint64_t desc = desc_base;
-  reinterpret_cast<uint32_t *>(&desc)[0] = (smem_addr >> 4);
+
+  uint64_t desc = 0;
+  desc |= ((uint64_t)(smem_addr >> 4)) & 0x3FFFULL;        // [0,14)
+  desc |= (lbo & 0x3FFFULL) << 16;                          // [16,30)
+  desc |= (sbo & 0x3FFFULL) << 32;                          // [32,46)
+  desc |= (1ULL << 46);                                     // version=1
+  desc |= (layout_type & 0x7ULL) << 61;                     // [61,64)
   return desc;
 }
 
@@ -283,8 +322,13 @@ CUDA_INLINE void tcgen05_mma_ss_bf16(uint32_t d_tmem,
 //     and the caller toggles `phase` after each wait.
 
 CUDA_INLINE void tcgen05_commit_to_mbarrier(uint32_t mbar_smem_addr) {
+  // The `.shared::cluster` qualifier matters: per CUTLASS
+  // `cutlass/arch/barrier.h:770`, tcgen05.commit treats the mbarrier
+  // address as cluster-shared. Without this qualifier ptxas accepts
+  // the asm but the hardware never arrives on the mbar, so any
+  // subsequent mbarrier.try_wait spins forever.
   asm volatile(
-      "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];\n"
+      "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n"
       :: "r"(mbar_smem_addr) : "memory");
 }
 
