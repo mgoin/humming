@@ -220,9 +220,11 @@ public:
       uint32_t k_base = iter_id * kPartMmaShapeK;
       constexpr uint32_t kBf16PerCall = 8;
       constexpr uint32_t kCalls = WarpShape::N / 16u;
-      // Hardware Swizzle<3,4,3> reads the ABSOLUTE byte address, so the
-      // XOR amount depends on smem_b_dequant_base too -- not just the
-      // relative offset within the buffer.
+      // Hardware Swizzle<3,4,3> applies to the absolute byte address:
+      // the descriptor encodes (smem_base >> 4) in its start_address,
+      // and the HW XOR'ing of bits [4, 7) uses bits [7, 10) of the
+      // *full* abs byte, so smem_base/128 contributes to the XOR
+      // amount and must be included here.
       uint32_t smem_base_div_128 =
           cast_smem_ptr_to_uint(smem_b_bf16) >> 7;
       PRAGMA_UNROLL
@@ -235,11 +237,7 @@ public:
           uint32_t k = k_base + 2u * (t % 4u) + (v_in_frag & 1u)
                      + 8u * (v_in_frag >> 1);
           uint32_t linear_bytes = n * kRowBytes + k * sizeof(__nv_bfloat16);
-          // Swizzle<3,4,3>: XOR (abs_addr >> 7 & 7) into bits [4,7) of
-          // the byte address.  abs_addr = smem_base + linear_bytes, and
-          // since linear_bytes < BlockN * row_stride bytes and our row
-          // stride is 128B (= 2^7), the bits [7,10) of abs_addr are
-          // exactly (smem_base/128 + n) & 7  (no carry from k*2).
+          // HW Swizzle<3,4,3> uses abs byte; include smem_base.
           uint32_t xor_shift = (smem_base_div_128 + n) & 7u;
           uint32_t swizzled = linear_bytes ^ (xor_shift << 4);
           uint32_t reg_index = i * kBf16PerCall + v;
@@ -248,7 +246,7 @@ public:
           // n+1: output[m, n] = (n+1) * sum_A[m] -> reveals N mapping
           // k+1: output[m, n] = sum_k A[m,k]*(k+1) -> n-independent if K
           //      mapping is correct (same value across all cols per row)
-          float sentinel_f = float(n) + 1.0f;  // n-sentinel
+          float sentinel_f = float(k) + 1.0f;  // k-sentinel
           __nv_bfloat16 sentinel_bf16 = __float2bfloat16(sentinel_f);
           smem_b_bf16[swizzled / sizeof(__nv_bfloat16)] = sentinel_bf16;
 #else
