@@ -86,14 +86,26 @@ public:
   void load_legacy_swizzled_128B(int4 *smem_ptr) {
     static_assert(BlockShape::K * ElementA::kBits >= 1024);
     uint32_t smem_base = cast_smem_ptr_to_uint(smem_ptr);
+    // Existing humming swizzle is per-thread, effectively Swizzle<2,4,3>:
+    //   col_xor = (smem_row & 3)
+    // tcgen05.mma's K-major descriptor with 128B swizzle expects
+    // Swizzle<3,4,3> (`row & 7`). When `kUseTcgen05` is set, compute
+    // the XOR per-iter from the global row index instead.
     uint32_t smem_swizzled_col = (thread_id % 8) ^ (((thread_id % 64) / 8 + smem_base / 128)) % 8;
+    static constexpr bool kUseTcgen05 = TuningConfig::kUseTcgen05;
 
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < kLoadIters; i++) {
       uint32_t smem_offset = i * kNumLoadThreads + thread_id;
       uint32_t smem_row = smem_offset / 8;
       uint32_t smem_col = smem_offset % 8;
-      uint32_t smem_swizzled_offset = smem_row * 8 + smem_swizzled_col;
+      uint32_t smem_swizzled_offset;
+      if constexpr (kUseTcgen05) {
+        uint32_t row_xor = (smem_row + smem_base / 128) & 7u;
+        smem_swizzled_offset = smem_row * 8 + (smem_col ^ row_xor);
+      } else {
+        smem_swizzled_offset = smem_row * 8 + smem_swizzled_col;
+      }
 
       uint32_t gmem_col = smem_row / BlockShape::M * 8 + smem_col;
       uint32_t gmem_row = kIsIndexedGemm ? load_row_index[i] : (smem_row % BlockShape::M);

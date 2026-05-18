@@ -186,7 +186,75 @@ JIT recompile is ~10 s with empty cache, ~0 s with hits.
   (cuobjdump can't disassemble SASS for instructions newer than its
   build; PTX always works.)
 
-## Real blocker: the epilogue is built for 2 N-warps, TCGEN05 has 1
+## Phase B.9 update (2026-05-18): epilogue is fixed; real blocker is the A-side swizzle mismatch
+
+* **Epilogue is correct** (validated with `TCGEN05_DEBUG_SKIP_TMEM`,
+  scratch[i] = lane*1000 + i sentinel). The custom path in
+  `final_regs_c_as_ptr` writes bf16 directly into `smem.reduce` in
+  the row-major-with-XOR-swizzle layout the existing
+  `gmem_writer::write_legacy` expects, and `EpiloguePipeline::call`
+  now skips `smem_writer.write` for TCGEN05. No more 32-col duplication.
+
+* **TMEM layout for M=64 cta_group::1** uses DPs
+  `{0..15, 32..47, 64..79, 96..111}` — M/16 stride 32, M%16 stride 1.
+  Our `tcgen05.ld.32x32b.x32` reads 32 contiguous DPs which gets ZEROS
+  for half the lanes (e.g. lanes 16..31 of the first call land in
+  DPs 16..31, which are unused for the M=64 MMA). Fix: emit 4 calls at
+  DP bases `{0, 32, 64, 96}` and only consume the first 16 lanes' data
+  per call (or use `16x256b.x{N/8}` which matches the 16-DP atom). NOT
+  the blocker for current symptoms -- the bigger issue is upstream.
+
+* **Real blocker: A's SMEM swizzle from humming's `loader_a` is
+  Swizzle<2,4,3> with a 128-byte row stride, which is not a CUTE
+  canonical UMMA-K layout.** Per
+  `cute/atom/mma_traits_sm100.hpp:271-303`, the canonical K-major
+  layouts are:
+  ```
+  LayoutType::B32  : Swizzle<1,4,3> o ((8,n),2):((2,SBO),1)
+  LayoutType::B64  : Swizzle<2,4,3> o ((8,n),2):((4,SBO),1)  ← match B2 swizzle ...
+  LayoutType::B128 : Swizzle<3,4,3> o ((8,n),2):((8,SBO),1)  ← ...but humming's row stride is 8
+  ```
+  So humming's layout has the *swizzle pattern* of B64 but the *row
+  stride* of B128 — neither descriptor reads it correctly.
+
+  Validated with `TCGEN05_DEBUG_CONST_B` (smem.b_dequant filled with
+  bf16(1.0) regardless of dequant + scatter): output should be
+  N-independent `sum_k A[m, k]`, and it *is* N-independent, but the
+  value is wrong (`actual ≈ 2× expected` for most rows, random match
+  for a few). That's the signature of "A read at wrong byte offsets
+  but consistently wrong" — i.e. swizzle mismatch.
+
+## Next step: align A-side SMEM swizzle to a canonical UMMA layout
+
+Two paths, both viable:
+
+1. **Modify `loader_a` to emit Swizzle<3,4,3>.** Per-row XOR amount
+   must be `row & 7`, not `row & 3`. Concretely: replace
+   `((thread_id % 64) / 8 + smem_base / 128) % 8` with a per-iter
+   formula that uses the global row index `((i*kNumLoadThreads +
+   thread_id) / 8) & 7` for the XOR. Only emit the new swizzle when
+   the kernel is in the TCGEN05 mode (preserve current behaviour for
+   mma.sync, since ldmatrix expects the current Swizzle<2,4,3>-with-
+   128B-row-stride layout — that's actually a valid ldmatrix.sync
+   pattern, just not a CUTE-canonical UMMA pattern).
+
+2. **Restage A in-kernel** into a `smem.a_for_tcgen05` buffer in the
+   canonical 128B-swizzle layout, run the MMA from that. Adds 8 KB
+   per stage and a r2s pass on A; probably easier to land but worse
+   for occupancy.
+
+Pick (1) — it's a 5-line change to one swizzle formula. Same
+treatment will need to apply to `loader_b`'s output via the dequant
+scatter in `TCGEN05::run` (currently uses Swizzle<3,4,3> XOR already;
+will need to verify against the canonical layout once A is fixed).
+
+After A is fixed, the M=64 TMEM-layout fix (split t2r into 4 calls at
+DP bases `{0, 32, 64, 96}` or switch to 16x256b) lands next.
+
+---
+
+## Earlier (Phase B.8): the epilogue is built for 2 N-warps, TCGEN05 has 1
+(now fixed -- kept here for the next session's "what changed" question)
 
 Spent an iteration probing the wrong-output pattern with
 `/tmp/probe_tcgen05.py`. The diagnostic was decisive:

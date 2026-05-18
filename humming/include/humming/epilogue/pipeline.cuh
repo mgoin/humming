@@ -58,12 +58,20 @@ public:
       static_assert(BlockShape::M % 32 == 0);
       static_assert(!TuningConfig::kUseTmaC);
     }
+    // TCGEN05 path: `mma.final_regs_c_as_ptr()` already wrote bf16 into
+    // smem.reduce in the gmem_writer-expected layout, returning nullptr
+    // as a sentinel. Skip the smem_writer entirely (it would interpret
+    // regs_c in the m16n8 fragment layout, which doesn't apply here)
+    // and let gmem_writer drain smem.reduce to gmem unmodified.
+    constexpr bool kIsTcgen05 = MmaOpClass::kMmaType == MmaType::TCGEN05;
 
     if (slice_count > 1) acquire_gmem_barrier();
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < kNumWriteSplits; i++) {
-      smem_writer.write(regs_c_ptr, slice_count, i);
-      sync_math_threads();
+      if constexpr (!kIsTcgen05) {
+        smem_writer.write(regs_c_ptr, slice_count, i);
+        sync_math_threads();
+      }
       gmem_writer.write(slice_id, slice_count, i);
       sync_math_threads();
     }

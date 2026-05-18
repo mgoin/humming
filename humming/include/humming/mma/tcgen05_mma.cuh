@@ -32,6 +32,19 @@
 #include <humming/utils/ptx/barrier.cuh>
 #include <humming/utils/ptx/tcgen05.cuh>
 
+// Debug switches (set to non-zero to enable):
+//   TCGEN05_DEBUG_CONST_B: bulk-fill smem.b_dequant with bf16(1.0),
+//     bypassing dequant + scatter. Output should be N-independent
+//     = sum_k A[m, k]. Used to isolate MMA+t2r+epilogue from dequant.
+//   TCGEN05_DEBUG_SKIP_TMEM: skip the t2r and fill scratch with
+//     (lane * 1000 + idx). Output reveals (lane, scratch_idx) ->
+//     (m, n) layout directly.
+//     (Validated 2026-05-18: SMEM-write + gmem_writer chain is
+//      correct; bf16 precision around 1000 masks individual values.)
+// Both off by default -- only re-enable when investigating regressions.
+// #define TCGEN05_DEBUG_CONST_B 1
+// #define TCGEN05_DEBUG_SKIP_TMEM 1
+
 
 // fence_proxy.async.shared::cta -- ensures prior r2s of dequantised B
 // is observable by subsequent tcgen05.mma SMEM reads. Same primitive
@@ -58,11 +71,18 @@ public:
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kNumWarpShapeNSplits = WarpShape::N == ElementA::kBits * 2 ? 2 : 1;
 
-  // SMEM descriptor swizzle for A and B. Picking B2 from the workbook:
-  // both A and B use 128B swizzle so the descriptor math is shared with
-  // humming's existing TMA/cp.async A loader. (The r2s in transform_b
-  // must produce data in the swizzled layout for this to be correct;
-  // see workbook §"Phase B.6.3" for the lane-mapping spec.)
+  // SMEM descriptor swizzle for A and B.
+  //
+  // KNOWN MISMATCH (workbook §"Phase B.9"): humming's loader_a writes
+  // Swizzle<2,4,3> (col XOR by row & 3) but with a 128-byte row stride.
+  // CUTE's canonical 64B (Swizzle<2,4,3>) layout expects a 64-byte row
+  // stride (4 uint128_t/row), and the canonical 128B (Swizzle<3,4,3>)
+  // expects col-XOR by row & 7. NEITHER matches humming's actual data,
+  // so the tcgen05.mma descriptor reads the WRONG A bytes for half the
+  // rows. The next step is either to fix humming's loader_a swizzle to
+  // match Swizzle<3,4,3>, or to restage A into a tcgen05-private buffer
+  // with the canonical layout. Keeping 128 here as the closest fit
+  // until that restage lands.
   static constexpr uint32_t kSwizzleBytesA = 128;
   static constexpr uint32_t kSwizzleBytesB = 128;
 
@@ -144,6 +164,27 @@ public:
   void run(uint32_t stage_id, uint32_t iter_id) {
     uint32_t buffer_id = iter_id % 2;
 
+#ifdef TCGEN05_DEBUG_CONST_B
+    // Debug: ALL threads bulk-fill smem.b_dequant[buffer_id] with bf16(1.0),
+    // covering the FULL buffer (BlockN * BlockK bf16). Swizzle is
+    // irrelevant since the fill is constant. Output should equal
+    //   out[m, n] = sum_k A[m, k] * 1 = sum_k A[m, k]
+    // N-independent. Lets us isolate MMA + t2r + epilogue from dequant.
+    {
+      __nv_bfloat16 one = __float2bfloat16(1.0f);
+      __nv_bfloat162 one2 = __halves2bfloat162(one, one);
+      uint32_t one2_uint = *reinterpret_cast<uint32_t *>(&one2);
+      uint32_t *smem_b_u32 = reinterpret_cast<uint32_t *>(
+          &smem.b_dequant[buffer_id][0]);
+      constexpr uint32_t kTotalU32 =
+          BlockShape::N * BlockShape::K / 2;  // bf16 elems / 2 per uint32
+      uint32_t t = threadIdx.x;
+      PRAGMA_UNROLL
+      for (uint32_t i = t; i < kTotalU32; i += blockDim.x) {
+        smem_b_u32[i] = one2_uint;
+      }
+    }
+#else
     // ---- r2s of the just-dequantised B tile to swizzled SMEM ----
     // transform_b left bf16 in `regs_b_tmp[buffer_id]` in mma.sync
     // m16n8k16 B-fragment layout. We now scatter to smem.b_dequant
@@ -191,6 +232,7 @@ public:
         }
       }
     }
+#endif
     fence_proxy_async_shared_cta();
     __syncthreads();
 
@@ -223,140 +265,102 @@ public:
     }
   }
 
-  // Run the t2r and expose a plain RMEM accumulator pointer for the
-  // epilogue. Called once per output tile, AFTER the K-loop completes.
+  // Run the t2r and write the result directly into `smem.reduce` in
+  // the layout that humming's `gmem_writer::write_legacy` expects,
+  // bypassing the existing `smem_writer` (which assumes ≥2 N-warps
+  // covering BlockN -- a constraint TCGEN05 violates by design).
   //
-  // Step 1: drain MMAs via tcgen05.commit + mbarrier wait.
-  // Step 2: tcgen05.ld.32x32b.x32 delivers TMEM -> RMEM, BUT in a
-  //   "row-per-thread" layout that DOES NOT match what humming's
-  //   existing smem_writer (mma.sync epilogue) expects.  After the
-  //   t2r, thread t holds row t of each 32x32 quarter-tile.
-  // Step 3: Round-trip through smem.b_dequant (no longer needed for
-  //   B staging post-mainloop, and conveniently sized at exactly
-  //   BlockM*BlockN*sizeof(fp32) bytes for the common shapes) to
-  //   convert the layout into the m16n8 C-fragment-per-thread layout
-  //   the smem_writer reads. This keeps the rest of the epilogue
-  //   (smem_writer + gmem_writer) untouched.
+  // gmem_writer.cuh:103 reads smem.reduce as a row-major `int4 tile
+  // [BlockM][BlockN / 8]` with this XOR swizzle on the int4 col:
+  //   swizzled_int4_col = int4_col ^ ((row + smem_base) % 8)
+  // Each int4 holds 8 bf16 (one 8-wide N-strip of a row).
   //
-  // m16n8 C-fragment layout the smem_writer expects: thread t holds
-  // 4 fp32 per (m_8x8, n_8x8) sub-tile at positions
-  //   (m = 8*m_8x8 + t/4, n = 4*n_8x8 + (t%4)*2 + {0,1})
-  //   plus the second-row pair which the writer derives separately.
-  // Concretely the writer reads `regs_c` as a flat float2 array
-  // indexed by `n_8x8 * 8 + m_8x8`, with each float2 holding the two
-  // consecutive-N values at that thread's (row, col).
+  // The caller (EpiloguePipeline::call) must skip `smem_writer.write`
+  // for TCGEN05 -- the SMEM is already filled by the time we return.
+  // We return `nullptr` as a sentinel so the dispatcher can assert.
   template <class T = uint32_t>
   CUDA_INLINE T *final_regs_c_as_ptr() {
-    // tcgen05.commit uses elect_one_sync pattern (one thread issues).
+    // ---- 1. Drain MMAs via commit + mbarrier wait ----
     if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
       uint32_t mbar_addr = cast_smem_ptr_to_uint(&smem.tcgen05_mbar);
       tcgen05_commit_to_mbarrier(mbar_addr);
     }
-    // All threads wait on the mbar; phase flips after each tile.
     mbarrier_wait(&smem.tcgen05_mbar, mbar_phase_);
     mbar_phase_ ^= 1u;
     tcgen05_fence_view_async_tmem_store();
 
-    // Per-warp slice of the (BlockM x BlockN) TMEM accumulator tile.
+    // ---- 2. tcgen05.ld -> per-thread scratch (row-per-thread) ----
+    //
+    // M=64 cta_group::1 TMEM atom (per mma_traits_sm100.hpp:507):
+    //   Shape ((16, 4), N_MMA), Stride ((1, 32), 128)
+    // Valid M values are at DPs {0..15, 32..47, 64..79, 96..111}, spanning
+    // 4 TMEM sub-partitions of 32 DPs each. Per PTX spec, a warp can only
+    // access DPs in its own sub-partition, so we need 4 warps -- each
+    // reading its sub-partition's first 16 DPs (= 16 valid M values).
+    // Lanes 16..31 of each warp see garbage at warp-local DPs 16..31 and
+    // skip the write.
     static constexpr uint32_t kMWarps = MAX(BlockShape::M / WarpShape::M, 1u);
     static constexpr uint32_t kNWarps = MAX(BlockShape::N / WarpShape::N, 1u);
-    // Each tcgen05.ld.32x32b.x32 call reads 32 rows x 32 fp32 cols per
-    // warp; tile this within the per-warp slice.
-    static constexpr uint32_t kCallsM = MAX(WarpShape::M / 32u, 1u);
     static constexpr uint32_t kCallsN = MAX(WarpShape::N / 32u, 1u);
-    static_assert(
-        sizeof(regs_c) == kCallsM * kCallsN * 32u * sizeof(uint32_t),
-        "regs_c footprint mismatch: codegen warp_shape must match "
-        "(kCallsM * kCallsN * 32) uint32 per thread per warp");
+    static_assert(WarpShape::M == 16,
+                  "TCGEN05 path requires WarpShape::M == 16 so the 4 "
+                  "M-sub-blocks of the M=64 TMEM atom each map to a "
+                  "warp's own sub-partition.");
 
     uint32_t warp_id = threadIdx.x / 32u;
     uint32_t m_warp_id = warp_id % kMWarps;
     uint32_t n_warp_id = (warp_id / kMWarps) % kNWarps;
-
-    // TMEM addr encoding: low 16 bits = column index (units of 32 bits),
-    // high 16 bits = row index. Base is the per-CTA column allocation
-    // start written by `tcgen05_alloc`.
-    uint32_t base_addr = smem.tcgen05_tmem_col
-                       + ((m_warp_id * WarpShape::M) << 16)
-                       + (n_warp_id * WarpShape::N);
-
-    // Load TMEM into a per-thread scratch buffer (still in row-per-thread
-    // layout). Cannot land directly in regs_c, which we'll repopulate
-    // in m16n8 layout after the SMEM round-trip.
-    uint32_t scratch[kCallsM * kCallsN * 32u];
-    PRAGMA_UNROLL
-    for (uint32_t im = 0; im < kCallsM; im++) {
-      PRAGMA_UNROLL
-      for (uint32_t in = 0; in < kCallsN; in++) {
-        uint32_t addr = base_addr + ((im * 32u) << 16) + (in * 32u);
-        tcgen05_ld_32x32b_x32(addr, scratch + (im * kCallsN + in) * 32u);
-      }
-    }
-    tcgen05_fence_view_async_tmem_store();
-
-    // Reinterpret smem.b_dequant as a flat fp32 [BlockM * BlockN] scratch.
-    // Layout: smem_fp32[m * BlockN + n].
-    constexpr uint32_t kFp32PerInt4 = 16u / 4u;  // 4 fp32 per int4
-    static_assert(
-        BlockShape::M * BlockShape::N * sizeof(float) <=
-        SharedStorage::kStageSizeBDequant * sizeof(int4) * SharedStorage::kNumStages,
-        "TCGEN05 epilogue layout-convert needs at least BlockM*BlockN fp32 "
-        "of scratch SMEM; smem.b_dequant is undersized for this shape");
-    float *smem_fp32 = reinterpret_cast<float *>(&smem.b_dequant[0][0]);
-
-    // Step 3a: write each thread's row-per-thread fp32 to smem in
-    // pure row-major (BlockM, BlockN) layout.
     uint32_t laneid = threadIdx.x % 32u;
-    constexpr uint32_t kRowsPerQuarter = 32u;
-    constexpr uint32_t kColsPerQuarter = 32u;
+
+    // Per-warp implicit sub-partition base (lane->DP binding is HW-fixed).
+    // The taddr's DP field is warp-local: DP=0 = the warp's first DP.
+    uint32_t base_addr = smem.tcgen05_tmem_col + (n_warp_id * WarpShape::N);
+
+    // ---- 3. Per-warp t2r + pack + SMEM write ----
+    int4 *smem_reduce = smem.reduce;
+    uint32_t smem_reduce_base = cast_smem_ptr_to_uint(smem_reduce) / 128u;
     constexpr uint32_t kBlockN = BlockShape::N;
+    constexpr uint32_t kInt4ColsPerRow = kBlockN / 8u;
     PRAGMA_UNROLL
-    for (uint32_t im = 0; im < kCallsM; im++) {
-      uint32_t row_base_in_warp = im * kRowsPerQuarter;
-      uint32_t m_full = (m_warp_id * WarpShape::M) + row_base_in_warp + laneid;
+    for (uint32_t ni = 0; ni < kCallsN; ni++) {
+      uint32_t tmp[32];
+#ifdef TCGEN05_DEBUG_SKIP_TMEM
       PRAGMA_UNROLL
-      for (uint32_t in = 0; in < kCallsN; in++) {
-        uint32_t col_base_in_warp = in * kColsPerQuarter;
-        uint32_t *src = scratch + (im * kCallsN + in) * 32u;
+      for (uint32_t i = 0; i < 32u; i++) {
+        float val = float(threadIdx.x) * 1000.0f + float(ni * 32u + i);
+        tmp[i] = *reinterpret_cast<uint32_t *>(&val);
+      }
+#else
+      uint32_t addr = base_addr + ni * 32u;
+      tcgen05_ld_32x32b_x32(addr, tmp);
+      tcgen05_fence_view_async_tmem_store();
+#endif
+      if (laneid < 16u) {
+        uint32_t m_full = (m_warp_id * WarpShape::M) + laneid;
+        uint32_t row_xor = (m_full + smem_reduce_base) % 8u;
+        uint32_t col_int4_base = (n_warp_id * WarpShape::N + ni * 32u) / 8u;
         PRAGMA_UNROLL
-        for (uint32_t c = 0; c < kColsPerQuarter; c++) {
-          uint32_t n_full = (n_warp_id * WarpShape::N) + col_base_in_warp + c;
-          smem_fp32[m_full * kBlockN + n_full] = *reinterpret_cast<float *>(&src[c]);
+        for (uint32_t int4_in_quarter = 0; int4_in_quarter < 4u;
+             int4_in_quarter++) {
+          int4 packed;
+          uint32_t *packed_u32 = reinterpret_cast<uint32_t *>(&packed);
+          float *src_fp32 =
+              reinterpret_cast<float *>(tmp + int4_in_quarter * 8u);
+          PRAGMA_UNROLL
+          for (uint32_t pair = 0; pair < 4u; pair++) {
+            float f0 = src_fp32[pair * 2u + 0u];
+            float f1 = src_fp32[pair * 2u + 1u];
+            __nv_bfloat162 v = __floats2bfloat162_rn(f0, f1);
+            packed_u32[pair] = *reinterpret_cast<uint32_t *>(&v);
+          }
+          uint32_t int4_col = col_int4_base + int4_in_quarter;
+          uint32_t swizzled = int4_col ^ row_xor;
+          smem_reduce[m_full * kInt4ColsPerRow + swizzled] = packed;
         }
       }
     }
     __syncthreads();
-
-    // Step 3b: read back into regs_c in the m16n8 C-fragment layout
-    // that the existing smem_writer expects.
-    //
-    // The writer reads `regs[0][0]` as a float2[64] indexed by
-    // `n_8x8 * 8 + m_8x8`. Each float2 holds (output[row, col],
-    // output[row, col+1]) for this thread, where:
-    //   row = 8 * m_8x8 + (laneid / 4)
-    //   col = 4 * n_8x8 + (laneid % 4) * 2
-    constexpr uint32_t kInnerM = 8u;  // = MmaShape::M / 8 = BlockM / 8
-    constexpr uint32_t kInnerN = 8u;  // 64 float2 / kInnerM
-    static_assert(BlockShape::M / 8u == kInnerM,
-                  "TCGEN05 layout-convert assumes BlockM=64; "
-                  "generalise the 8x8 sub-tile indexing for other shapes");
-    static_assert(BlockShape::N / 4u / 2u == kInnerN,
-                  "TCGEN05 layout-convert assumes BlockN=64; "
-                  "generalise the 4-col / 2-pair indexing for other shapes");
-    float *regs_fp32 = reinterpret_cast<float *>(regs_c);
-    PRAGMA_UNROLL
-    for (uint32_t n_8x8 = 0; n_8x8 < kInnerN; n_8x8++) {
-      PRAGMA_UNROLL
-      for (uint32_t m_8x8 = 0; m_8x8 < kInnerM; m_8x8++) {
-        uint32_t m_full = 8u * m_8x8 + (laneid / 4u);
-        uint32_t n_full = 4u * n_8x8 + (laneid % 4u) * 2u;
-        uint32_t reg_idx = (n_8x8 * kInnerM + m_8x8) * 2u;
-        regs_fp32[reg_idx + 0] = smem_fp32[m_full * kBlockN + n_full + 0];
-        regs_fp32[reg_idx + 1] = smem_fp32[m_full * kBlockN + n_full + 1];
-      }
-    }
-    __syncthreads();
-    return reinterpret_cast<T *>(regs_c);
+    return nullptr;
   }
 
   // The s2r_pipe reads these accessors (same shape as WMMA's interface).
