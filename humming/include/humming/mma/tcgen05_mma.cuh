@@ -188,10 +188,12 @@ public:
     bool scale_d = !first_issue_;
     first_issue_ = false;
 
-    // tcgen05.mma is .sync.aligned per the PTX spec -- it has to be
-    // executed warp-uniformly. Issue from all 32 threads of warp 0; the
-    // hardware treats this as one CTA-group issue.
-    if (threadIdx.x < 32) {
+    // tcgen05.mma per CUTLASS pattern (cute/arch/mma_sm100_umma.hpp:65):
+    // ONE elected thread of warp 0 issues. Other threads wait at branch
+    // reconvergence. tcgen05.mma is NOT .sync.aligned (unlike alloc/
+    // dealloc which require warp-uniform participation), so this is
+    // safe and matches CUTLASS exactly.
+    if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
       tcgen05_mma_ss_bf16(smem.tcgen05_tmem_col, a_desc, b_desc, idesc, scale_d);
     }
   }
@@ -211,19 +213,14 @@ public:
   // allocation is derived from (m_warp_id, n_warp_id).
   template <class T = uint32_t>
   CUDA_INLINE T *final_regs_c_as_ptr() {
-    // tcgen05.commit is .sync.aligned -- warp-uniform.
-    if (threadIdx.x < 32) {
+    // tcgen05.commit uses elect_one_sync pattern (one thread issues).
+    if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
       uint32_t mbar_addr = cast_smem_ptr_to_uint(&smem.tcgen05_mbar);
       tcgen05_commit_to_mbarrier(mbar_addr);
     }
-    // All threads wait on the same mbarrier; phase flips after each
-    // tile's wait so the next tile's commit re-arms cleanly.
+    // All threads wait on the mbar; phase flips after each tile.
     mbarrier_wait(&smem.tcgen05_mbar, mbar_phase_);
     mbar_phase_ ^= 1u;
-
-    // The mbarrier_wait guarantees all tcgen05.mma stores to TMEM are
-    // visible; an explicit fence isn't required by the spec, but keeping
-    // it is cheap and defensive while we shake the layout out.
     tcgen05_fence_view_async_tmem_store();
 
     // Per-warp slice of the (BlockM x BlockN) TMEM accumulator tile.

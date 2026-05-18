@@ -107,6 +107,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   // warp 0 (threadIdx.x < 32) so all 32 threads issue together. Thread 0
   // also runs the mbarrier init (a regular intrinsic, not warp-aligned).
   // Size for now: 128 columns (covers BlockN up to 128 with f32 acc).
+  // `.sync.aligned` instructions (tcgen05.alloc/dealloc/relinquish)
+  // require ALL 32 threads of the issuing warp to execute together,
+  // unlike tcgen05.mma/commit which use the elect_one_sync pattern.
+  // Confirmed by bisection: with elect_one_sync the alloc spins.
   if constexpr (MmaOpClass::kMmaType == MmaType::TCGEN05) {
     if (threadIdx.x < 32) {
       uint32_t smem_addr =
@@ -177,6 +181,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
   // Release the TMEM column allocation before kernel exit. tcgen05.*
   // is .sync.aligned -- must be warp-uniform.
+  // dealloc + relinquish are also .sync.aligned -> warp-uniform.
   if constexpr (MmaOpClass::kMmaType == MmaType::TCGEN05) {
     __syncthreads();
     if (threadIdx.x < 32) {

@@ -85,6 +85,27 @@ CUDA_INLINE void tcgen05_relinquish_alloc_permit() {
       ::: "memory");
 }
 
+// One-thread-elect-out-of-warp helper, used to gate `.sync.aligned`
+// tcgen05 instructions per CUTLASS's pattern
+// (`cute/arch/cluster_sm90.hpp:elect_one_sync`).  Returns true on the
+// elected lane (typically lane 0), false on the others. The implicit
+// branch reconvergence after the if-block lets the elected thread
+// issue the asm while the other 31 wait, satisfying `.sync.aligned`.
+CUDA_INLINE bool tcgen05_elect_one_sync() {
+  uint32_t pred = 0;
+  uint32_t laneid = 0;
+  asm volatile(
+      "{\n"
+      "  .reg .b32 %rx;\n"
+      "  .reg .pred %px;\n"
+      "  elect.sync %rx | %px, 0xFFFFFFFF;\n"
+      "  @%px mov.s32 %1, 1;\n"
+      "  mov.s32 %0, %%laneid;\n"
+      "}\n"
+      : "+r"(laneid), "+r"(pred));
+  return pred != 0;
+}
+
 template <uint32_t NumColumns>
 CUDA_INLINE void tcgen05_dealloc(uint32_t tmem_col_index) {
   static_assert(NumColumns == 32 || NumColumns == 64 || NumColumns == 128 ||
@@ -285,15 +306,28 @@ CUDA_INLINE void tcgen05_mma_ss_bf16(uint32_t d_tmem,
                                      uint64_t b_desc,
                                      uint32_t idesc,
                                      bool scale_d) {
+  // Real PTX syntax per CUTLASS
+  // `cute/arch/mma_sm100_umma.hpp:111` (SM100_MMA_F16BF16_SS::fma):
+  //
+  //   tcgen05.mma.cta_group::1.kind::f16
+  //       [tmem_c], desc_a, desc_b, idesc, {mask0, mask1, mask2, mask3}, p
+  //
+  // The `{m0..m3}` operand is a 128-bit sparsity/disable mask -- all-zero
+  // means "no masking". Without this operand the instruction parses to a
+  // different variant and hangs / never retires. Caused the bulk of
+  // Phase B.6 debug pain; caught via `compute-sanitizer --tool synccheck`
+  // which fingered the trailing `mbarrier_wait` as a "Missing wait".
+  uint32_t mask[4] = {0u, 0u, 0u, 0u};
   asm volatile(
-      "{\n"
-      "  .reg .pred p;\n"
-      "  setp.ne.b32 p, %4, 0;\n"
-      "  tcgen05.mma.cta_group::1.kind::f16.collector::a::fill "
-      "    [%0], %1, %2, %3, p;\n"
+      "{\n\t"
+      "  .reg .pred p;\n\t"
+      "  setp.ne.b32 p, %4, 0;\n\t"
+      "  tcgen05.mma.cta_group::1.kind::f16 "
+      "    [%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t"
       "}\n"
       :: "r"(d_tmem), "l"(a_desc), "l"(b_desc), "r"(idesc),
-         "r"((uint32_t)scale_d)
+         "r"((uint32_t)scale_d),
+         "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
       : "memory");
 }
 

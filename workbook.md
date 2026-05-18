@@ -482,50 +482,82 @@ CUTLASS source):
     treats them differently; without the qualifier the commit never
     actually arrives on the mbar.
 
-**Despite all four fixes the kernel still hangs in `mbarrier_wait`.**
-SASS inspection (`cuobjdump --dump-sass`) confirms:
-  * `UTCATOMSWS.FIND_AND_SET.ALIGN` = tcgen05.alloc -- emitted
-  * `UTCHMMA` = tcgen05.mma -- emitted, one per K-iter
-  * `UTCBAR` = tcgen05.commit -- emitted (predicate `@!UP1` resolves
-    to true for our 32-thread kernel)
-  * `UTCATOMSWS.AND` = tcgen05.dealloc -- emitted
+Phase B.6 continued -- HANG RESOLVED by compute-sanitizer + bisection:
 
-Instructions look right at SASS level. Remaining suspects (each is
-real debug work):
+7e. **Missing 128-bit mask operand on `tcgen05.mma`**. The real CUTLASS
+    asm (`cute/arch/mma_sm100_umma.hpp:111`) has a `{m0,m1,m2,m3}`
+    sparsity-disable mask before the predicate:
+    `tcgen05.mma.cta_group::1.kind::f16 [d], a, b, idesc, {0,0,0,0}, p`
+    My wrapper had `[d], a, b, idesc, p` -- ptxas accepted but the
+    hardware silently misinterprets and never retires. Found by
+    `compute-sanitizer --tool synccheck`, which fingered the post-MMA
+    `mbarrier_wait` as a "Missing wait".
 
-8. **Mbarrier wait-side scope.** Humming's `mbarrier_wait` uses
-   `mbarrier.try_wait.parity.shared::cta.b64`, my commit uses
-   `.shared::cluster`. The hardware may require both sides to agree.
-   Try `mbarrier.try_wait.parity.shared::cluster.b64`.
+7f. **`.sync.aligned` instructions need WARP-UNIFORM execution, NOT
+    `elect_one_sync`.** This was the actual hang. Per PTX 8.7:
+       - `tcgen05.alloc.cta_group.sync.aligned`     -> all 32 lanes
+       - `tcgen05.dealloc.cta_group.sync.aligned`   -> all 32 lanes
+       - `tcgen05.relinquish_alloc_permit.cta_group.sync.aligned` -> all 32
+       - `tcgen05.mma.cta_group.kind::<...>`        -> elect_one_sync (CUTLASS)
+       - `tcgen05.commit.cta_group.mbarrier::arrive::one` -> elect_one_sync
+    My initial `if (threadIdx.x < 32 && elect_one_sync())` for alloc
+    diverged the warp -> spin. Reverted alloc/dealloc/relinquish to
+    `if (threadIdx.x < 32)` (all 32 lanes); kept elect_one_sync for
+    mma/commit. **Kernel now runs to completion.**
 
-9. **Mbarrier init scope.** `__mbarrier_init` is generic;
-   `tcgen05.commit.shared::cluster.b64` reads the mbar as cluster-
-   scoped. May need an explicit
-   `mbarrier.init.shared::cluster.b64 [mbar], count` instead of the
-   intrinsic.
+Debug methodology that found this (worth reusing):
+  1. `compute-sanitizer --tool synccheck` -> caught "Missing wait" at
+     a specific SMEM address corresponding to the tcgen05_mbar.
+  2. `nvidia-smi pmon` during the hang -> SM utilisation 99 % meant
+     busy-loop, not idle-wait -> mbarrier polling.
+  3. Bisection: temporarily replace `final_regs_c_as_ptr` body with
+     `__syncthreads + return`. Still hung. Then bypass `run()`. Still
+     hung. Then bypass alloc/dealloc. **Completed.** So the alloc was
+     the culprit, not anything in the math/wait path.
 
-10. **Producer fence before tcgen05.mma.** Humming's existing path
-    uses `consumer.wait_stage()` which fences cp.async. The
-    tcgen05.mma reads SMEM via descriptor; if cp.async loads aren't
-    yet visible to the proxy that tcgen05.mma uses, the MMA reads
-    garbage and might silently never retire. Try adding a
-    `fence.proxy.async.shared::cta` before the MMA issue.
+SASS structure of the working kernel:
+  * `UTCATOMSWS.FIND_AND_SET.ALIGN` = tcgen05.alloc -- emitted (1x)
+  * `UTCHMMA` = tcgen05.mma -- emitted (16x for K_block=128 / K_inst=16
+    * 2 outer K-stages from problem_K=256)
+  * `UTCBAR` = tcgen05.commit -- emitted (one per output tile)
+  * `UTCATOMSWS.AND` = tcgen05.dealloc -- emitted (1x)
 
-11. **r2s lane mapping for B.** Independent of the hang: even after
-    the kernel runs, `transform_b` writes a naive thread-contiguous
-    scatter; the SMEM contents won't match what tcgen05.mma reads
-    via the 128B-swizzle descriptor. The "B2" path from the
-    walkthrough -- compute per-thread (row, col) from m16n8k16
-    B-fragment, scatter to swizzled SMEM positions. Or "B3": bypass
-    the fragment-layout dequant and write directly into row-major
-    SMEM with the descriptor declaring swizzle=NONE.
+First-correctness output (B2 r2s lane mapping not yet wired):
 
-12. **TMEM column count hardcoded 128.** Constexpr-derive from
-    `BlockN * cd_bits / 32` once the kernel runs.
+```
+out[:2,:4] = [[-8.94, -9.94, -5.25, -13.88], [1.46, -1.00, -5.72, -0.96]]
+ref[:2,:4] = [[-3.67, -1.89, -48.25, -15.25], [1.75,  6.28,  2.47,  3.03]]
+|out|: mean ~ 10.2, max ~ 136
+|ref|: mean ~ 10.2, max ~ 136
+out nonzero frac: 0.94
+85 % of elements mismatched, max abs err 136
+```
 
-Diagnostic next step: add a tiny print or a write to gmem of a
-sentinel value right before `mbarrier_wait` -- if the print appears
-but the post-wait code doesn't, we know the commit never fires.
+So magnitudes are right (mean & max ~match), 94 % of outputs are
+non-zero, but the values are scrambled. This is exactly the
+"data is correct but in the wrong (row, col)" signal we predicted
+for the swizzle=128 B descriptor reading data that the r2s wrote
+in row-major.
+
+Remaining work for correctness:
+
+8. **r2s lane mapping for B.** With swizzle=128 on the descriptor,
+   the MMA expects SMEM laid out per `Swizzle<3,4,3> o ((8,n),2):
+   ((8,SBO),1)`. The naive thread-contiguous r2s writes row-major.
+   Need to either:
+   (a) compute per-thread (row, col) from the m16n8k16 B-fragment
+       layout and scatter to swizzled positions, OR
+   (b) bypass humming's fragment-layout dequant and dequant directly
+       into row-major SMEM with the descriptor set to swizzle=NONE.
+   (b) is cleaner code-wise; (a) keeps humming's dequant unchanged.
+
+9. **TMEM column count hardcoded 128.** Constexpr-derive from
+   `BlockN * cd_bits / 32` -- once correctness lands.
+
+10. **K-warp distribution.** Forced `WarpShape::K = BlockShape::K`
+    so K_WARPS = 1. Not a correctness blocker but limits perf;
+    eventually want a tcgen05-aware mainloop that doesn't rely on
+    humming's implicit per-warp K reduction.
 
 Concrete next-iteration plan:
 
