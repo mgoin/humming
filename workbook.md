@@ -439,26 +439,74 @@ Resolved this iteration:
    than zero" compile error even though the typedef isn't selected by
    the `std::conditional_t`. Fixed with `MAX(.., 1)` guards.
 
-Still pending (current blocker, illegal-instruction at runtime):
+Also resolved this iteration:
 
-5. **CRegisters sizing for t2r doesn't match `tcgen05.ld.32x32b.x32`'s
-   per-thread footprint.** `tcgen05.ld.32x32b.x32.b32` is documented as
-   loading 32 uint32 per lane (128 B/lane), which for one warp covers
-   1024 uint32 = 4 KB of TMEM. A 64×128 fp32 accumulator is 32 KB → 8
-   t2r issues per warp (or distributed across multiple warps with
-   coordinated offsets). My current TCGEN05 class issues *one* t2r and
-   assumes that drains the entire tile — which it doesn't. This is the
-   most likely source of the remaining illegal-instruction.
-6. **r2s lane mapping for B still naive.** B1 from the workbook
-   ("swizzle=0 + thread-contiguous scatter") — won't be correct math
-   until each thread writes to the (row, col) the descriptor expects.
-7. **TMEM column count fixed at 128.** Currently `tcgen05_alloc<128>`
-   irrespective of BlockN. Works for BlockN ≤ 128 with f32 acc;
-   BlockN=256 will need 256. Make it constexpr-derived from the tile.
+5. **CRegisters now sized per-warp, not whole-tile.**
+   `Tcgen05OpClassImpl` accepts `warp_shape` (threaded through
+   `MmaOpClass.from_config(warp_shape=...)` in `kernel/humming.py`).
+   `reg_cd_count = warp_M * warp_N * cd_bits / (32 * 32)`. Dropped
+   the `regs_c[2]` double-buffer (tcgen05 doesn't need WMMA's
+   scale-gating buffer) — single `regs_c`.
+6. **t2r loop with multi-call coverage** of the per-warp slice.
+   `final_regs_c_as_ptr` issues `kCallsM * kCallsN` invocations of
+   `tcgen05_ld_32x32b_x32`, each covering a 32x32 fp32 chunk, with
+   TMEM addresses encoded as `(col | row<<16)` and per-warp base
+   offsets `(m_warp_id * WarpM, n_warp_id * WarpN)`. Compile-time
+   `static_assert(sizeof(regs_c) == kCallsM*kCallsN*32*4)` catches
+   codegen-to-runtime drift.
 
-The test (`tests/test_tcgen05.py::test_tcgen05_w4a16_smallest`) is
-xfail-marked until (5) lands; once it runs to completion, (6) is the
-next blocker for math correctness.
+Still pending (current blocker, kernel hangs in `mbarrier_wait`):
+
+7. **SMEM matrix-descriptor stride fields aren't filled in.** The
+   64-bit tcgen05.mma operand descriptor encodes not just
+   `(addr, swizzle)` but also `leading_dim_byte_offset` (bits 16-29)
+   and `stride_dim_byte_offset` (bits 32-45), each `>> 4`. Humming's
+   existing `make_wgmma_smem_desc` hardcodes those to values that
+   only make sense for `swizzle_bytes` in {64, 128}. My
+   `tcgen05_smem_desc<0>` (swizzle=0 for B) inherits the hardcoded
+   stride constants -- so the descriptor says "no swizzle, but with
+   stride values from a 128B swizzle" -- garbage. tcgen05.mma never
+   retires, the post-commit `mbarrier_wait` spins forever.
+
+   *Fix path:* write a proper `tcgen05_smem_desc(SmemPtr, ldb_bytes,
+   sdb_bytes, swizzle)` that takes the tile's actual byte dimensions
+   and fills LDB/SDB. CUTLASS
+   `include/cute/arch/mma_sm100_umma.hpp::make_smem_desc(SmemPtr,
+   Layout)` does this; mirror its logic. OR switch to
+   `swizzle=128` for B and refactor `transform_b` to write the
+   swizzled layout (the "B2" path from the walkthrough).
+
+8. **r2s lane mapping for B.** Independent of (7): `transform_b`
+   currently writes a naive thread-contiguous scatter. Even after
+   the descriptor is fixed, the SMEM contents won't be in the order
+   tcgen05.mma expects. Real fix: either (a) compute per-thread
+   (row, col) from the m16n8k16 B-fragment register layout and
+   scatter accordingly, or (b) bypass humming's fragment-layout
+   dequant and write a row-major dequant directly into
+   `smem.b_dequant`.
+
+9. **TMEM column count hardcoded 128.** Constexpr-derive from
+   `BlockN * cd_bits / 32` once (7) + (8) land.
+
+Concrete next-iteration plan:
+
+  a. Copy CUTLASS's `make_smem_desc` builder out of
+     `cute/arch/mma_sm100_umma.hpp` (any cutlass-src checkout under
+     `.deps/`). It takes a layout explicitly and produces a uint64
+     with LDB/SDB correct for both swizzled and non-swizzled tiles.
+  b. Pick a path:
+       * **B2 (recommended)**: use `swizzle=128` everywhere, refactor
+         `transform_b`'s r2s to write the 128B-swizzled layout.
+         More arithmetic but matches what humming's existing TMA
+         path already does for A, so we share the descriptor math.
+       * **B1 (smaller delta)**: keep `swizzle=0` but compute the
+         non-swizzled LDB/SDB correctly from BlockShape.
+  c. With (a) + (b), the kernel should at minimum *run to
+     completion*; expect wrong math the first time, iterate.
+
+Test (`tests/test_tcgen05.py::test_tcgen05_w4a16_smallest`) is
+xfail-marked. Block shape is now (64, 64, 128), warp (64, 64, 32):
+1 epilogue warp, 4 t2r calls covering the warp's 64x64 slice.
 
 ### Phase B.2 (still pending) — `mma/tcgen05_mma.cuh`
 

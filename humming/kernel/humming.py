@@ -225,6 +225,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             self.a_dtype,
             self.a_dtype,
             mma_cd_dtype,
+            warp_shape=self.warp_shape,
         )
 
     def check_shape(self):

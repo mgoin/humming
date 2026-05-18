@@ -60,11 +60,15 @@ def test_tcgen05_w4a16_smallest():
     group_size = 128
 
     # Smallest viable shape (still a multiple of the kernel's tile).
+    # Problem shape divides BlockShape evenly.
     shape_m = 128
-    shape_n = 256
+    shape_n = 128
     shape_k = 256
 
-    block_shape = (64, 128, 128)
+    # Phase B.4 smallest viable: BlockM=64 (min for tcgen05.mma kind::f16),
+    # BlockN=64 keeps the per-warp t2r footprint at uint32[64] per thread
+    # using 4 calls of 32dp32b32x.
+    block_shape = (64, 64, 128)
     warp_shape = (64, 64, 32)
 
     # Build the W4A16 problem identical to what test_shape uses.

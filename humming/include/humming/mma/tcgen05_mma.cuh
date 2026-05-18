@@ -86,11 +86,11 @@ public:
   // BlockN x BlockK B tile (matches the post-dequant footprint of WMMA's
   // regs_b for the same warp shape).
   uint32_t regs_b_tmp[2][WarpShape::N * kPartMmaShapeK * ElementA::kBits / 32 / 32];
-  // Final post-t2r RMEM accumulator the epilogue reads. Sized to the
-  // per-thread accumulator slice; MmaOpClass::CRegisters comes from the
-  // Tcgen05OpClassImpl codegen and is sized for the full BlockMxN tile
-  // divided by 32 lanes.
-  typename MmaOpClass::CRegisters regs_c[2];
+  // Final post-t2r RMEM accumulator the epilogue reads. Single buffer
+  // (no double-buffer like WMMA needs for register/scale gating).
+  // MmaOpClass::CRegisters comes from Tcgen05OpClassImpl codegen and is
+  // sized to one warp's slice = warp_M * warp_N / 32 lanes per thread.
+  typename MmaOpClass::CRegisters regs_c;
 
   CUDA_INLINE
   TCGEN05(SharedStorage &smem_, ArithClass &arith_)
@@ -188,8 +188,17 @@ public:
 
   // Run the t2r and expose a plain RMEM accumulator pointer for the
   // epilogue. Called once per output tile, AFTER the K-loop completes.
+  //
   // Drains all in-flight tcgen05.mma issues via a single commit; waits
-  // on the per-CTA mbarrier; then issues the TMEM->RMEM load.
+  // on the per-CTA mbarrier; then issues N TMEM->RMEM loads to cover
+  // this warp's (warp_M x warp_N) slice of the accumulator tile.
+  //
+  // Each `tcgen05_ld_32x32b_x32` call reads 32 rows x 32 fp32-cols per
+  // warp (= 4 KB). A (warp_M x warp_N) slice needs
+  //   (warp_M / 32) x (warp_N / 32) calls per warp.
+  // TMEM address encoding: col index in low 16 bits, row index in
+  // high 16 bits. The warp's base offset within the per-CTA TMEM column
+  // allocation is derived from (m_warp_id, n_warp_id).
   template <class T = uint32_t>
   CUDA_INLINE T *final_regs_c_as_ptr() {
     // tcgen05.commit is .sync.aligned -- warp-uniform.
@@ -206,14 +215,41 @@ public:
     // visible; an explicit fence isn't required by the spec, but keeping
     // it is cheap and defensive while we shake the layout out.
     tcgen05_fence_view_async_tmem_store();
-    // TMEM -> RMEM. Each thread loads its slice of the accumulator.
-    tcgen05_ld_32x32b_x32(smem.tcgen05_tmem_col,
-                          reinterpret_cast<uint32_t *>(regs_c));
-    __syncthreads();
 
-    // Reset first_issue_ for the next output tile -- otherwise we'd
-    // accumulate into stale TMEM. (zero_accum() is the canonical reset
-    // but the mainloop already calls it before each tile.)
+    // Per-warp slice of the (BlockM x BlockN) TMEM accumulator tile.
+    // Number of warps that cooperate on the t2r along each dim:
+    static constexpr uint32_t kMWarps = MAX(BlockShape::M / WarpShape::M, 1u);
+    static constexpr uint32_t kNWarps = MAX(BlockShape::N / WarpShape::N, 1u);
+    // Each tcgen05.ld.32x32b.x32 call reads 32 rows x 32 fp32 cols per
+    // warp; tile this within the per-warp slice.
+    static constexpr uint32_t kCallsM = MAX(WarpShape::M / 32u, 1u);
+    static constexpr uint32_t kCallsN = MAX(WarpShape::N / 32u, 1u);
+    static_assert(
+        sizeof(regs_c) == kCallsM * kCallsN * 32u * sizeof(uint32_t),
+        "regs_c footprint mismatch: codegen warp_shape must match "
+        "(kCallsM * kCallsN * 32) uint32 per thread per warp");
+
+    uint32_t warp_id = threadIdx.x / 32u;
+    uint32_t m_warp_id = warp_id % kMWarps;
+    uint32_t n_warp_id = (warp_id / kMWarps) % kNWarps;
+
+    // TMEM addr encoding: low 16 bits = column index (units of 32 bits),
+    // high 16 bits = row index. Base is the per-CTA column allocation
+    // start written by `tcgen05_alloc`.
+    uint32_t base_addr = smem.tcgen05_tmem_col
+                       + ((m_warp_id * WarpShape::M) << 16)
+                       + (n_warp_id * WarpShape::N);
+
+    uint32_t *regs = reinterpret_cast<uint32_t *>(regs_c);
+    PRAGMA_UNROLL
+    for (uint32_t im = 0; im < kCallsM; im++) {
+      PRAGMA_UNROLL
+      for (uint32_t in = 0; in < kCallsN; in++) {
+        uint32_t addr = base_addr + ((im * 32u) << 16) + (in * 32u);
+        tcgen05_ld_32x32b_x32(addr, regs + (im * kCallsN + in) * 32u);
+      }
+    }
+    __syncthreads();
     return reinterpret_cast<T *>(regs_c);
   }
 

@@ -296,15 +296,25 @@ class Tcgen05OpClassImpl:
     constructed at kernel time (not at codegen time).
     """
 
-    def __init__(self, m, n, k, a_dtype, b_dtype, cd_dtype):
+    def __init__(self, m, n, k, a_dtype, b_dtype, cd_dtype,
+                 warp_shape=None):
         self.shape = (m, n, k)
         self.a_dtype = a_dtype if isinstance(a_dtype, str) else DTYPE_MAP[a_dtype]
         self.b_dtype = b_dtype if isinstance(b_dtype, str) else DTYPE_MAP[b_dtype]
         self.cd_dtype = cd_dtype if isinstance(cd_dtype, str) else DTYPE_MAP[cd_dtype]
 
-        # Same RMEM C-register count as MMA -- the t2r path lands accumulators
-        # in the same register footprint the epilogue expects.
-        self.reg_cd_count = calc_reg_count(m, n, self.cd_dtype) // 4
+        # tcgen05.mma writes a (BlockM × BlockN) accumulator into TMEM. The
+        # epilogue's t2r reads it back into RMEM, distributed across the
+        # epilogue warps (after K-reduction). Per-thread CRegisters count:
+        #   warp_M * warp_N * cd_bits / (32 lanes * 32 bits/uint32)
+        # Falls back to whole-tile sizing if warp_shape isn't provided
+        # (used by callers that only have access to MMA shape).
+        if warp_shape is not None:
+            warp_m, warp_n = warp_shape[0], warp_shape[1]
+            cd_bits = DTYPE_BIT_WIDTH_MAP[self.cd_dtype]
+            self.reg_cd_count = warp_m * warp_n * cd_bits // (32 * 32)
+        else:
+            self.reg_cd_count = calc_reg_count(m, n, self.cd_dtype) // 4
         if self.cd_dtype == "f16":
             self.val_type_cd = "half"
             self.reg_cd_type = "uint32_t"
@@ -352,7 +362,8 @@ class Tcgen05OpClassImpl:
 
 class MmaOpClass:
     @classmethod
-    def from_config(cls, mma_type, m, n, k, a_dtype, b_dtype, cd_dtype):
+    def from_config(cls, mma_type, m, n, k, a_dtype, b_dtype, cd_dtype,
+                    warp_shape=None):
         mma_type = mma_type if isinstance(mma_type, MmaType) else getattr(MmaType, mma_type.upper())
 
         if mma_type == MmaType.MMA:
@@ -360,6 +371,7 @@ class MmaOpClass:
         elif mma_type == MmaType.WGMMA:
             return WgmmaOpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype)
         elif mma_type == MmaType.TCGEN05:
-            return Tcgen05OpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype)
+            return Tcgen05OpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype,
+                                      warp_shape=warp_shape)
         else:
             raise ValueError(f"Invalid MMA Type: {mma_type}")
