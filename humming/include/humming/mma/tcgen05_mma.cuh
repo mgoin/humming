@@ -226,16 +226,25 @@ public:
   // Run the t2r and expose a plain RMEM accumulator pointer for the
   // epilogue. Called once per output tile, AFTER the K-loop completes.
   //
-  // Drains all in-flight tcgen05.mma issues via a single commit; waits
-  // on the per-CTA mbarrier; then issues N TMEM->RMEM loads to cover
-  // this warp's (warp_M x warp_N) slice of the accumulator tile.
+  // Step 1: drain MMAs via tcgen05.commit + mbarrier wait.
+  // Step 2: tcgen05.ld.32x32b.x32 delivers TMEM -> RMEM, BUT in a
+  //   "row-per-thread" layout that DOES NOT match what humming's
+  //   existing smem_writer (mma.sync epilogue) expects.  After the
+  //   t2r, thread t holds row t of each 32x32 quarter-tile.
+  // Step 3: Round-trip through smem.b_dequant (no longer needed for
+  //   B staging post-mainloop, and conveniently sized at exactly
+  //   BlockM*BlockN*sizeof(fp32) bytes for the common shapes) to
+  //   convert the layout into the m16n8 C-fragment-per-thread layout
+  //   the smem_writer reads. This keeps the rest of the epilogue
+  //   (smem_writer + gmem_writer) untouched.
   //
-  // Each `tcgen05_ld_32x32b_x32` call reads 32 rows x 32 fp32-cols per
-  // warp (= 4 KB). A (warp_M x warp_N) slice needs
-  //   (warp_M / 32) x (warp_N / 32) calls per warp.
-  // TMEM address encoding: col index in low 16 bits, row index in
-  // high 16 bits. The warp's base offset within the per-CTA TMEM column
-  // allocation is derived from (m_warp_id, n_warp_id).
+  // m16n8 C-fragment layout the smem_writer expects: thread t holds
+  // 4 fp32 per (m_8x8, n_8x8) sub-tile at positions
+  //   (m = 8*m_8x8 + t/4, n = 4*n_8x8 + (t%4)*2 + {0,1})
+  //   plus the second-row pair which the writer derives separately.
+  // Concretely the writer reads `regs_c` as a flat float2 array
+  // indexed by `n_8x8 * 8 + m_8x8`, with each float2 holding the two
+  // consecutive-N values at that thread's (row, col).
   template <class T = uint32_t>
   CUDA_INLINE T *final_regs_c_as_ptr() {
     // tcgen05.commit uses elect_one_sync pattern (one thread issues).
@@ -249,7 +258,6 @@ public:
     tcgen05_fence_view_async_tmem_store();
 
     // Per-warp slice of the (BlockM x BlockN) TMEM accumulator tile.
-    // Number of warps that cooperate on the t2r along each dim:
     static constexpr uint32_t kMWarps = MAX(BlockShape::M / WarpShape::M, 1u);
     static constexpr uint32_t kNWarps = MAX(BlockShape::N / WarpShape::N, 1u);
     // Each tcgen05.ld.32x32b.x32 call reads 32 rows x 32 fp32 cols per
@@ -272,13 +280,79 @@ public:
                        + ((m_warp_id * WarpShape::M) << 16)
                        + (n_warp_id * WarpShape::N);
 
-    uint32_t *regs = reinterpret_cast<uint32_t *>(regs_c);
+    // Load TMEM into a per-thread scratch buffer (still in row-per-thread
+    // layout). Cannot land directly in regs_c, which we'll repopulate
+    // in m16n8 layout after the SMEM round-trip.
+    uint32_t scratch[kCallsM * kCallsN * 32u];
     PRAGMA_UNROLL
     for (uint32_t im = 0; im < kCallsM; im++) {
       PRAGMA_UNROLL
       for (uint32_t in = 0; in < kCallsN; in++) {
         uint32_t addr = base_addr + ((im * 32u) << 16) + (in * 32u);
-        tcgen05_ld_32x32b_x32(addr, regs + (im * kCallsN + in) * 32u);
+        tcgen05_ld_32x32b_x32(addr, scratch + (im * kCallsN + in) * 32u);
+      }
+    }
+    tcgen05_fence_view_async_tmem_store();
+
+    // Reinterpret smem.b_dequant as a flat fp32 [BlockM * BlockN] scratch.
+    // Layout: smem_fp32[m * BlockN + n].
+    constexpr uint32_t kFp32PerInt4 = 16u / 4u;  // 4 fp32 per int4
+    static_assert(
+        BlockShape::M * BlockShape::N * sizeof(float) <=
+        SharedStorage::kStageSizeBDequant * sizeof(int4) * SharedStorage::kNumStages,
+        "TCGEN05 epilogue layout-convert needs at least BlockM*BlockN fp32 "
+        "of scratch SMEM; smem.b_dequant is undersized for this shape");
+    float *smem_fp32 = reinterpret_cast<float *>(&smem.b_dequant[0][0]);
+
+    // Step 3a: write each thread's row-per-thread fp32 to smem in
+    // pure row-major (BlockM, BlockN) layout.
+    uint32_t laneid = threadIdx.x % 32u;
+    constexpr uint32_t kRowsPerQuarter = 32u;
+    constexpr uint32_t kColsPerQuarter = 32u;
+    constexpr uint32_t kBlockN = BlockShape::N;
+    PRAGMA_UNROLL
+    for (uint32_t im = 0; im < kCallsM; im++) {
+      uint32_t row_base_in_warp = im * kRowsPerQuarter;
+      uint32_t m_full = (m_warp_id * WarpShape::M) + row_base_in_warp + laneid;
+      PRAGMA_UNROLL
+      for (uint32_t in = 0; in < kCallsN; in++) {
+        uint32_t col_base_in_warp = in * kColsPerQuarter;
+        uint32_t *src = scratch + (im * kCallsN + in) * 32u;
+        PRAGMA_UNROLL
+        for (uint32_t c = 0; c < kColsPerQuarter; c++) {
+          uint32_t n_full = (n_warp_id * WarpShape::N) + col_base_in_warp + c;
+          smem_fp32[m_full * kBlockN + n_full] = *reinterpret_cast<float *>(&src[c]);
+        }
+      }
+    }
+    __syncthreads();
+
+    // Step 3b: read back into regs_c in the m16n8 C-fragment layout
+    // that the existing smem_writer expects.
+    //
+    // The writer reads `regs[0][0]` as a float2[64] indexed by
+    // `n_8x8 * 8 + m_8x8`. Each float2 holds (output[row, col],
+    // output[row, col+1]) for this thread, where:
+    //   row = 8 * m_8x8 + (laneid / 4)
+    //   col = 4 * n_8x8 + (laneid % 4) * 2
+    constexpr uint32_t kInnerM = 8u;  // = MmaShape::M / 8 = BlockM / 8
+    constexpr uint32_t kInnerN = 8u;  // 64 float2 / kInnerM
+    static_assert(BlockShape::M / 8u == kInnerM,
+                  "TCGEN05 layout-convert assumes BlockM=64; "
+                  "generalise the 8x8 sub-tile indexing for other shapes");
+    static_assert(BlockShape::N / 4u / 2u == kInnerN,
+                  "TCGEN05 layout-convert assumes BlockN=64; "
+                  "generalise the 4-col / 2-pair indexing for other shapes");
+    float *regs_fp32 = reinterpret_cast<float *>(regs_c);
+    PRAGMA_UNROLL
+    for (uint32_t n_8x8 = 0; n_8x8 < kInnerN; n_8x8++) {
+      PRAGMA_UNROLL
+      for (uint32_t m_8x8 = 0; m_8x8 < kInnerM; m_8x8++) {
+        uint32_t m_full = 8u * m_8x8 + (laneid / 4u);
+        uint32_t n_full = 4u * n_8x8 + (laneid % 4u) * 2u;
+        uint32_t reg_idx = (n_8x8 * kInnerM + m_8x8) * 2u;
+        regs_fp32[reg_idx + 0] = smem_fp32[m_full * kBlockN + n_full + 0];
+        regs_fp32[reg_idx + 1] = smem_fp32[m_full * kBlockN + n_full + 1];
       }
     }
     __syncthreads();

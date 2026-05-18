@@ -186,34 +186,94 @@ JIT recompile is ~10 s with empty cache, ~0 s with hits.
   (cuobjdump can't disassemble SASS for instructions newer than its
   build; PTX always works.)
 
-## Next step: r2s correctness
+## Real blocker: the epilogue is built for 2 N-warps, TCGEN05 has 1
 
-The kernel runs; only the layout of the bf16 staging in `smem.b_dequant`
-is wrong. Output magnitudes match the reference exactly (mean ≈ max ≈
-mean(|ref|)), only **which** (n, k) each value ends up at is broken.
+Spent an iteration probing the wrong-output pattern with
+`/tmp/probe_tcgen05.py`. The diagnostic was decisive:
 
-Current attempt in `mma/tcgen05_mma.cuh::TCGEN05::run`: scatters each
-thread's 32 bf16/K-iter to addresses computed from CUTLASS's m16n8k16
-`BLayout = ((4,8),(2,2)):((16,1),(8,64))` (per
-`mma_traits_sm80.hpp:89`), with `Swizzle<3,4,3>` XOR on the linear byte
-offset. The math evidently doesn't match what tcgen05.mma reads through
-its descriptor.
+* `out[:2, :4] = [[0,0,0,0],[0,0,0,0]]` and only **6.2%** of the
+  output cells are non-zero with the original (B2) implementation.
+* Non-zero rows cluster at `{8,9,10,11}, {16,17,18,19}, {24..27}, ...`
+  with strict gaps every 8 rows. Within a non-zero row, only specific
+  N-columns get values, **and those values are duplicated every 32
+  columns**: `out[m=8, n=0,2,4,6] == out[m=8, n=32,34,36,38] == ...`
 
-The concrete next step is **sentinel-write validation**:
+That duplication-period-32 is the smoking gun. `smem_writer.cuh:173`
+hardcodes
+```
+col = col_8x8block * 4 + WarpShape::N / 2 * n_warp_id;
+```
+so each warp covers only **WarpShape::N / 2 = 32 cols** of N. The
+existing mma.sync path covers BlockN=64 by running **two N-warps**
+(or by the `kIsWarpHalfGroup` half-N=32 fast path); both rely on
+N_WARPS ≥ 2 *for the epilogue*, even though humming's mainloop is
+otherwise tolerant of N_WARPS=1.
 
-1. Replace the r2s payload with `((threadIdx.x & 0xff) << 8) |
-   (reg_index & 0xff)` (or similar) instead of the dequantised bf16.
-2. Run a single MMA with **A = identity (just the bf16 representation
-   of 1.0 along the diagonal)**, so each output `C[m,n] = sum_k A[m,k]
-   * B[k,n] = B[m,n]`. The accumulator is then a direct view of how
-   the hardware interpreted the B SMEM layout.
-3. Read back via t2r and dump to GMEM. For each `out[m,n]` value,
-   decode `(thread, reg)` and compare against expected.
-4. The diff between expected and actual gives us the exact mapping.
+TCGEN05 violates both assumptions:
+* The tcgen05.mma instruction shape covers the full (BlockM × BlockN)
+  per issue, so the natural warp layout is **one warp per CTA**, not
+  two N-warps.
+* After `tcgen05.ld.32x32b.x32`, each thread holds a **whole 32-col
+  row** of its quarter-tile, not the m16n8 C-fragment layout the
+  smem_writer iterates with.
 
-Once the mapping is corrected, the kernel should produce correct bf16
-output. **Don't try more blind XOR/stride permutations.** Each iteration
-without instrumentation has not converged so far.
+These are independent bugs. Even with the dequant 100% correct, the
+epilogue would still mis-write half of N.
+
+Mid-iteration I added a TMEM->SMEM->RMEM layout-convert in
+`final_regs_c_as_ptr` (round-trip through `smem.b_dequant` reinterpreted
+as fp32, then read back in m16n8 C-fragment per-thread layout). The
+test now produces **11.7% non-zero** (up from 6.2%), more rows show
+data, and within a row the values **repeat every 4 cols** instead of
+every 32 — consistent with the smem_writer reaching the full M=64 but
+still only filling N=[0, 32) and `gmem_writer` re-reading those same
+cols when emitting the second 32-col block. **The layout-convert is
+necessary but not sufficient; it's still in the tree to amortise the
+work for the next step.**
+
+## Next step: custom TCGEN05 epilogue (smem_writer bypass)
+
+Two ways out, in order of preference:
+
+1. **Custom smem layout, reuse gmem_writer.** `gmem_writer::write_legacy`
+   reads `smem.reduce` as a flat int4[BlockM*BlockN/8] in pure
+   row-major-with-XOR-swizzle, treating it as `(BlockM rows, BlockN/8
+   int4-cols)`. The XOR swizzle is
+   `smem_col_swizzled = smem_col ^ ((smem_row + smem_base) % 8)`
+   (gmem_writer.cuh:103). Easy target:
+   * After the t2r layout-convert (which we already have), each thread
+     owns 128 fp32 in row-per-thread layout.
+     Drop the m16n8-layout read-back; instead each thread:
+     - converts its 64 fp32 values to bf16 (with AWQ scale + zp_lift
+       fold-in via `arith.may_apply_f32_on_smem_write` -- need to call
+       this manually since we're not going through smem_writer),
+     - writes its row to `smem.reduce[m * 8 ^ swizzle]` directly.
+   * Then call `gmem_writer.write(slice_id, slice_count, 0)` as today.
+   * Big simplification: no kNumWriteSplits, no n_warp_id math, no
+     m16n8 fragment iteration.
+
+2. **Restructure to use ≥2 warps cooperating on TMEM.** Force
+   `WarpShape::N ≤ BlockShape::N / 2`, run two warps that each
+   tcgen05.ld their half of TMEM, fall back to the existing smem_writer.
+   Avoids new epilogue code but constrains warp tiling and burns extra
+   sync. Better long-term but worse short-term.
+
+**Pick (1).** ~80 lines in `mma/tcgen05_mma.cuh` -- replace
+`final_regs_c_as_ptr` with a flow that produces a `int4 *` (or
+`smem_ptr` that the epilogue path's `smem_writer.write` skips) and
+have the kernel-level dispatch in `humming.cuh:179` route past
+`smem_writer.write` for TCGEN05. Quickest win: add a TCGEN05 branch
+inside `EpiloguePipeline::call` that calls our custom writer instead
+of `smem_writer.write`.
+
+Reuse of humming's dequant in `transform_b` -- the analysis from
+the previous workbook entry still stands. The B-fragment (n, k)
+derivation matches CUTLASS BLayout `((4,8),(2,2)):((16,1),(8,64))`
+once you read the codomain as (N, K) with stride pattern
+`stride_N=1, stride_K=8` (i.e. K is the column-major inner). The
+current `mma/tcgen05_mma.cuh::run` `n, k` formula matches that
+derivation **assuming** the smem_writer gets the right layout --
+revisit after the epilogue is fixed.
 
 After correctness lands, the remaining items (none of them blocking
 correctness) are:
