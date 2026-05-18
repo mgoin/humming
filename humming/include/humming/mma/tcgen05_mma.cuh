@@ -45,6 +45,8 @@
 // #define TCGEN05_DEBUG_CONST_B 1
 // #define TCGEN05_DEBUG_SKIP_TMEM 1
 // #define TCGEN05_DEBUG_SCATTER_SENTINEL 1
+// #define TCGEN05_DEBUG_REGS_B_SENTINEL 1
+// #define TCGEN05_DEBUG_NO_SCATTER 1
 
 
 // fence_proxy.async.shared::cta -- ensures prior r2s of dequantised B
@@ -157,6 +159,28 @@ public:
           regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
       arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
     }
+#ifdef TCGEN05_DEBUG_REGS_B_SENTINEL
+    // Overwrite regs_b_tmp with a per-(reg_index)-derived sentinel so
+    // the scatter writes bf16(my_n+1) at (my_n, my_k). If the (n,k)
+    // mapping in run() matches the PTX m16n8k16 fragment layout that
+    // mma.sync uses (and that my scatter assumes), the production test
+    // with this on should show effective_n[col] == col.
+    {
+      uint32_t t = threadIdx.x % 32u;
+      __nv_bfloat16 *regs_b_bf16 =
+          reinterpret_cast<__nv_bfloat16 *>(regs_b_tmp[buffer_id]);
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < WarpShape::N / 16u; i++) {
+        PRAGMA_UNROLL
+        for (uint32_t v = 0; v < 8u; v++) {
+          uint32_t frag_id = v / 4u;
+          uint32_t v_in_frag = v % 4u;
+          uint32_t my_n = i * 16u + 8u * frag_id + (t / 4u);
+          regs_b_bf16[i * 8u + v] = __float2bfloat16(float(my_n) + 1.0f);
+        }
+      }
+    }
+#endif
 
     // We defer the r2s of dequantised bf16 to TCGEN05::run(iter_id),
     // because the r2s needs the K-iter index to compute SMEM offsets
@@ -242,13 +266,18 @@ public:
           uint32_t swizzled = linear_bytes ^ (xor_shift << 4);
           uint32_t reg_index = i * kBf16PerCall + v;
 #ifdef TCGEN05_DEBUG_SCATTER_SENTINEL
-          // Toggle between n+1 and k+1 sentinels by changing the source.
-          // n+1: output[m, n] = (n+1) * sum_A[m] -> reveals N mapping
-          // k+1: output[m, n] = sum_k A[m,k]*(k+1) -> n-independent if K
-          //      mapping is correct (same value across all cols per row)
-          float sentinel_f = float(k) + 1.0f;  // k-sentinel
+          float sentinel_f = float(n) + 1.0f;
           __nv_bfloat16 sentinel_bf16 = __float2bfloat16(sentinel_f);
           smem_b_bf16[swizzled / sizeof(__nv_bfloat16)] = sentinel_bf16;
+#elif defined(TCGEN05_DEBUG_NO_SCATTER)
+          // Only thread 0 v=0 i=0 writes bf16(2.671875) at (n=0, k=0).
+          // Expected: output[m, 0] = A[m, 0] * 2.671875 = 2.671875 (for A=delta).
+          if (threadIdx.x % 32 == 0 && i == 0 && v == 0 && iter_id == 0) {
+            __nv_bfloat16 val = __float2bfloat16(2.671875f);
+            smem_b_bf16[swizzled / sizeof(__nv_bfloat16)] = val;
+          }
+          (void)regs_b_bf16;
+          (void)reg_index;
 #else
           smem_b_bf16[swizzled / sizeof(__nv_bfloat16)] = regs_b_bf16[reg_index];
 #endif

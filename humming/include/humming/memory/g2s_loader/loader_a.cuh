@@ -101,10 +101,6 @@ public:
       uint32_t smem_col = smem_offset % 8;
       uint32_t smem_swizzled_offset;
       if constexpr (kUseTcgen05) {
-        // HW Swizzle<3,4,3> uses absolute byte address bits; the
-        // smem_base / 128 contributes to the XOR amount (verified
-        // empirically). Removing it or replacing + with ^ regresses
-        // the test.
         uint32_t row_xor = (smem_row + smem_base / 128) & 7u;
         smem_swizzled_offset = smem_row * 8 + (smem_col ^ row_xor);
       } else {
