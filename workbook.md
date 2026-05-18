@@ -402,39 +402,63 @@ untouched.
   - block (64, 128, 128), warp (64, 64, 32), num_stages=2, 1-CTA
   - `mma_type='tcgen05'`, `use_tcgen05=True`
 
-Known-correct issues to fix in this path (recorded so next iteration
-doesn't re-discover):
+Resolved this iteration:
 
-1. **HANG AT LAUNCH (currently blocking)**. The kernel.cubin (20 KB)
-   builds cleanly through nvrtc/ptxas for sm_103a but pytest hangs once
-   the kernel actually launches. The most plausible cause:
-   `tcgen05.mma` is async, and our temporary `tcgen05_fence +
-   __syncthreads` stand-in does NOT actually wait for the MMA to retire.
-   The subsequent `tcgen05.ld` (in `final_regs_c_as_ptr`) and
-   `tcgen05.dealloc<128>` (at kernel exit) then collide with an
-   in-flight MMA and the device blocks. **Resolution: must land the
-   mbarrier-based `tcgen05.commit.cta_group::1.mbarrier::arrive::one`
-   + matching `mbarrier.try_wait` before this test can run.** Pattern
-   to copy from CUTLASS: `include/cute/arch/mma_sm100_desc.hpp` and the
-   pipeline classes nearby.
-2. **r2s lane mapping doesn't match tcgen05.mma SMEM swizzle.** Even
-   once (1) is fixed, math will be wrong: `transform_b` writes the
-   dequantised bf16 tile into SMEM with a naive `threadIdx.x * stride`
-   layout. tcgen05.mma expects the same 128B/64B swizzled layout wgmma
-   uses; the descriptor we build via `tcgen05_smem_desc<128>` has the
-   swizzle bits set, so the kernel-side reader assumes swizzled data.
-3. **Wasted A→RMEM hop.** s2r_pipe still loads A into `regs_a` (now a
-   small dummy array on the TCGEN05 class). The actual A operand comes
-   from SMEM via `tcgen05_smem_desc(&smem.a[stage_id][0])`. Profile to
-   see if this hurts.
-4. **TMEM column count fixed at 128.** Currently `tcgen05_alloc<128>`
-   at kernel entry, irrespective of BlockN. Works for BlockN ≤ 128 with
-   f32 acc; BlockN=256 will need 256. Make it constexpr-derived from
-   the actual tile.
+1. ~~**HANG AT LAUNCH**~~ — Fixed by (a) wiring the mbarrier-based
+   `tcgen05.commit.cta_group::1.mbarrier::arrive::one` →
+   `mbarrier.try_wait.parity` round-trip in `TCGEN05::final_regs_c_as_ptr`
+   and (b) realising the entire `tcgen05.*` family is `.sync.aligned`
+   PTX, i.e. **must be issued warp-uniformly**. Single-thread guards
+   (`if (threadIdx.x == 0)`) caused warp-0 divergence → undefined. Fix:
+   `if (threadIdx.x < 32)` so all 32 threads of warp 0 issue together.
+   Applies to `tcgen05_alloc / mma / commit / relinquish / dealloc`.
+2. **Instruction-descriptor encoding was off** in the original
+   handcoded layout — the actual SM100 `InstrDescriptor` bit fields
+   (per CUTLASS `include/cute/arch/mma_sm100_desc.hpp:412`):
+   ```
+   c_format @ bits [4,6)   (F32 = 1)
+   a_format @ bits [7,10)  (BF16 = 1)
+   b_format @ bits [10,13)
+   n_dim    @ bits [17,23) -- N >> 3 (N=128 → 16)
+   m_dim    @ bits [24,29) -- M >> 4 (M=64 → 4, M=128 → 8)
+   ```
+   I had c_format at bit 9, a_format at bit 12, M-shift by 5 instead of
+   4 -- malformed across the board. Now using a CUTLASS-style bitfield
+   `union Tcgen05InstrDescriptor` in `utils/ptx/tcgen05.cuh` so we don't
+   re-make this class of mistake.
+3. **Codegen emitted wrong MmaShape.** `kernel/humming.py:185` only
+   special-cased WGMMA, so TCGEN05 fell through to `mma_shape_m=16,
+   n=8, k=variable` -- the mma.sync shape. Fixed to make tcgen05 use
+   `MmaShape = (BlockM, BlockN, 16)` since tcgen05.mma covers the full
+   block tile per issue.
+4. **Epilogue array typedefs were tcgen05-hostile.**
+   `epilogue/smem_reducer.cuh:19` and `smem_writer.cuh:86` declared
+   `WGMMA_CRegistersArrayType = CRegisters[WarpN*4/MmaM][WarpM/MmaN]`
+   without `MAX(.., 1)`. When `MmaShape == BlockShape` (tcgen05 case)
+   the second dimension is 0 → "the size of an array must be greater
+   than zero" compile error even though the typedef isn't selected by
+   the `std::conditional_t`. Fixed with `MAX(.., 1)` guards.
 
-The test (`tests/test_tcgen05.py::test_tcgen05_w4a16_smallest`) is marked
-`xfail(run=False)` until (1) lands. Run with
-`pytest --runxfail tests/test_tcgen05.py` once the mbarrier path is up.
+Still pending (current blocker, illegal-instruction at runtime):
+
+5. **CRegisters sizing for t2r doesn't match `tcgen05.ld.32x32b.x32`'s
+   per-thread footprint.** `tcgen05.ld.32x32b.x32.b32` is documented as
+   loading 32 uint32 per lane (128 B/lane), which for one warp covers
+   1024 uint32 = 4 KB of TMEM. A 64×128 fp32 accumulator is 32 KB → 8
+   t2r issues per warp (or distributed across multiple warps with
+   coordinated offsets). My current TCGEN05 class issues *one* t2r and
+   assumes that drains the entire tile — which it doesn't. This is the
+   most likely source of the remaining illegal-instruction.
+6. **r2s lane mapping for B still naive.** B1 from the workbook
+   ("swizzle=0 + thread-contiguous scatter") — won't be correct math
+   until each thread writes to the (row, col) the descriptor expects.
+7. **TMEM column count fixed at 128.** Currently `tcgen05_alloc<128>`
+   irrespective of BlockN. Works for BlockN ≤ 128 with f32 acc;
+   BlockN=256 will need 256. Make it constexpr-derived from the tile.
+
+The test (`tests/test_tcgen05.py::test_tcgen05_w4a16_smallest`) is
+xfail-marked until (5) lands; once it runs to completion, (6) is the
+next blocker for math correctness.
 
 ### Phase B.2 (still pending) — `mma/tcgen05_mma.cuh`
 

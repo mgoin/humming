@@ -44,14 +44,12 @@ pytestmark = pytest.mark.skipif(not _is_blackwell(), reason="tcgen05 needs sm_10
 
 @pytest.mark.xfail(
     reason=(
-        "Phase B.4 WIP: kernel compiles end-to-end on sm_103a but hangs at "
-        "launch. Suspected: tcgen05.mma issues are async and our temporary "
-        "fence+__syncthreads stand-in doesn't actually wait for the MMA to "
-        "drain, so the subsequent tcgen05.ld and tcgen05.dealloc collide "
-        "with an in-flight MMA. Needs the mbarrier-based commit (Phase "
-        "B.2c in workbook.md). Run with --runxfail when iterating."
+        "Phase B.4 in progress: completion path (mbarrier-based commit/wait) "
+        "is wired up so the kernel runs to completion, but the r2s lane "
+        "mapping in transform_b doesn't yet match what tcgen05.mma expects "
+        "from the SMEM B descriptor (workbook 'B1 vs B2'). Expect wrong "
+        "math until the m16n8k16 B-fragment scatter lands."
     ),
-    run=False,  # don't actually execute the hanging kernel by default
     strict=False,
 )
 def test_tcgen05_w4a16_smallest():
@@ -107,6 +105,11 @@ def test_tcgen05_w4a16_smallest():
         use_stream_k=False,
     )
 
+    # Compute the reference FIRST so a misbehaving tcgen05 kernel that
+    # corrupts CUDA context doesn't take cublas down with it.
+    outputs_ref = inputs_ref.matmul(weight_ref.T)
+    torch.cuda.synchronize()
+
     from humming import ops
     outputs = torch.empty(
         (shape_m, shape_n),
@@ -121,9 +124,21 @@ def test_tcgen05_w4a16_smallest():
         weight_scale=weight_scale,
         zero_point=zero_point,
     )
+    torch.cuda.synchronize()
 
-    # Reference
-    outputs_ref = inputs_ref.matmul(weight_ref.T).to(outputs.dtype)
+    outputs_ref = outputs_ref.to(outputs.dtype)
+
+    # Diagnostics first -- tells us whether the kernel produced garbage,
+    # all-zeros, or something with the right magnitude in the wrong layout.
+    abs_err = (outputs.float() - outputs_ref.float()).abs()
+    print(
+        f"\n  out[:2,:4]={outputs[:2,:4].tolist()}\n"
+        f"  ref[:2,:4]={outputs_ref[:2,:4].tolist()}\n"
+        f"  max|err|={abs_err.max().item():.3e}  mean|err|={abs_err.mean().item():.3e}\n"
+        f"  |ref|: mean={outputs_ref.float().abs().mean().item():.3e}  "
+        f"max={outputs_ref.float().abs().max().item():.3e}\n"
+        f"  out nonzero frac: {(outputs.float().abs() > 1e-6).float().mean().item():.3f}"
+    )
 
     # Loose tolerance for first pass -- tighten once correct.
     torch.testing.assert_close(outputs, outputs_ref, rtol=0.5, atol=0.5)

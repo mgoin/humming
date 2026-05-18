@@ -29,6 +29,7 @@
 //   * No accumulator double-buffering -- one TMEM region per CTA.
 
 #include <humming/utils/all.cuh>
+#include <humming/utils/ptx/barrier.cuh>
 #include <humming/utils/ptx/tcgen05.cuh>
 
 
@@ -57,10 +58,12 @@ public:
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kNumWarpShapeNSplits = WarpShape::N == ElementA::kBits * 2 ? 2 : 1;
 
-  // For the staging r2s we keep the same regs_b footprint as WMMA: one
-  // per-thread tile of dequantised bf16 per buffer (two buffers ping-pong
-  // with the K loop, matching humming.cuh's transform_b(0/1) pattern).
-  static constexpr uint32_t kSwizzleBytes = 128;
+  // SMEM descriptor swizzle for A and B. Phase B.4 picks B1 from the
+  // workbook: B's r2s writes a plain row-major layout (swizzle=0). A's
+  // SMEM is already loaded by humming's TMA/cp.async loader with the
+  // wgmma-compatible 128B swizzle, so we keep that.
+  static constexpr uint32_t kSwizzleBytesA = 128;
+  static constexpr uint32_t kSwizzleBytesB = 0;
 
   SharedStorage &smem;
   ArithClass &arith;
@@ -161,9 +164,11 @@ public:
   void run(uint32_t stage_id, uint32_t iter_id) {
     uint32_t buffer_id = iter_id % 2;
 
-    // A descriptor reads from smem.a[stage_id]; B from smem.b_dequant.
-    uint64_t a_desc = tcgen05_smem_desc<kSwizzleBytes>(&smem.a[stage_id][0]);
-    uint64_t b_desc = tcgen05_smem_desc<kSwizzleBytes>(&smem.b_dequant[buffer_id][0]);
+    // A descriptor reads from smem.a[stage_id] (128B swizzle, written by
+    // the existing TMA/cp.async loader); B descriptor reads from
+    // smem.b_dequant (swizzle=0, written by transform_b's r2s).
+    uint64_t a_desc = tcgen05_smem_desc<kSwizzleBytesA>(&smem.a[stage_id][0]);
+    uint64_t b_desc = tcgen05_smem_desc<kSwizzleBytesB>(&smem.b_dequant[buffer_id][0]);
 
     uint32_t idesc =
         tcgen05_instr_desc_bf16_bf16_f32(BlockShape::M, BlockShape::N);
@@ -173,27 +178,42 @@ public:
     bool scale_d = !first_issue_;
     first_issue_ = false;
 
-    if (threadIdx.x == 0) {
-      // Only one thread issues tcgen05.mma per CTA group.
+    // tcgen05.mma is .sync.aligned per the PTX spec -- it has to be
+    // executed warp-uniformly. Issue from all 32 threads of warp 0; the
+    // hardware treats this as one CTA-group issue.
+    if (threadIdx.x < 32) {
       tcgen05_mma_ss_bf16(smem.tcgen05_tmem_col, a_desc, b_desc, idesc, scale_d);
     }
-
-    // Phase 0: barrier instead of mbarrier-based commit/wait.
-    // TODO: thread an mbarrier through here once the pipeline allocates it.
-    tcgen05_fence_view_async_tmem_store();
-    __syncthreads();
   }
 
   // Run the t2r and expose a plain RMEM accumulator pointer for the
   // epilogue. Called once per output tile, AFTER the K-loop completes.
+  // Drains all in-flight tcgen05.mma issues via a single commit; waits
+  // on the per-CTA mbarrier; then issues the TMEM->RMEM load.
   template <class T = uint32_t>
   CUDA_INLINE T *final_regs_c_as_ptr() {
+    // tcgen05.commit is .sync.aligned -- warp-uniform.
+    if (threadIdx.x < 32) {
+      uint32_t mbar_addr = cast_smem_ptr_to_uint(&smem.tcgen05_mbar);
+      tcgen05_commit_to_mbarrier(mbar_addr);
+    }
+    // All threads wait on the same mbarrier; phase flips after each
+    // tile's wait so the next tile's commit re-arms cleanly.
+    mbarrier_wait(&smem.tcgen05_mbar, mbar_phase_);
+    mbar_phase_ ^= 1u;
+
+    // The mbarrier_wait guarantees all tcgen05.mma stores to TMEM are
+    // visible; an explicit fence isn't required by the spec, but keeping
+    // it is cheap and defensive while we shake the layout out.
     tcgen05_fence_view_async_tmem_store();
-    __syncthreads();
-    // Load the per-thread slice of the accumulator out of TMEM.
+    // TMEM -> RMEM. Each thread loads its slice of the accumulator.
     tcgen05_ld_32x32b_x32(smem.tcgen05_tmem_col,
                           reinterpret_cast<uint32_t *>(regs_c));
     __syncthreads();
+
+    // Reset first_issue_ for the next output tile -- otherwise we'd
+    // accumulate into stale TMEM. (zero_accum() is the canonical reset
+    // but the mainloop already calls it before each tile.)
     return reinterpret_cast<T *>(regs_c);
   }
 
@@ -227,6 +247,8 @@ public:
 private:
   // True until the first tcgen05.mma issue lands, used to drive scale_d.
   bool first_issue_ = true;
+  // mbarrier phase parity bit. Flips after each tile's commit/wait pair.
+  uint32_t mbar_phase_ = 0;
 };
 
 

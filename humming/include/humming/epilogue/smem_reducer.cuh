@@ -16,7 +16,10 @@ private:
   static constexpr bool kUseWgmma = MmaOpClass::kMmaType == MmaType::WGMMA;
   using CRegistersType = typename MmaOpClass::CRegisters;
   using MMA_CRegistersArrayType = CRegistersType[MAX(WarpShape::M / MmaShape::M, 1)][MAX(WarpShape::N / MmaShape::N, 1)];
-  using WGMMA_CRegistersArrayType = CRegistersType[WarpShape::N * 4 / MmaShape::M][WarpShape::M / MmaShape::N];
+  // The WGMMA path divisor can be larger than the warp shape on tcgen05
+  // configs where MmaShape == BlockShape; guard with MAX(.., 1) so the
+  // typedef remains well-formed even when this branch isn't selected.
+  using WGMMA_CRegistersArrayType = CRegistersType[MAX(WarpShape::N * 4 / MmaShape::M, 1)][MAX(WarpShape::M / MmaShape::N, 1)];
   using CRegistersArrayType = std::conditional_t<kUseWgmma, WGMMA_CRegistersArrayType, MMA_CRegistersArrayType>;
 
 public:

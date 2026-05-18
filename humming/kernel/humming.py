@@ -182,9 +182,18 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         else:
             mma_cd_dtype = dtypes.float32
 
-        mma_shape_m = 64 if self.mma_type == MmaType.WGMMA else 16
-        mma_shape_n = self.warp_shape[0] if self.mma_type == MmaType.WGMMA else 8
-        mma_shape_k = 256 // self.a_dtype.num_bits
+        if self.mma_type == MmaType.TCGEN05:
+            # tcgen05.mma.kind::f16 instruction shape: m64/128/256, n32..256
+            # step 32, k=16 for bf16/f16. The instruction covers the FULL
+            # block tile in one issue, so MmaShape == BlockShape (M, N) and
+            # K=16 (the kind::f16 K-step).
+            mma_shape_m = self.block_shape[0]
+            mma_shape_n = self.block_shape[1]
+            mma_shape_k = 16
+        else:
+            mma_shape_m = 64 if self.mma_type == MmaType.WGMMA else 16
+            mma_shape_n = self.warp_shape[0] if self.mma_type == MmaType.WGMMA else 8
+            mma_shape_k = 256 // self.a_dtype.num_bits
         if self.sm_version == 75 and self.a_dtype == dtypes.int8:
             mma_shape_m = 8
 
@@ -197,10 +206,16 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.mma_type == MmaType.WGMMA:
             assert self.warp_shape[0] % mma_shape_n == 0
             assert self.warp_shape[1] % (mma_shape_m // 4) == 0
+            assert self.warp_shape[2] % mma_shape_k == 0
+        elif self.mma_type == MmaType.TCGEN05:
+            # tcgen05.mma covers the entire BlockMxBlockN tile per issue,
+            # so no per-warp subdivision applies in M/N. K is handled by
+            # the mainloop's K-loop (one issue per K=mma_shape_k step).
+            assert self.warp_shape[2] % mma_shape_k == 0
         else:
             assert self.warp_shape[0] % mma_shape_m == 0
             assert self.warp_shape[1] % mma_shape_n == 0
-        assert self.warp_shape[2] % mma_shape_k == 0
+            assert self.warp_shape[2] % mma_shape_k == 0
 
         return MmaOpClass.from_config(
             self.mma_type,

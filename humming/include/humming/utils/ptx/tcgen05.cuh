@@ -157,45 +157,71 @@ CUDA_INLINE uint64_t tcgen05_smem_desc(const void *smem_ptr) {
 // Instruction descriptor
 // ============================================================================
 //
-// The 32-bit instruction descriptor encodes the shape/dtype/transpose flags
-// for one tcgen05.mma issue. Layout (per PTX 8.7 §9.7.16.6) for the dense
-// .kind::f16 / .kind::bf16 / .kind::tf32 family:
+// 32-bit "instruction descriptor" passed to every tcgen05.mma issue. The
+// layout follows CUTLASS's `UMMA::InstrDescriptor` exactly
+// (`include/cute/arch/mma_sm100_desc.hpp:412`); reproduce it as a union so
+// we don't have to maintain hand-rolled shift arithmetic. PTX ISA 8.7
+// §9.7.16.5.1 is the spec.
 //
-//   bits  0.. 5  sparsity (0 for dense)
-//   bits  6.. 8  saturation / negate (we leave 0)
-//   bits  9..11  d_type (00=f16, 01=bf16, 10=tf32, 11=f32)
-//   bits 12..14  a_type / b_type
-//   bits 15..16  negate A / B
-//   bit  17      A is transposed
-//   bit  18      B is transposed
-//   bits 19..23  M-shape (units of 32, so M=64 -> 2)
-//   bits 24..28  N-shape (units of 8, so N=128 -> 16)
-//   bits 29..30  cta_group (00=1, 01=2)
-//   bit  31      reserved
-//
-// For our W4A16 path the inputs are A=bf16, B=bf16 (after dequant), D=f32,
-// cta_group=1, no negate, no transpose, dense, M variable, N variable.
+//   sparse_id2  : 2  [ 0, 2)  -- meta id for sparse
+//   sparse_flag : 1  [ 2, 3)  -- dense=0, sparse=1
+//   saturate    : 1  [ 3, 4)  -- int8 saturate; 0 for f16/bf16
+//   c_format    : 2  [ 4, 6)  -- 0=F16, 1=F32, 2=S32
+//   (reserved)  : 1  [ 6, 7)
+//   a_format    : 3  [ 7,10)  -- F16=0, BF16=1, TF32=2 (kind::f16 family)
+//   b_format    : 3  [10,13)
+//   a_negate    : 1  [13,14)
+//   b_negate    : 1  [14,15)
+//   a_major     : 1  [15,16)  -- 0 = K-major (standard), 1 = MN-major
+//   b_major     : 1  [16,17)
+//   n_dim       : 6  [17,23)  -- N >> 3.  N=32 -> 4, ..., N=256 -> 32
+//   (reserved)  : 1  [23,24)
+//   m_dim       : 5  [24,29)  -- M >> 4.  M=64  -> 4,  M=128 -> 8, M=256 -> 16
+//   (reserved)  : 1  [29,30)
+//   max_shift   : 2  [30,32)
 
-namespace tcgen05_dtype_codes {
-  // Codes for the A/B/D type fields. Match PTX 8.7 Table 38.
-  constexpr uint32_t F16 = 0;
+union Tcgen05InstrDescriptor {
+  uint32_t desc;
+  struct {
+    uint16_t sparse_id2  : 2,
+             sparse_flag : 1,
+             saturate    : 1,
+             c_format    : 2,
+             _r0         : 1,
+             a_format    : 3,
+             b_format    : 3,
+             a_negate    : 1,
+             b_negate    : 1,
+             a_major     : 1;
+    uint16_t b_major     : 1,
+             n_dim       : 6,
+             _r1         : 1,
+             m_dim       : 5,
+             _r2         : 1,
+             max_shift   : 2;
+  };
+};
+
+namespace tcgen05_fmt {
+  constexpr uint32_t F16  = 0;
   constexpr uint32_t BF16 = 1;
   constexpr uint32_t TF32 = 2;
-  constexpr uint32_t F32 = 3;
+}
+namespace tcgen05_cfmt {
+  constexpr uint32_t F16 = 0;
+  constexpr uint32_t F32 = 1;
+  constexpr uint32_t S32 = 2;
 }
 
 CUDA_INLINE uint32_t tcgen05_instr_desc_bf16_bf16_f32(uint32_t shape_m,
                                                      uint32_t shape_n) {
-  // shape_m in {64, 128, 256}; shape_n in {32, 64, ..., 256, step 32}.
-  uint32_t idesc = 0;
-  idesc |= (tcgen05_dtype_codes::F32  & 0x7) << 9;   // d_type
-  idesc |= (tcgen05_dtype_codes::BF16 & 0x7) << 12;  // a_type (and shared b_type slot)
-  // M-shape in units of 32:
-  idesc |= ((shape_m >> 5) & 0x1f) << 19;
-  // N-shape in units of 8:
-  idesc |= ((shape_n >> 3) & 0x1f) << 24;
-  // cta_group::1 -> bits 29-30 = 00.
-  return idesc;
+  Tcgen05InstrDescriptor d{};
+  d.c_format = tcgen05_cfmt::F32;
+  d.a_format = tcgen05_fmt::BF16;
+  d.b_format = tcgen05_fmt::BF16;
+  d.n_dim    = (shape_n >> 3);   // N=128 -> 16
+  d.m_dim    = (shape_m >> 4);   // M=64  -> 4, M=128 -> 8
+  return d.desc;
 }
 
 
@@ -237,32 +263,30 @@ CUDA_INLINE void tcgen05_mma_ss_bf16(uint32_t d_tmem,
 // Group commit / wait
 // ============================================================================
 //
-// NOTE: Unlike wgmma's `commit_group / wait_group` pair, tcgen05.mma signals
+// Unlike wgmma's `commit_group / wait_group` pair, tcgen05.mma signals
 // completion through an *mbarrier*. The canonical idiom is:
 //
 //   tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [mbar_smem_addr];
 //   ...
-//   mbarrier.try_wait.parity.shared.b64 ...
+//   mbarrier.try_wait.parity.shared::cta.b64 P, [mbar_smem_addr], phase;
 //
-// That means the call site must thread an mbarrier SMEM address through to
-// the commit, and the kernel must initialise that mbarrier in shared
-// storage. This is meaningful surgery to humming's `g2s_pipeline` /
-// `consumer_pipeline` -- they already manage mbarriers for cp.async/TMA,
-// and the tcgen05 path needs its own mbarrier alongside the existing ones.
+// `tcgen05.commit` packages ALL prior tcgen05.mma issues from this CTA
+// into a single batch and arrives on `mbar` exactly once when they all
+// retire. The reader busy-waits on the mbarrier with a phase parity bit
+// that flips on every use of the same mbar.
 //
-// Sketched out below but commented until the pipeline plumbing in
-// `kernel/humming.cuh` and `epilogue/pipeline.cuh` allocates the mbarrier
-// and threads its SMEM address down. Until then, callers must use a
-// blocking `__syncthreads()` after the issue and accept the perf hit (it's
-// only the prototype path).
+// Caller obligations:
+//   * Init the mbar at kernel start: `__mbarrier_init(&mbar, 1)` -- one
+//     expected arrival because each tcgen05.commit arrives exactly once.
+//   * Only one thread issues `tcgen05_commit_to_mbarrier()` per use.
+//   * All threads waiting on the result call `mbarrier_wait(mbar, phase)`
+//     and the caller toggles `phase` after each wait.
 
-#if 0  // TODO(sm100): land alongside the mbarrier wiring in humming.cuh.
 CUDA_INLINE void tcgen05_commit_to_mbarrier(uint32_t mbar_smem_addr) {
   asm volatile(
       "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];\n"
       :: "r"(mbar_smem_addr) : "memory");
 }
-#endif
 
 CUDA_INLINE void tcgen05_fence_view_async_tmem_store() {
   // Ensures prior TMEM stores from this CTA are visible before subsequent

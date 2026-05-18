@@ -102,15 +102,19 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   producer.init_mbarrir();
   __syncthreads();
 
-  // TMEM allocation for the tcgen05 path. One warp issues the alloc; the
-  // column index lands in smem.tcgen05_tmem_col which all warps observe
-  // after the sync. Size for now: 128 columns (covers BlockN up to 128
-  // with f32 acc). Revisit when we support BlockN > 128.
+  // TMEM allocation + mbarrier init for the tcgen05 path. The tcgen05.*
+  // family is .sync.aligned -- must be executed warp-uniformly. Use
+  // warp 0 (threadIdx.x < 32) so all 32 threads issue together. Thread 0
+  // also runs the mbarrier init (a regular intrinsic, not warp-aligned).
+  // Size for now: 128 columns (covers BlockN up to 128 with f32 acc).
   if constexpr (MmaOpClass::kMmaType == MmaType::TCGEN05) {
-    if (threadIdx.x == 0) {
+    if (threadIdx.x < 32) {
       uint32_t smem_addr =
           cast_smem_ptr_to_uint(&smem.tcgen05_tmem_col);
       tcgen05_alloc<128>(smem_addr);
+    }
+    if (threadIdx.x == 0) {
+      __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
     }
     __syncthreads();
   }
@@ -171,10 +175,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     epilogue.call(mma.final_regs_c_as_ptr());
   }
 
-  // Release the TMEM column allocation before kernel exit.
+  // Release the TMEM column allocation before kernel exit. tcgen05.*
+  // is .sync.aligned -- must be warp-uniform.
   if constexpr (MmaOpClass::kMmaType == MmaType::TCGEN05) {
     __syncthreads();
-    if (threadIdx.x == 0) {
+    if (threadIdx.x < 32) {
       tcgen05_relinquish_alloc_permit();
       tcgen05_dealloc<128>(smem.tcgen05_tmem_col);
     }

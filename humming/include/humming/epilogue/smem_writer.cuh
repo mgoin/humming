@@ -83,7 +83,7 @@ private:
   using ValTypeC = typename MmaOpClass::ValTypeC;
   using CRegistersType = typename MmaOpClass::CRegisters;
   using MMA_CRegistersArrayType = CRegistersType[MAX(WarpShape::M / MmaShape::M, 1)][MAX(WarpShape::N / MmaShape::N, 1)];
-  using WGMMA_CRegistersArrayType = CRegistersType[WarpShape::N * 4 / MmaShape::M][WarpShape::M / MmaShape::N];
+  using WGMMA_CRegistersArrayType = CRegistersType[MAX(WarpShape::N * 4 / MmaShape::M, 1)][MAX(WarpShape::M / MmaShape::N, 1)];
   using CRegistersArrayType = std::conditional_t<kUseWgmma, WGMMA_CRegistersArrayType, MMA_CRegistersArrayType>;
 
   static constexpr uint32_t kNumWriteSplits = TuningConfig::kNumWriteSplits;
