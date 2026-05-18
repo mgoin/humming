@@ -165,7 +165,12 @@ public:
       // when `use_tcgen05` is set in the TuningConfig; otherwise the
       // mma.sync / wgmma paths dequant directly into RMEM and need no
       // SMEM here.
-      IF_USE_TCGEN05(int4 b_dequant[kNumStages][kStageSizeBDequant];)
+      // alignas(128) is REQUIRED for the Swizzle<3,4,3> the tcgen05.mma
+      // descriptor applies -- the swizzle XORs bits [4,7) of the
+      // absolute byte address, and a non-128B-aligned base shifts the
+      // effective pattern in a way that doesn't match a row-major
+      // logical layout.
+      IF_USE_TCGEN05(alignas(128) int4 b_dequant[kNumStages][kStageSizeBDequant];)
     };
     int4 reduce[MAX(kWarpReduceSize, kBlockOutputSize)];
   };

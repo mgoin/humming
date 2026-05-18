@@ -143,9 +143,14 @@ public:
     static_assert(!std::is_same<ElementA, ElementB>::value,
                   "TCGEN05 path is only wired up for narrow-B (int4) today");
 
-    uint32_t *regs_b_ptr = regs_b_tmp[buffer_id];
+    // dequant_b1248 writes 4 uint32 starting at the passed pointer per
+    // call. Each outer-i call corresponds to a DIFFERENT m16n8 fragment
+    // pair in regs_b_tmp, so advance the destination by 4 uint32 per
+    // iter (same pattern as wmma.cuh:60 -- previously this was reusing
+    // the base pointer and overwriting on every call).
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < WarpShape::N / 16; i++) {
+      uint32_t *regs_b_ptr = regs_b_tmp[buffer_id] + i * 4u;
       uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, i);
       uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
       dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(
@@ -187,55 +192,63 @@ public:
     }
 #else
     // ---- r2s of the just-dequantised B tile to swizzled SMEM ----
-    // transform_b left bf16 in `regs_b_tmp[buffer_id]` in mma.sync
-    // m16n8k16 B-fragment layout. We now scatter to smem.b_dequant
-    // at logical (n, k) positions matching the tcgen05.mma descriptor
-    // (128B-swizzled, K-major).
     //
-    // Per-thread fragment layout (from CUTLASS mma_traits_sm80.hpp:89,
-    // BLayout = `((4,8),(2,2)):((16,1),(8,64))`):
-    //   v=0: (n = t%4 + frag_n_base + 0, k = t/4 + 0)
-    //   v=1: (n = t%4 + frag_n_base + 0, k = t/4 + 8)
-    //   v=2: (n = t%4 + frag_n_base + 4, k = t/4 + 0)
-    //   v=3: (n = t%4 + frag_n_base + 4, k = t/4 + 8)
-    // humming's `dequant<>` call with j=i covers TWO consecutive
-    // n-frags of 8N each (= 16 N) starting at n = i*16. So per dequant
-    // call the 8 outputs span:
-    //   bf16[0..3]: frag_n_base = i*16     (first 8 N)
-    //   bf16[4..7]: frag_n_base = i*16+8   (next 8 N)
+    // Per PTX ISA 7.0 Table 32 (mma.m16n8k16.f16, B-matrix layout),
+    // thread t's 4 b16 of B are at:
+    //   v=0: (k = 2*(t%4) + 0, n = t/4)   — first b32 lo
+    //   v=1: (k = 2*(t%4) + 1, n = t/4)   — first b32 hi
+    //   v=2: (k = 2*(t%4) + 8, n = t/4)   — second b32 lo
+    //   v=3: (k = 2*(t%4) + 9, n = t/4)   — second b32 hi
+    //
+    // humming's `dequant<>` call with j=i fills regs_b_tmp[i*4..i*4+3]
+    // (= 4 b32 = 8 b16) which mma.sync interprets as TWO m16n8 instances:
+    //   instance 2i (n_base = i*16 + 0): {b0=res[0], b1=res[1]}
+    //   instance 2i+1 (n_base = i*16 + 8): {b0=res[2], b1=res[3]}
+    //
+    // Final (reg_index = i*8 + v in [0, 32)) -> (n, k) mapping:
+    //   frag_id   = v / 4                       (0 or 1)
+    //   v_in_frag = v % 4
+    //   n = i*16 + 8*frag_id + (t / 4)
+    //   k = k_base + 2*(t%4) + (v_in_frag & 1) + 8 * (v_in_frag >> 1)
     {
       __nv_bfloat16 *smem_b_bf16 =
           reinterpret_cast<__nv_bfloat16 *>(&smem.b_dequant[buffer_id][0]);
       __nv_bfloat16 *regs_b_bf16 =
           reinterpret_cast<__nv_bfloat16 *>(regs_b_tmp[buffer_id]);
-      // Row stride of the (BlockN, BlockK) bf16 tile, in bytes.
       constexpr uint32_t kRowBytes = BlockShape::K * sizeof(__nv_bfloat16);
       uint32_t t = threadIdx.x % 32u;
-      uint32_t k_base = iter_id * kPartMmaShapeK;  // global K-base for this iter
+      uint32_t k_base = iter_id * kPartMmaShapeK;
       constexpr uint32_t kBf16PerCall = 8;
       constexpr uint32_t kCalls = WarpShape::N / 16u;
+      // Hardware Swizzle<3,4,3> reads the ABSOLUTE byte address, so the
+      // XOR amount depends on smem_b_dequant_base too -- not just the
+      // relative offset within the buffer.
+      uint32_t smem_base_div_128 =
+          cast_smem_ptr_to_uint(smem_b_bf16) >> 7;
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kCalls; i++) {
         PRAGMA_UNROLL
         for (uint32_t v = 0; v < kBf16PerCall; v++) {
           uint32_t frag_id = v / 4u;
           uint32_t v_in_frag = v % 4u;
-          uint32_t n =
-              i * 16u + frag_id * 8u + (t % 4u) + (v_in_frag / 2u) * 4u;
-          uint32_t k = k_base + (t / 4u) + (v_in_frag % 2u) * 8u;
+          uint32_t n = i * 16u + 8u * frag_id + (t / 4u);
+          uint32_t k = k_base + 2u * (t % 4u) + (v_in_frag & 1u)
+                     + 8u * (v_in_frag >> 1);
           uint32_t linear_bytes = n * kRowBytes + k * sizeof(__nv_bfloat16);
-          // Swizzle<3,4,3>: XOR bits [7,10) of the linear address into
-          // the atom-within-row position (bits [4,7)).
-          uint32_t xor_mask = ((linear_bytes >> 7) & 0x7u) << 4;
-          uint32_t swizzled = linear_bytes ^ xor_mask;
+          // Swizzle<3,4,3>: XOR (abs_addr >> 7 & 7) into bits [4,7) of
+          // the byte address.  abs_addr = smem_base + linear_bytes, and
+          // since linear_bytes < BlockN * row_stride bytes and our row
+          // stride is 128B (= 2^7), the bits [7,10) of abs_addr are
+          // exactly (smem_base/128 + n) & 7  (no carry from k*2).
+          uint32_t xor_shift = (smem_base_div_128 + n) & 7u;
+          uint32_t swizzled = linear_bytes ^ (xor_shift << 4);
           uint32_t reg_index = i * kBf16PerCall + v;
 #ifdef TCGEN05_DEBUG_SCATTER_SENTINEL
-          // Sentinel: write bf16(n+1) at the (n, k) my formula picks.
-          // output[m, n_mma] = sum_k A[m, k] * (n_scattered+1)
-          //   = (n_scattered+1) * sum_A[m]   (if n_scattered uniform per col)
-          // The ratio output[m, n] / sum_A[m] = the "effective scattered n"
-          // that ended up at MMA's column n.
-          float sentinel_f = float(n) + 1.0f;
+          // Toggle between n+1 and k+1 sentinels by changing the source.
+          // n+1: output[m, n] = (n+1) * sum_A[m] -> reveals N mapping
+          // k+1: output[m, n] = sum_k A[m,k]*(k+1) -> n-independent if K
+          //      mapping is correct (same value across all cols per row)
+          float sentinel_f = float(n) + 1.0f;  // n-sentinel
           __nv_bfloat16 sentinel_bf16 = __float2bfloat16(sentinel_f);
           smem_b_bf16[swizzled / sizeof(__nv_bfloat16)] = sentinel_bf16;
 #else

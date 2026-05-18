@@ -69,8 +69,13 @@ def test_tcgen05_w4a16_smallest():
     # the 128B-swizzle atom width exactly. With BlockK > 64 (= 128 B per
     # row), each actual SMEM row would span 2 swizzle-rows and the
     # canonical UMMA-K layout no longer applies cleanly.
+    # 4 warps along M -- each warp accesses its own TMEM sub-partition.
+    # The M=64 cta_group::1 TMEM atom places valid M values at DPs
+    # {0..15, 32..47, 64..79, 96..111} (per CUTE
+    # mma_traits_sm100.hpp:507), and a warp can only access its own
+    # 32-DP sub-partition.
     block_shape = (64, 64, 64)
-    warp_shape = (64, 64, 64)
+    warp_shape = (16, 64, 64)
 
     # Build the W4A16 problem identical to what test_shape uses.
     random_weight = generate_random_weight(
