@@ -44,6 +44,7 @@
 // Both off by default -- only re-enable when investigating regressions.
 // #define TCGEN05_DEBUG_CONST_B 1
 // #define TCGEN05_DEBUG_SKIP_TMEM 1
+// #define TCGEN05_DEBUG_SCATTER_SENTINEL 1
 
 
 // fence_proxy.async.shared::cta -- ensures prior r2s of dequantised B
@@ -228,7 +229,18 @@ public:
           uint32_t xor_mask = ((linear_bytes >> 7) & 0x7u) << 4;
           uint32_t swizzled = linear_bytes ^ xor_mask;
           uint32_t reg_index = i * kBf16PerCall + v;
+#ifdef TCGEN05_DEBUG_SCATTER_SENTINEL
+          // Sentinel: write bf16(n+1) at the (n, k) my formula picks.
+          // output[m, n_mma] = sum_k A[m, k] * (n_scattered+1)
+          //   = (n_scattered+1) * sum_A[m]   (if n_scattered uniform per col)
+          // The ratio output[m, n] / sum_A[m] = the "effective scattered n"
+          // that ended up at MMA's column n.
+          float sentinel_f = float(n) + 1.0f;
+          __nv_bfloat16 sentinel_bf16 = __float2bfloat16(sentinel_f);
+          smem_b_bf16[swizzled / sizeof(__nv_bfloat16)] = sentinel_bf16;
+#else
           smem_b_bf16[swizzled / sizeof(__nv_bfloat16)] = regs_b_bf16[reg_index];
+#endif
         }
       }
     }

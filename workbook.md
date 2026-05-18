@@ -186,7 +186,139 @@ JIT recompile is ~10 s with empty cache, ~0 s with hits.
   (cuobjdump can't disassemble SASS for instructions newer than its
   build; PTX always works.)
 
-## Phase B.9 update (2026-05-18): epilogue is fixed; real blocker is the A-side swizzle mismatch
+## Phase B.10 update (2026-05-18): the MMA + t2r + epilogue chain is correct; only the dequant scatter remains
+
+End-to-end validation with debug instruments:
+
+* **`A=1, B=1` →** output is uniformly 256 everywhere ✓
+* **`A[m,k]=m, B=1` →** output[m, n] = K * m for all (m, n) ✓ (exact match)
+* **`A=random, B=dequant int4` →** still only 8 of 16 N positions (mod 16)
+  per row are nonzero. Same `{2, 4, 5, 7, 10, 12, 13, 15}` mod-16 pattern
+  from the very first failure -- the bug has been isolated to the
+  m16n8-fragment → K-major-SMEM scatter in `TCGEN05::run`.
+
+Three architectural fixes landed in this iteration (all in commit `12314ea`):
+
+1. **Custom epilogue.** `final_regs_c_as_ptr` now writes bf16 directly
+   into `smem.reduce` in `gmem_writer::write_legacy`'s expected layout
+   (row-major int4 with XOR swizzle by `(row + smem_base) % 8`).
+   `EpiloguePipeline::call` skips `smem_writer.write` for TCGEN05.
+
+2. **4-warp t2r at per-warp TMEM sub-partitions.** Each warp is bound
+   to one TMEM sub-partition (warp 0 → DPs 0..31, warp 1 → 32..63,
+   etc.). The M=64 cta_group::1 atom places valid M at DPs
+   `{0..15, 32..47, 64..79, 96..111}`, so 4 warps are required for
+   BlockM=64. Forces `WarpShape::M = 16` (test config:
+   `block_shape=(64,64,64), warp_shape=(16,64,64)`). Each warp's
+   `tcgen05.ld` reads its sub-partition's first 16 DPs; lanes 16..31
+   skip the write. ~50% t2r bandwidth on the table; switching to
+   `tcgen05.ld.16x256b.x{N/8}` (which has a 16-DP atom that matches
+   exactly) would recover it. Deferred -- correctness first.
+
+3. **A's SMEM swizzle aligned to canonical UMMA layout.** `loader_a`
+   was emitting Swizzle<2,4,3> with a 128-byte row stride -- not a
+   valid CUTE canonical UMMA-K layout. When `kUseTcgen05`, `loader_a`
+   now uses Swizzle<3,4,3> (`row & 7`), matching the descriptor's
+   `layout_type = SWIZZLE_128B` expectation. WMMA path is unchanged
+   (gated on `kUseTcgen05`); smoke tests still pass.
+
+## Phase B.10 follow-up: scatter mapping is partly correct, partly wrong
+
+Sentinel test (write `bf16(n+1)` via the scatter; effective N at MMA col
+n = `output[m, n] / sum_A[m] - 1`) reveals:
+
+```
+col   0   1   2     3   4     5     6   7     8   9   10    11  12    13     14  15
+n_eff -1  -1  -0.66 -1  -0.33 5.11  -1  7.15  -1  -1  0.68  -1  1.02  13.26  -1  15.31
+```
+
+* Cols 5, 7, 13, 15 see roughly correct N values (5, 7, 13, 15). ✓
+* Cols 2, 4, 10, 12 see small / wrong N values.
+* Cols 0, 1, 3, 6, 8, 9, 11, 14 output 0 → those N positions never get
+  scattered.
+
+So humming's `dequant_b1248` output is **NOT** quite in the m16n8k16
+BLayout `((4,8),(2,2)):((16,1),(8,64))` I derived. The actual ordering
+is some permutation that lands certain N values at "wrong" K positions
+within the m16n8 fragment.
+
+The cleanest path forward: **bypass humming's `dequant_b1248` for the
+TCGEN05 path and write a per-thread dequant whose (thread, output) →
+(n, k) mapping we control.** Each thread t handles 2 N-rows × 16 K
+(per K-iter), reading int4 codes from `regs_qb[buffer_id]` and emitting
+bf16 directly into the K-major SMEM. This was the original Option B3
+plan; the validated epilogue + 4-warp t2r means it'll go end-to-end
+this time.
+
+Sketch (BlockN=64, K-iter=16, 4 warps × 32 lanes = 128 threads, each
+covering 2 N-rows × 16 K per K-iter):
+```
+For lane t in warp w (effective N range = [w*16, (w+1)*16)):
+  for n_in_warp in {2t % 16, 2t % 16 + 1}:   // wraps within warp's 16 N
+    for k in [0, 16):
+      code = extract_int4(regs_qb, n=warp*16 + n_in_warp, k=k_base+k)
+      bf16 = uint_to_f16(code, zp)
+      write bf16 to smem.b_dequant[(warp*16 + n_in_warp), k_base+k]
+```
+
+But the trick is to figure out which `regs_qb` byte corresponds to
+which logical (n, k). humming's repack puts codes in `loader_b`'s
+expected order, which depends on the mma.sync fragment layout. We'd
+need to either:
+
+* (a) Read `smem.b` directly (bypassing `loader_b`), with our own
+  understanding of the repack format. Brittle.
+* (b) Re-use `dequant_b1248`'s output but RE-MAP via a permutation
+  table derived from this sentinel test. The cols `{5, 7, 13, 15}`
+  that come out right give us 4 known-good mapping points; with the
+  remaining 12 cols of varying correctness we can derive the full
+  permutation.
+
+Better: write a small CUDA microkernel that dequants ONE int4 code
+according to humming's loader+dequant pipeline AND records the
+(thread, output) → (n_global, k_global) mapping. Print and use that
+to construct the correct scatter formula.
+
+## Earlier next step: fix the (m16n8 fragment) → (K-major SMEM) scatter in TCGEN05::run
+
+The 8-of-16 N coverage pattern (mod-16 positions `{2, 4, 5, 7, 10, 12,
+13, 15}` are nonzero, `{0, 1, 3, 6, 8, 9, 11, 14}` are zero) is
+diagnostic of a per-thread mapping bug. The most likely cause:
+humming's `dequant_b1248` output ordering doesn't quite match the
+m16n8k16 CUTLASS `BLayout` `((4,8),(2,2)):((16,1),(8,64))` derivation
+the scatter currently uses.
+
+Path forward:
+
+1. **Verify the (thread, reg_index) → (n, k) mapping empirically.**
+   Replace `regs_b_bf16[reg_index]` in the scatter with a sentinel
+   `bf16(n*1000 + k)` -- output should equal
+   `sum_k A[m, k] * (1000*n + k) = 1000*n*sum_A[m] + sum_k A[m,k]*k`.
+   If the test passes, our (n, k) mapping is correct and the dequant
+   value-ordering is the bug. If it fails, the mapping is wrong.
+
+2. **Cross-check with `humming/include/humming/mma/wmma.cuh`**: its
+   `transform_b` uses the same dequant output via `MmaOpClass::fma`
+   (mma.sync m16n8k16). If we mirror the `regs_b` ordering it consumes,
+   the scatter is guaranteed to match the m16n8 BLayout that mma.sync
+   actually agrees with.
+
+3. Alternative: **bypass humming's `dequant_b1248`** and write a
+   per-thread row-major dequant for the tcgen05 path (Option B3 from
+   the earlier workbook iteration). With validated epilogue and t2r,
+   this is now feasible -- the bottleneck was always the epilogue.
+
+After scatter is correct, the remaining items (none blocking) are:
+
+* **`tcgen05.ld.16x256b.x8`** to recover the t2r bandwidth (see #2 above).
+* **TMEM column count is hardcoded `tcgen05_alloc<128>`** at kernel
+  entry. Constexpr-derive from `BlockN * cd_bits / 32`.
+* **`K_WARPS = 1` constraint** is OK for prototype; eventually want a
+  tcgen05-aware mainloop.
+* **Sm100Heuristics inherits Sm89.** Once TCGEN05 is correct, write
+  real heuristics: TCGEN05 above a per-shape batch crossover, MMA below.
+
+## Previous status: epilogue + N-warp blocker (Phase B.8/B.9 prelude)
 
 * **Epilogue is correct** (validated with `TCGEN05_DEBUG_SKIP_TMEM`,
   scratch[i] = lane*1000 + i sentinel). The custom path in
