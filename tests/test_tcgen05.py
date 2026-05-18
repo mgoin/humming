@@ -65,16 +65,12 @@ def test_tcgen05_w4a16_smallest():
     shape_n = 128
     shape_k = 256
 
-    # Phase B.6 smallest viable: BlockM=64 (min for tcgen05.mma.kind::f16),
-    # BlockN=64 keeps per-warp t2r footprint reasonable, BlockK=128.
-    # Warp shape MUST have WarpK == BlockK for the tcgen05 path: the
-    # mainloop's mma.run(iter_id) iterates over `warp_k_iters` K-chunks
-    # per stage, and a single tcgen05.mma issue at the CTA level covers
-    # one K-chunk only. With WarpK < BlockK, multiple K-warps would each
-    # issue their own tcgen05.mma into the same TMEM column = corrupt
-    # accumulation. Forcing K_WARPS = 1 sidesteps this.
-    block_shape = (64, 64, 128)
-    warp_shape = (64, 64, 128)
+    # Phase B.7: shrink BlockK to 64 bf16 so row stride = 128 B matches
+    # the 128B-swizzle atom width exactly. With BlockK > 64 (= 128 B per
+    # row), each actual SMEM row would span 2 swizzle-rows and the
+    # canonical UMMA-K layout no longer applies cleanly.
+    block_shape = (64, 64, 64)
+    warp_shape = (64, 64, 64)
 
     # Build the W4A16 problem identical to what test_shape uses.
     random_weight = generate_random_weight(

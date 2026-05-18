@@ -522,34 +522,49 @@ SASS structure of the working kernel:
   * `UTCBAR` = tcgen05.commit -- emitted (one per output tile)
   * `UTCATOMSWS.AND` = tcgen05.dealloc -- emitted (1x)
 
-First-correctness output (B2 r2s lane mapping not yet wired):
+First-correctness output trajectory across iterations:
 
 ```
-out[:2,:4] = [[-8.94, -9.94, -5.25, -13.88], [1.46, -1.00, -5.72, -0.96]]
-ref[:2,:4] = [[-3.67, -1.89, -48.25, -15.25], [1.75,  6.28,  2.47,  3.03]]
-|out|: mean ~ 10.2, max ~ 136
-|ref|: mean ~ 10.2, max ~ 136
-out nonzero frac: 0.94
-85 % of elements mismatched, max abs err 136
+1. Naive thread-contig r2s, swizzle=128 desc, BlockK=128:
+   out|: mean 10.2  nonzero_frac 0.94  mismatch 85%  max_err 136
+   -> magnitudes match, values scrambled
+
+2. m16n8k16-fragment-aware r2s + swizzle XOR, BlockK=128:
+   out|: mean ~10  nonzero_frac 0.11  mismatch 84%  max_err 133
+   -> only ~10% of slots written, suggests bad XOR or stride math
+
+3. Same r2s + BlockK=64 (row stride = swizzle atom = 128 B):
+   out|: nonzero_frac 0.06  mismatch 85%  max_err 153
+   -> still scrambled; smaller BlockK didn't help, so the XOR
+      formula or the m16n8k16 fragment (n,k) mapping itself
+      is the bug, not the row-stride mismatch.
 ```
 
-So magnitudes are right (mean & max ~match), 94 % of outputs are
-non-zero, but the values are scrambled. This is exactly the
-"data is correct but in the wrong (row, col)" signal we predicted
-for the swizzle=128 B descriptor reading data that the r2s wrote
-in row-major.
+Diagnosis: the canonical UMMA-K B128 layout is
+`Swizzle<3,4,3> o ((8,n),2):((8,SBO),1)` and our handcoded swizzle
+formula `linear ^ (((linear >> 7) & 0x7) << 4)` isn't producing the
+addresses the descriptor actually reads from. Need to verify by
+emitting a sentinel pattern (thread_id << 16 | reg_index) from the
+r2s, dumping the SMEM through TMA store, and comparing against the
+descriptor's read order. That's the next-iteration step.
 
-Remaining work for correctness:
+Two structural options still on the table:
 
-8. **r2s lane mapping for B.** With swizzle=128 on the descriptor,
-   the MMA expects SMEM laid out per `Swizzle<3,4,3> o ((8,n),2):
-   ((8,SBO),1)`. The naive thread-contiguous r2s writes row-major.
-   Need to either:
-   (a) compute per-thread (row, col) from the m16n8k16 B-fragment
-       layout and scatter to swizzled positions, OR
-   (b) bypass humming's fragment-layout dequant and dequant directly
-       into row-major SMEM with the descriptor set to swizzle=NONE.
-   (b) is cleaner code-wise; (a) keeps humming's dequant unchanged.
+8a. **Stick with humming's fragment-layout dequant + swizzled r2s.**
+    Need to instrument with sentinel writes and decode the actual
+    (n, k) the descriptor maps each lane to. Possibly the m16n8k16
+    BLayout mapping from CUTLASS `mma_traits_sm80.hpp:89` is
+    correct on its own but our additional swizzle XOR is wrong.
+    Try removing the XOR and switching descriptor to swizzle=NONE
+    -- if that's still scrambled, the fragment math itself needs
+    work.
+
+8b. **Switch to a row-major-direct dequant.** Skip humming's
+    `dequant<>` for B and write per-thread row-major output (still
+    using `dequant_single` for the bit-twiddling). Cleaner, lets us
+    pick swizzle=NONE or swizzle=128 freely. User's preference is
+    to keep humming's dequant if not "excessively slow" so we hold
+    on this.
 
 9. **TMEM column count hardcoded 128.** Constexpr-derive from
    `BlockN * cd_bits / 32` -- once correctness lands.

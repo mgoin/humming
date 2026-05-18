@@ -132,37 +132,11 @@ public:
       arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
     }
 
-    // r2s: copy the per-thread dequantised tile back to smem.b_dequant.
-    //
-    // TODO(sm100): the lane->SMEM mapping below is a placeholder that
-    // assigns each thread a contiguous int4 (16 B) slot. The resulting
-    // SMEM layout is NOT swizzle-correct for tcgen05.mma -- the kernel
-    // will compile and run, but produce wrong output. Phase B.4's job is
-    // to either (a) match the tcgen05.mma SMEM swizzle here, or
-    // (b) build a custom swizzle descriptor that consumes this layout.
-    // Tracked in workbook.md.
-    constexpr uint32_t kBytesPerThread = sizeof(regs_b_tmp[0]);
-    static_assert(kBytesPerThread >= 4, "r2s tile must be non-empty");
-    if constexpr (kBytesPerThread >= 16) {
-      // 16B-aligned -- emit int4 stores.
-      int4 *smem_b_dst = reinterpret_cast<int4 *>(
-          &smem.b_dequant[buffer_id][0]) + threadIdx.x * (kBytesPerThread / 16);
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < kBytesPerThread / 16; i++) {
-        smem_b_dst[i] = reinterpret_cast<int4 *>(regs_b_ptr)[i];
-      }
-    } else {
-      // Tiny per-thread tile -- fall back to uint32 stores.
-      uint32_t *smem_b_dst = reinterpret_cast<uint32_t *>(
-          &smem.b_dequant[buffer_id][0]) + threadIdx.x * (kBytesPerThread / 4);
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < kBytesPerThread / 4; i++) {
-        smem_b_dst[i] = regs_b_ptr[i];
-      }
-    }
-
-    // Fence so subsequent SMEM reads on the tcgen05 path observe the
-    // r2s; the issuing warp will pair this with a __syncthreads().
+    // We defer the r2s of dequantised bf16 to TCGEN05::run(iter_id),
+    // because the r2s needs the K-iter index to compute SMEM offsets
+    // (one K-chunk of 16 bf16 per K-iter) and `transform_b` only
+    // receives buffer_id from humming's mainloop. The dequant results
+    // stay in `regs_b_tmp[buffer_id]` until run() consumes them.
     fence_proxy_async_shared_cta();
   }
 
@@ -170,6 +144,57 @@ public:
   void run(uint32_t stage_id, uint32_t iter_id) {
     uint32_t buffer_id = iter_id % 2;
 
+    // ---- r2s of the just-dequantised B tile to swizzled SMEM ----
+    // transform_b left bf16 in `regs_b_tmp[buffer_id]` in mma.sync
+    // m16n8k16 B-fragment layout. We now scatter to smem.b_dequant
+    // at logical (n, k) positions matching the tcgen05.mma descriptor
+    // (128B-swizzled, K-major).
+    //
+    // Per-thread fragment layout (from CUTLASS mma_traits_sm80.hpp:89,
+    // BLayout = `((4,8),(2,2)):((16,1),(8,64))`):
+    //   v=0: (n = t%4 + frag_n_base + 0, k = t/4 + 0)
+    //   v=1: (n = t%4 + frag_n_base + 0, k = t/4 + 8)
+    //   v=2: (n = t%4 + frag_n_base + 4, k = t/4 + 0)
+    //   v=3: (n = t%4 + frag_n_base + 4, k = t/4 + 8)
+    // humming's `dequant<>` call with j=i covers TWO consecutive
+    // n-frags of 8N each (= 16 N) starting at n = i*16. So per dequant
+    // call the 8 outputs span:
+    //   bf16[0..3]: frag_n_base = i*16     (first 8 N)
+    //   bf16[4..7]: frag_n_base = i*16+8   (next 8 N)
+    {
+      __nv_bfloat16 *smem_b_bf16 =
+          reinterpret_cast<__nv_bfloat16 *>(&smem.b_dequant[buffer_id][0]);
+      __nv_bfloat16 *regs_b_bf16 =
+          reinterpret_cast<__nv_bfloat16 *>(regs_b_tmp[buffer_id]);
+      // Row stride of the (BlockN, BlockK) bf16 tile, in bytes.
+      constexpr uint32_t kRowBytes = BlockShape::K * sizeof(__nv_bfloat16);
+      uint32_t t = threadIdx.x % 32u;
+      uint32_t k_base = iter_id * kPartMmaShapeK;  // global K-base for this iter
+      constexpr uint32_t kBf16PerCall = 8;
+      constexpr uint32_t kCalls = WarpShape::N / 16u;
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < kCalls; i++) {
+        PRAGMA_UNROLL
+        for (uint32_t v = 0; v < kBf16PerCall; v++) {
+          uint32_t frag_id = v / 4u;
+          uint32_t v_in_frag = v % 4u;
+          uint32_t n =
+              i * 16u + frag_id * 8u + (t % 4u) + (v_in_frag / 2u) * 4u;
+          uint32_t k = k_base + (t / 4u) + (v_in_frag % 2u) * 8u;
+          uint32_t linear_bytes = n * kRowBytes + k * sizeof(__nv_bfloat16);
+          // Swizzle<3,4,3>: XOR bits [7,10) of the linear address into
+          // the atom-within-row position (bits [4,7)).
+          uint32_t xor_mask = ((linear_bytes >> 7) & 0x7u) << 4;
+          uint32_t swizzled = linear_bytes ^ xor_mask;
+          uint32_t reg_index = i * kBf16PerCall + v;
+          smem_b_bf16[swizzled / sizeof(__nv_bfloat16)] = regs_b_bf16[reg_index];
+        }
+      }
+    }
+    fence_proxy_async_shared_cta();
+    __syncthreads();
+
+    // ---- now build descriptors + issue tcgen05.mma ----
     // A descriptor reads from smem.a[stage_id]; advance the pointer by
     // `iter_id * kKChunkUint128` so this MMA processes K-chunk `iter_id`.
     // (tcgen05.mma.kind::f16 only sees 16 bf16 of K per issue; the
