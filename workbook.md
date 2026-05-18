@@ -1,676 +1,253 @@
 # sm100-tcgen05 workbook
 
-Living scratchpad for context that's expensive to rediscover. Not a design doc
-— just facts, file:line pointers, and decisions. Append, don't delete.
+Living scratchpad. **What's true now**, not the journey. Append when you learn
+something the next session would otherwise rediscover; trim when it becomes
+stale.
 
-## What this branch is
+## Goal
 
-Adding a real Blackwell (sm_100) `tcgen05.mma` path to humming. Target dtype
-combo for the first cut: **bf16 activations × int4 weights, AWQ-style
-(unsigned codes + per-group zero-point + bf16 scales, group_size=128)**.
+Add a Blackwell `tcgen05.mma` (UMMA) path to humming for **bf16 × uint4
+W4A16, AWQ-style (per-group bf16 scales + uint4 zero-points,
+group_size=128)**. Beat humming's existing mma.sync path at compute-bound
+batch sizes; coexist with it below the crossover.
 
-Branch: `sm100-tcgen05` on `origin = github.com/mgoin/humming`.
-Upstream: `github.com/inclusionAI/humming`. Branched from mgoin/main commit
-`a6455de` (the venv's editable install already points here, so changes are
-live without reinstall).
+## Environment
 
-Hardware: B300 SXM6 (cc 10.0, `--gpu-architecture=sm_103a`), CUDA 13.0,
-torch from `~/code/vllm/.venv`, `nvidia-cutlass-dsl==4.5.1`. Build of the
-extension happens through `~/.cache/torch_extensions/py312_cu130/humming_extension/`
-+ `~/.humming/cache/<hash>/kernel.cu` for JIT'd device code.
+Branch `sm100-tcgen05` on `origin = github.com/mgoin/humming`. Editable
+install at `/home/mgoin/code/vllm/humming/`; changes are live without
+reinstall (`ops/utils.py` patched so `humming.__file__` works even when
+cwd is the vllm root).
 
-## Why we're here
+* Hardware: B300 SXM6, cc 10.3, compile target `sm_103a`.
+* Toolchain: CUDA 13.0, `nvidia-cutlass-dsl==4.5.1`, torch in
+  `~/code/vllm/.venv`. NVRTC for the device code; the JIT cache lives at
+  `~/.humming/cache/<hash>/{kernel.cu, kernel.cubin, signature.txt}`.
+* `rm -rf ~/.humming/cache` to force a fresh JIT after include-only edits.
 
-`humming/config/config.py:76-78` is the smoking gun:
+## Reference perf bar (Sablefish on the same B300)
 
-```python
-if self.mma_type is None:
-    sm_version = torch.cuda.get_device_capability()[0]
-    self.mma_type = MmaType.WGMMA if sm_version == 9 else MmaType.MMA
+Sablefish (CUTLASS tcgen05 W4A16, AWQ int4 gs=128) is the upstream we have
+to land at or below. `tests/baseline_phaseA.tsv` is the full table; the
+headline:
+
+| shape (N×K)     | B=16 hum vs sf | B=4096 hum vs sf |
+| --------------- | -------------- | ---------------- |
+| 4096 × 4096     |  16 / 41 µs    | 343 / 228 µs     |
+| 14336 × 4096    |  17 / 62 µs    | 1163 / 651 µs    |
+| 28672 × 8192    |  58 / 194 µs   | 4536 / 2363 µs   |
+| 8192 × 28672    |  60 / 181 µs   | 4486 / 2289 µs   |
+
+Humming today **wins at low batch** (mma.sync's small fragments are
+inherently better for skinny GEMM) and roughly matches Marlin at high
+batch but loses to Sablefish by ~2×. The tcgen05 path is meant to close
+that high-batch gap.
+
+## Where tcgen05 fits in humming
+
+`MmaType.TCGEN05` joins `MMA` and `WGMMA` in the enum. Three-way dispatch
+at `humming.cuh:71` and `humming_ws.cuh:71` (just the non-WS path is wired
+end-to-end; the WS path inherits the dispatch but is unexercised).
+
+```
+A: bf16 ────────────TMA/cp.async────►  smem.a            ──┐
+                                                           │
+B: uint4 codes ─────TMA/cp.async────►  smem.b   ──S2R──►  regs_qb ──dequant──► regs_b_tmp
+                                                           │
+                                                           │  (NEW for TCGEN05)
+                                                           │  r2s with swizzle scatter
+                                                           ▼
+                                                       smem.b_dequant (bf16)
+                                                           │
+A from smem.a, B from smem.b_dequant ──tcgen05.mma──► TMEM accumulator
+                                                           │
+                                                           ▼
+                                       t2r (tcgen05.ld) ──► RMEM ──► existing epilogue
 ```
 
-So on B300 (cc 10) → `MmaType.MMA` → emits `mma.sync.aligned.m16n8k16` (Ada).
-Every cached kernel under `~/.humming/cache/*/kernel.cu` confirms this — no
-wgmma, no tcgen05, despite compiling for `sm_103a`.
+Files we added or extended (everything else is unchanged):
 
-**Additional discovery on this fork** (mgoin/humming, commit `a6455de`):
+| file                                            | role                                                        |
+| ----------------------------------------------- | ----------------------------------------------------------- |
+| `humming/config/enum.py`                        | `MmaType.TCGEN05`                                          |
+| `humming/config/mma.py`                         | `Tcgen05OpClassImpl` (codegen for the C++ MmaOpClass)      |
+| `humming/config/config.py`                      | `TuningConfig.use_tcgen05`                                 |
+| `humming/tune/sm100.py`                         | `Sm100Heuristics` (still inherits Sm89 -- no real tcgen05 tuning yet) |
+| `humming/tune/__init__.py`                      | Register 100/101/102/103 in `heuristics_map`               |
+| `humming/utils/device.py`                       | sm100 entries in `ops_map` for compute-bound threshold     |
+| `humming/kernel/humming.py`                     | TCGEN05 MmaShape = (BlockM, BlockN, 16); warp_shape threaded into `from_config` |
+| `humming/ops/utils.py`                          | CWD-resilient `humming.__file__` fallback                  |
+| `include/humming/utils/enum.cuh`                | C++ `MmaType::TCGEN05`                                     |
+| `include/humming/utils/storage.cuh`             | `b_dequant`, `tcgen05_tmem_col`, `tcgen05_mbar` under `IF_USE_TCGEN05` |
+| `include/humming/utils/ptx/tcgen05.cuh`         | PTX wrappers (alloc/dealloc/mma/commit/ld/fence/instr_desc/smem_desc/elect_one_sync) |
+| `include/humming/mma/tcgen05_mma.cuh`           | `TCGEN05` class (zero_accum / transform_b / run / final_regs_c_as_ptr) |
+| `include/humming/kernel/humming.cuh`            | TMEM alloc + mbar init at entry; dealloc at exit           |
+| `include/humming/kernel/humming_ws.cuh`         | Three-way dispatch (only)                                  |
+| `include/humming/epilogue/{smem_reducer,smem_writer}.cuh` | `MAX(.., 1)` guards on WGMMA_CRegistersArrayType so it stays well-formed when MmaShape == BlockShape |
+| `tests/test_sm100_smoke.py`                     | HummingLayer-level smoke through heuristic dispatch         |
+| `tests/test_tcgen05.py`                         | Direct-construct TCGEN05 correctness test (xfail)          |
+| `tests/bench_w4a16_baseline.py`                 | 3-way perf vs Sablefish + Marlin                           |
+| `tests/baseline_phaseA.tsv`                     | Snapshot of humming's mma.sync perf, pre-tcgen05            |
 
-* No `tune/sm100.py` exists. Upstream `inclusionAI/humming` recently added a
-  placeholder stub but mgoin/main is older. Files present in `tune/`:
-  `__init__.py base.py sm75.py sm8x.py sm90.py sm90_h20.py`.
-* `tune/__init__.py:21-28` defines `heuristics_map` with keys `{75, 80,
-  86, 87, 89, 90}` — no 100, no 103.
-* `get_heuristics_class()` (line 36-44) computes `sm_version = cc[0]*10 +
-  cc[1]`. On B300 that's `10*10 + 3 = 103`. Result: **`heuristics_map[103]`
-  raises `KeyError`. The normal Python entry point through humming's
-  heuristics is broken on B300 today.**
-* The ~100 cached kernels in `~/.humming/cache/` were generated by
-  benchmark scripts that bypass `get_heuristics_class()` and construct
-  configs by hand. The kernel codegen path itself works — only the
-  heuristic dispatch is missing.
-* `config.py:78`'s `cc[0]` check uses just the *major* (10), so on cc 10.x
-  it falls through to `MmaType.MMA` (mma.sync). That part works.
+## Current state
 
-So the smallest "humming on B300 doesn't blow up" change is:
-1. Add `Sm100Heuristics` to `tune/`
-2. Register `100` (and maybe `103`) in `heuristics_map`
+* `tests/test_sm100_smoke.py` (10 tests, mma.sync path): **passes**.
+* `tests/baseline_phaseA.tsv`: humming's existing path is healthy across all
+  shapes/batches, sets the floor we need to keep.
+* `tests/test_tcgen05.py` (TCGEN05 path): **xfail**. Kernel compiles, runs
+  to completion in ~4 s, output magnitudes match reference, but values are
+  scrambled (~85% mismatched). Layout bug in the bf16 r2s.
 
-We'll piggyback on that addition with the TCGEN05 path.
+## Sharp edges already paid for (don't re-discover)
 
-## Reference data (from Sablefish, same hw, against `marlin_gemm` AWQ)
+Each of these cost real hours and would burn the next session if
+forgotten. Citations are to the file in our checkout or the original spec.
 
-Lives at `~/code/vllm/.scratch/sablefish/`. Same B300, same AWQ int4 gs=128
-+ zp. The crossover where a CUTLASS-based tcgen05 W4A16 beats Marlin AWQ:
+* **SM100 SmemDescriptor layout != SM90's.** Bits and field meanings
+  rearranged. Use the bit-by-bit builder in
+  `include/humming/utils/ptx/tcgen05.cuh::tcgen05_smem_desc` (mirrors
+  CUTLASS `cute/arch/mma_sm100_desc.hpp:98`). Humming's existing
+  `make_wgmma_smem_desc` happens to produce a valid SM100 desc for
+  128 B swizzle by coincidence -- don't rely on that.
 
-| (N, K)         | crossover B  | sf @ B=4096 vs Marlin |
-| -------------- | ------------ | --------------------- |
-| 4096 × 4096    | ~700         | 1.55×                 |
-| 14336 × 4096   | ~200         | 1.89×                 |
-| 4096 × 14336   | ~400         | 1.64×                 |
-| 8192 × 8192    | ~600         | 1.99×                 |
-| 28672 × 8192   | ~150         | 2.00×                 |
-| 8192 × 28672   | ~400         | 2.01×                 |
+* **`.sync.aligned` vs `elect_one_sync` is a hard split:**
 
-That's the bar humming-tcgen05 has to clear once it works. Below the
-crossover, we keep `MmaType.MMA` (mma.sync, what humming does today).
+  | instr                                           | issue style                |
+  | ----------------------------------------------- | -------------------------- |
+  | `tcgen05.alloc / dealloc / relinquish`          | all 32 warp lanes together |
+  | `tcgen05.mma`                                   | `elect_one_sync` (one thread) |
+  | `tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64` | `elect_one_sync` |
 
-Sablefish floor at B≤32 is ~40 µs of kernel-launch + pipeline ramp. Marlin
-runs the same problem in ~13 µs. **Don't expect tcgen05 to beat mma.sync at
-very low batch — that's not the goal.**
+  Mix them and the kernel hangs. The `.shared::cluster` qualifier on
+  commit is mandatory (omitting it ptxas-accepts but the mbar never
+  arrives). PTX 8.7 §9.7.16 is the spec; CUTLASS `cutlass/arch/barrier.h:770`
+  is the canonical example.
 
-## Humming pack format (reusable as-is)
+* **`tcgen05.mma` requires the `{m0,m1,m2,m3}` mask operand.** Real form:
+  `tcgen05.mma.cta_group::1.kind::f16 [d], a, b, idesc, {0,0,0,0}, p`.
+  Without the mask, ptxas parses to a different variant; the hardware
+  silently misinterprets and the MMA never retires (post-MMA mbar wait
+  spins forever). CUTLASS `cute/arch/mma_sm100_umma.hpp:111`.
 
-Dense, tile-invariant. `kernel/pack_weight.cuh:5-27` packs 32 weights into
-`kNumBits` uint32s with low-bit-first ordering:
+* **`tcgen05.mma.kind::f16` is K=16 per issue.** The mainloop must drive
+  multiple issues with the SMEM pointer advancing by `iter_id *
+  kKChunkUint128` (= 2 uint128_t = 16 bf16) to cover BlockK. Otherwise
+  every iter re-multiplies the same first K-chunk.
 
-```c
-for (i = 0; i < 32; i++) {
-  uint32_t index = i * kNumBits;
-  uint32_t word_idx = index / 32;
-  uint32_t bit_offset = index % 32;
-  out_arr[word_idx] |= (in_arr[i] & mask) << bit_offset;
-}
-```
+* **TMEM accumulators are CTA-level.** Humming's existing mainloop
+  assumes per-warp K-reduction via multiple K-warps; for TCGEN05 you
+  must force `K_WARPS = 1` (i.e. `WarpShape::K == BlockShape::K`).
+  Otherwise multiple K-warps stomp on the same TMEM column.
 
-`ops/weight.py:39-53` exposes a `pack_weight(tensor, num_bits)` torch op.
-Output shape is `inputs.shape[:-1] + (last_dim * num_bits // 32,)`.
+* **Instruction descriptor bit fields** (from CUTLASS
+  `mma_sm100_desc.hpp:412`): `c_format` at bits [4,6), `a/b_format` at
+  [7,13), `n_dim` at [17,23) (= N>>3), `m_dim` at [24,29) (= M>>4).
+  The handcoded `union Tcgen05InstrDescriptor` in our `ptx/tcgen05.cuh`
+  is the safe API; use it, don't reach for shift arithmetic.
 
-For int4: a logical `(N, K)` weight matrix lands as `(N, K/8)` uint32 (=
-`(N, K/2)` uint8). **No Marlin-style tile permutation**, so TMA descriptors
-can load contiguous K bytes directly. ✓ Reusable for tcgen05 path.
+* **MmaType.TCGEN05 codegen needs `warp_shape`.** Per-thread `CRegisters`
+  count is `warp_M * warp_N * cd_bits / (32*32)`, not whole-block. Threaded
+  through `MmaOpClass.from_config(warp_shape=...)` in `kernel/humming.py`.
 
-Scales (`kernel/quant_weight.cuh:159-246`):
-- Per-group `(N, K/group_size)` float32 (or e8m0 compressed uint8).
-- Per-channel `(N,)` if `group_size==0`.
-
-Zero-points: `(N, K/group_size)` uint32, one int (4 bits valid) per group.
-
-## Today's dequant flow (sm89 / mma.sync path)
-
-Walkthrough using `humming.cuh:101-155` as the driver. Key call sites:
-
-1. **G2S into SMEM(int4)** — `producer.load_stage()` at `humming.cuh:111,114`.
-   Uses cp.async (today) or TMA (`TuningConfig::kUseTmaB`, currently false
-   on sm100). Lands raw 4-bit codes in `smem.b[stage_id]` as `int4 *`.
-2. **S2R into RMEM(int4)** — `s2r_pipe.load_stage_iter()` at
-   `humming.cuh:118,130`. `s2r_loader/loader_b.cuh:27-56` does the actual
-   copy into `regs_qb[buffer_id]`.
-3. **Dequant in RMEM** — `mma.transform_b(buffer_id)` at `humming.cuh:119,143`.
-   `mma/wmma.cuh:44-65` calls `dequant<ElementB, ElementA, kHasZeroPoint,
-   kIsFpZeroPoint, ...>(regs_qb, regs_b, i, zp_vals)`. Lives in
-   `datatype/dequant.cuh:104` (dispatch) and
-   `datatype/dequant_single.cuh:26-44` (int4→bf16 with zp/scale fused).
-4. **mma.sync** — `mma.run(stage_id, iter_id)` at `humming.cuh:131`.
-   `mma/wmma.cuh:67-81` triple-nested over `(k, j, m)` calling
-   `MmaOpClass::fma(regs_a, regs_b, regs_c, regs_c)`.
-
-**Dequantised bf16 lives in `regs_b` registers, not SMEM.** That's the
-incompatibility with tcgen05.
-
-## MMA interface contract (what TCGEN05 must implement)
-
-Interface used by `humming.cuh` and `humming_ws.cuh`:
-
-| method                            | purpose                                                                | callers                          |
-| --------------------------------- | ---------------------------------------------------------------------- | -------------------------------- |
-| `MMA(smem, arith)`                | construct from shared storage + arith helper                           | `humming.cuh:92`                 |
-| `zero_accum()`                    | zero the accumulator at start of each tile                             | `humming.cuh:102`                |
-| `transform_b(buffer_id)`          | dequant int4 → bf16 (whatever path) for the buffer about to be MMA'd   | `humming.cuh:119,143`            |
-| `run(stage_id, iter_id)`          | emit the actual MMA instructions for this K-iteration                  | `humming.cuh:131`                |
-| `final_regs_c_as_ptr<T>()`        | return accumulator as `T*` for the epilogue (epilogue reads RMEM)      | `humming.cuh:154`                |
-
-The dispatch line to extend: `humming.cuh:71` and `humming_ws.cuh:71`:
-
-```cpp
-using MMA = std::conditional_t<MmaOpClass::kMmaType == MmaType::WGMMA, WGMMA, WMMA>;
-```
-
-becomes three-way:
-
-```cpp
-using MMA = std::conditional_t<MmaOpClass::kMmaType == MmaType::TCGEN05, TCGEN05,
-              std::conditional_t<MmaOpClass::kMmaType == MmaType::WGMMA, WGMMA, WMMA>>;
-```
-
-**Strategy: hide TMEM entirely inside the TCGEN05 class.** Specifically:
-
-* `transform_b(buffer_id)`: do the same in-register dequant as WMMA (reuse
-  `dequant<Int4, BFloat16, ...>`), then `r2s` the resulting bf16 into a
-  bf16 SMEM staging buffer that lives in `SharedStorage`. This is the
-  ONE new SMEM hop we're adding.
-* `run(stage_id, iter_id)`: issue `tcgen05.mma.cta_group::1.kind::f16` from
-  SMEM A descriptor + SMEM bf16-staging descriptor → TMEM column.
-* `final_regs_c_as_ptr<T>()`: do `tcgen05.ld` + `tcgen05.commit` here,
-  return a normal RMEM `float*`. Epilogue sees the same RMEM accumulator
-  it does today.
-
-If that contract holds, the `epilogue/*`, `arith/*`, `scheduler.cuh`, and
-the outer mainloop in `humming.cuh` need no changes beyond the one-line
-dispatch.
-
-The risk: the existing `s2r_pipe.load_stage_iter()` also loads A into RMEM
-(via `s2r_loader/loader_a.cuh`). For tcgen05, A must stay in SMEM. Options:
-
-* (a) Keep s2r-of-A in place. tcgen05 reads A from SMEM directly via
-  descriptor; the RMEM copy is wasted but tolerable. Profile first.
-* (b) Branch the s2r pipeline on `TuningConfig::kUseTcgen05` (or a similar
-  flag) to skip A's RMEM hop. More invasive.
-
-Decision: start with (a). If profiling shows the wasted A→RMEM eats real
-time, switch to (b).
-
-## Net-new files for Phase 0
-
-| file                                                 | role                                                    |
-| ---------------------------------------------------- | ------------------------------------------------------- |
-| `include/humming/utils/ptx/tcgen05.cuh`              | PTX wrappers: `tcgen05.alloc/dealloc/commit/mma/ld`     |
-| `include/humming/mma/tcgen05_mma.cuh`                | `TCGEN05` template (mirrors `WMMA`/`WGMMA`)             |
-| `include/humming/memory/r2s_writer_b.cuh`            | r2s of dequantised bf16 from RMEM → SMEM staging buffer |
-
-In-place edits:
-
-| file                              | change                                                                          |
-| --------------------------------- | ------------------------------------------------------------------------------- |
-| `config/enum.py:4-6`              | Add `TCGEN05 = "tcgen05"` to `MmaType`                                          |
-| `config/mma.py:283-291`           | Add `Tcgen05OpClassImpl`                                                        |
-| `kernel/humming.cuh:71`           | Three-way dispatch (see above)                                                  |
-| `kernel/humming_ws.cuh:71`        | Same                                                                            |
-| `tune/sm100.py`                   | Real heuristics: return MMA below crossover, TCGEN05 above. Stop inheriting sm8x in the long run. |
-| `layer.py:79-84`                  | Add `MmaType.TCGEN05` branch                                                    |
-
-SMEM accounting: new bf16 staging buffer of `BlockShape::N × BlockShape::K
-× 2 B / num_stages`. For (256, 128, 128) at num_stages=2 that's 32 KB on
-top of existing. Budget is 227 KB, so the headroom is real but not infinite.
-First cut, cap `BlockShape::N ≤ 128, BlockShape::K ≤ 128` to be safe.
-
-## Phase 0 target config (smallest viable instance)
-
-* Kernel: `kernel/humming.cuh` (NOT `_ws.cuh`) — no warp specialisation
-* MMA: `tcgen05.mma.cta_group::1.kind::f16`, instruction shape `m64n128k16`
-* TuningConfig: `kNumStages=2`, no cluster, `kUseTmaA=true`, `kUseTmaB=true`,
-  `kUseTmaBS=true`, `kUseTmaBZP=true` (TMA is necessary for tcgen05 to issue
-  efficient SMEM loads; cp.async path stays for sm_89 fallback)
-* LayerConfig: bf16 A, int4 B (signed-shifted: `codes_u - 8`), bf16 C, fp32
-  acc, `kHasZeroPoint=true`, `kIsFpZeroPoint=false`,
-  `kIsGroupWeightScale=true`, `kWeightScaleGroupSize=128`
-* Problem shape for first correctness test: `(N=4096, K=4096, M=128)`. Big
-  enough to exercise multiple K-stages, small enough to debug.
-
-Pass criterion: produces same output as
-`vllm.model_executor.layers.quantization.utils.marlin_utils_test.awq_marlin_quantize`
-+ `ops.marlin_gemm` within bf16 ULP (max abs err ~ 4e-3 on the test problem).
-
-Once it works, profile vs Sablefish and Marlin to see where the overhead
-lives. We expect three sources of overhead by construction:
-
-1. **bf16 SMEM staging** — extra SMEM traffic on every K-iter. Could be
-   ~5–10 % of total at B=4096. Worth measuring before optimising away.
-2. **Wasted A→RMEM** if we stick with option (a) above.
-3. **tcgen05 launch + ramp** — the ~40 µs floor we saw in Sablefish. Not
-   fixable at the kernel level; that's the dispatch heuristic's job.
-
-## How to build / run
-
-After edits to humming sources, the editable install rebuilds the C++ launcher
-on next import. For pure-CUDA-template changes (i.e. inside `include/humming/`),
-the JIT'd device code rebuilds on next problem-shape invocation. To force a
-full rebuild:
+## How to drive the test
 
 ```bash
-rm -rf ~/.cache/torch_extensions/py312_cu130/humming_extension/
-rm -rf ~/.humming/tmp/ ~/.humming/cache/
+# Smoke (heuristic dispatch path, mma.sync):
+.venv/bin/python -m pytest humming/tests/test_sm100_smoke.py
+
+# TCGEN05 path (xfail-marked until correctness lands):
+rm -rf ~/.humming/cache    # forces fresh JIT after include edits
+.venv/bin/python -m pytest humming/tests/test_tcgen05.py -s --runxfail
+
+# Perf baseline (current humming + Sablefish + Marlin):
+.venv/bin/python humming/tests/bench_w4a16_baseline.py
 ```
 
-Test entrypoint TBD — looks like `humming/ops/` has the Python API; planning
-to write a small smoke test under `humming/tests/` that calls our new
-TCGEN05 config explicitly (bypassing the heuristic, to validate the path
-before tuning).
+JIT recompile is ~10 s with empty cache, ~0 s with hits.
 
-## Work log
+## Debug tools that work here
 
-### Phase A — heuristic dispatch on B300
+* **`compute-sanitizer --tool synccheck`** -- catches "Missing wait" on
+  mbarrier mismatches, points at the failing SMEM address. Useful when
+  the kernel hangs at a mbar.
+* **`compute-sanitizer --tool memcheck`** -- illegal-memory access
+  detection; less helpful when the hang has no actual memory error.
+* **`nvidia-smi pmon -c 1 -s u`** during a hang -- if SM utilisation is
+  99%, the kernel is in a busy loop (mbar_wait, most likely). If 0,
+  the kernel never launched or is stuck on a synchronous host call.
+* **Source-level bisection** -- comment out individual tcgen05 ops
+  (`alloc`, `mma`, `commit`, `wait`, `t2r`, `dealloc`) and see which
+  body causes the hang. Each compile-test cycle is ~10 s, faster than
+  reasoning about which instruction is "supposed to" be wrong.
+* **`cuobjdump --dump-sass ~/.humming/cache/<hash>/kernel.cubin`** to
+  confirm `UTCATOMSWS` (alloc/dealloc), `UTCHMMA` (mma), `UTCBAR`
+  (commit) are emitted in the expected count.
+* **`nvcc --gpu-architecture=sm_103a -std=c++17 -ptx -I... kernel.cu`**
+  to regenerate PTX from a cached kernel.cu for manual inspection.
+  (cuobjdump can't disassemble SASS for instructions newer than its
+  build; PTX always works.)
 
-* Added `tune/sm100.py` (`Sm100Heuristics` inheriting `Sm89Heuristics`,
-  227 KiB SMEM, `sm_version=100`). Registered 100/101/102/103 in
-  `tune/__init__.py:heuristics_map` so B100 (cc 10.0), B200 (10.0), B300
-  (10.3) all resolve. **Decision: inherit from Sm89 not write fresh.** Sm89
-  is the most semantically-similar code path (mma.sync m16n8k16, cp.async,
-  fp32 acc), and the cached kernel.cu artifacts already used those
-  configs successfully on B300 via hand-built bench scripts. Sticking with
-  Sm89's tuning curve gives us a known-good baseline; we tune Phase A
-  configs in-place later if needed.
-* Found and patched a second `KeyError: 103` in `utils/device.py:48`
-  (`ops_map[sm_version]` inside `estimate_tensorcore_max_tops`). Added
-  100/101/102/103 entries reusing sm90's 4096 ops/clock/SM — only used by
-  `estimate_compute_bound_threshold`, which is an order-of-magnitude
-  heuristic so the conservative value is fine.
-* Editable install was stale (`humming.__file__` returned `None` because
-  Python's cwd-based namespace shadowed the meta-path finder when invoked
-  from `~/code/vllm`). Reinstall via `uv pip install -e . --no-deps` fixed
-  it.
+## Next step: r2s correctness
 
-### Phase A perf observations (BIG surprise)
+The kernel runs; only the layout of the bf16 staging in `smem.b_dequant`
+is wrong. Output magnitudes match the reference exactly (mean ≈ max ≈
+mean(|ref|)), only **which** (n, k) each value ends up at is broken.
 
-Humming's existing mma.sync path is much stronger on B300 than I expected.
-On AWQ W4A16 (uint4 + gs=128 + zp, bf16 in/out), 6-shape sweep saved at
-`tests/baseline_phaseA.tsv`. Headline pattern (N×K=4096²):
+Current attempt in `mma/tcgen05_mma.cuh::TCGEN05::run`: scatters each
+thread's 32 bf16/K-iter to addresses computed from CUTLASS's m16n8k16
+`BLayout = ((4,8),(2,2)):((16,1),(8,64))` (per
+`mma_traits_sm80.hpp:89`), with `Swizzle<3,4,3>` XOR on the linear byte
+offset. The math evidently doesn't match what tcgen05.mma reads through
+its descriptor.
 
-```
-   B   humming us  Sablefish us  Marlin us | sf/hum  mar/hum
-  16        15.6         40.7        13.0   2.61x    0.83x
- 256        35.4         43.6        33.5   1.23x    0.95x
-1024        94.8         68.6        96.6   0.72x    1.02x
-4096       343.1        227.5       351.0   0.66x    1.02x
-```
+The concrete next step is **sentinel-write validation**:
 
-Same pattern on all 6 LLM shapes. Highlights from the big-shape end:
+1. Replace the r2s payload with `((threadIdx.x & 0xff) << 8) |
+   (reg_index & 0xff)` (or similar) instead of the dequantised bf16.
+2. Run a single MMA with **A = identity (just the bf16 representation
+   of 1.0 along the diagonal)**, so each output `C[m,n] = sum_k A[m,k]
+   * B[k,n] = B[m,n]`. The accumulator is then a direct view of how
+   the hardware interpreted the B SMEM layout.
+3. Read back via t2r and dump to GMEM. For each `out[m,n]` value,
+   decode `(thread, reg)` and compare against expected.
+4. The diff between expected and actual gives us the exact mapping.
 
-```
-        B          shape    hum_us   sf_us  mar_us | sf/hum
-     4096   14336 ×  4096   1163     651    1230     0.56x
-     4096    4096 × 14336   1140     708    1159     0.62x
-     4096   28672 ×  8192   4536    2363    4717     0.52x   ← biggest single win
-     4096    8192 × 28672   4486    2289    4616     0.51x
-```
+Once the mapping is corrected, the kernel should produce correct bf16
+output. **Don't try more blind XOR/stride permutations.** Each iteration
+without instrumentation has not converged so far.
 
-* **Low batch (B ≤ ~64)**: humming wins. mma.sync's small fragments give it
-  the same low-batch advantage Marlin has, AND humming is within 30 % of
-  Marlin — close enough that the existing path is "the answer" here.
-* **Mid batch (B ≈ 256)**: humming ≈ Marlin. Sablefish is behind by ~25 %.
-* **High batch (B ≥ 1024)**: Sablefish wins by 1.3–1.5×. Humming ≈ Marlin.
+After correctness lands, the remaining items (none of them blocking
+correctness) are:
 
-What this means for Phase B:
+* **TMEM column count is hardcoded `tcgen05_alloc<128>`** at kernel
+  entry. Constexpr-derive from `BlockN * cd_bits / 32`.
+* **`K_WARPS = 1` constraint.** OK for prototype; eventually want a
+  tcgen05-aware mainloop that doesn't rely on humming's per-warp
+  K-reduction.
+* **Sm100Heuristics inherits Sm89.** Returns mma.sync configs. Once
+  TCGEN05 is correct, write real heuristics: TCGEN05 above a per-shape
+  batch crossover, MMA below.
 
-1. The **only place tcgen05 buys anything is B ≥ ~512** (and humming has to
-   stay below Sablefish's ~227 µs at B=4096 to be worth shipping).
-2. **Humming at B=16 (18.6 µs) is already very close to Marlin (12.7 µs)** —
-   we don't need to write a new low-batch kernel. The crossover heuristic
-   in `Sm100Heuristics.get_config*` should keep returning the existing
-   mma.sync configs below the crossover.
-3. The Phase B target is a ~115 µs speedup vs humming-today at the largest
-   shapes (humming 343 → tcgen05 ~227 us at B=4096, N=K=4096), or roughly
-   matching Sablefish's curve. Full bench across the 6 LLM shapes saved at
-   `/tmp/humming_baseline.tsv` for diffing.
-
-### Phase A files added / changed
-
-* `humming/tune/sm100.py` (new)
-* `humming/tune/__init__.py` (heuristics_map registration)
-* `humming/utils/device.py` (ops_map entries)
-* `tests/test_sm100_smoke.py` (new — exercises HummingLayer through heuristics)
-* `tests/bench_w4a16_baseline.py` (new — 3-way perf comparison)
-* `tests/baseline_phaseA.tsv` (committed baseline numbers; diff against this for Phase C)
-
-### Phase B.1 — `MmaType.TCGEN05` enum + Python codegen scaffold
-
-* Added `TCGEN05 = "tcgen05"` to `MmaType` (Python `config/enum.py` + C++
-  `include/humming/utils/enum.cuh`).
-* `Tcgen05OpClassImpl` in `config/mma.py` — emits the `MmaShape` / type-bits /
-  `CRegisters` footprint but *does not* inline an `fma()` body. tcgen05.mma
-  takes a runtime instruction descriptor and operates on SMEM/TMEM, so the
-  emit happens inside `TCGEN05::run()` in the C++ side (see B.2b).
-* `MmaOpClass.from_config(MmaType.TCGEN05, ...)` returns the new impl.
-* **Nothing selects TCGEN05 yet.** Existing MMA/WGMMA dispatch lines (e.g.
-  `humming.cuh:71`) unchanged.
-
-### Phase B.2a — `utils/ptx/tcgen05.cuh` PTX wrappers (compile-verified)
-
-* New file `include/humming/utils/ptx/tcgen05.cuh` (~170 lines). Exposes:
-  - `tcgen05_alloc<NumColumns>(smem_addr_for_col_index)`
-  - `tcgen05_dealloc<NumColumns>(tmem_col_index)`
-  - `tcgen05_relinquish_alloc_permit()`
-  - `tcgen05_smem_desc<SwizzleBytes>(smem_ptr)` — same descriptor layout as
-    wgmma's `make_wgmma_smem_desc`; kept under a neutral name so the
-    tcgen05 path doesn't pull in the wgmma header.
-  - `tcgen05_instr_desc_bf16_bf16_f32(M, N)` — packs the instruction
-    descriptor bits per PTX ISA 8.7 §9.7.16.6.
-  - `tcgen05_mma_ss_bf16(d_tmem, a_desc, b_desc, idesc, scale_d)`
-  - `tcgen05_fence_view_async_tmem_store()`
-  - `tcgen05_ld_32x32b_x32(tmem_addr, uint32_t[32])` — t2r for the epilogue.
-* **Verified**: `nvcc -arch=sm_103a -std=c++17 -ptx` round-trip compiles
-  the wrappers through `ptxas` without errors. Test fixture (TODO: move
-  into `tests/`):
-  ```
-  /tmp/tcgen05_compile_check.cu  (a 50-line standalone TU)
-  ```
-  produces a 1.96 KB `.ptx` containing the expected `tcgen05.alloc /
-  tcgen05.mma.cta_group::1.kind::f16 / tcgen05.ld / tcgen05.dealloc`
-  instructions.
-
-* **Sharp edge found and recorded**: `tcgen05.commit` is **NOT** the
-  wgmma-style commit_group. Real form is
-  `tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [mbar_smem_addr]`
-  — completion is signaled via an *mbarrier*, not a numbered group. That
-  means:
-
-  > Adding tcgen05 commit/wait properly requires allocating an mbarrier
-  > in `SharedStorage` and threading its SMEM address into the commit
-  > callsite. Humming's `g2s_pipeline` / `ConsumerPipeline` already
-  > manage mbarriers for cp.async/TMA loads, so the right move is to add
-  > another mbarrier slot alongside them (NOT to invent a parallel
-  > scheme).
-
-  The wrapper is `#if 0`'d out in tcgen05.cuh under
-  `tcgen05_commit_to_mbarrier`; a clear TODO comment marks the work.
-
-### Phase B.2b/B.3 — TCGEN05 class wired in and compiling
-
-* **`mma/tcgen05_mma.cuh`** (new, ~200 lines): `TCGEN05` template with
-  same interface as `WMMA` / `WGMMA`. Three-way dispatch wired through
-  `humming.cuh:71` and `humming_ws.cuh:71`.
-* **`utils/storage.cuh`**: added `b_dequant[kNumStages][kStageSizeBDequant]`
-  bf16 staging buffer, `tcgen05_tmem_col`, and `tcgen05_mbar` SMEM
-  slots, all under `IF_USE_TCGEN05(...)`.
-* **`config/config.py`**: `use_tcgen05: bool` field on TuningConfig
-  (auto-generates `HUMMING_USE_TCGEN05` macro + `kUseTcgen05` constexpr).
-* **`kernel/humming.cuh`**: `tcgen05_alloc<128>` at kernel entry,
-  matching `tcgen05_dealloc<128>` + `relinquish_alloc_permit` at exit;
-  both gated by `if constexpr (MmaOpClass::kMmaType == MmaType::TCGEN05)`.
-* **`ops/utils.py`**: fixed `humming.__file__ = None` resolution bug
-  (running from repo root made cwd shadow the editable install; falls
-  back to `__path__[0]` now).
-
-**The TCGEN05 path compiles end-to-end through nvrtc/ptxas.** Existing
-mma.sync and wgmma tests (`test_shape`, `test_sm100_smoke`) still pass
-after the dispatch edits, confirming the non-tcgen05 paths are
-untouched.
-
-### Phase B.4 — first correctness attempt
-
-`tests/test_tcgen05.py` exercises the smallest viable instance:
-  - `bf16 A x uint4 B`, gs=128, has_zero_point=True
-  - block (64, 128, 128), warp (64, 64, 32), num_stages=2, 1-CTA
-  - `mma_type='tcgen05'`, `use_tcgen05=True`
-
-Resolved this iteration:
-
-1. ~~**HANG AT LAUNCH**~~ — Fixed by (a) wiring the mbarrier-based
-   `tcgen05.commit.cta_group::1.mbarrier::arrive::one` →
-   `mbarrier.try_wait.parity` round-trip in `TCGEN05::final_regs_c_as_ptr`
-   and (b) realising the entire `tcgen05.*` family is `.sync.aligned`
-   PTX, i.e. **must be issued warp-uniformly**. Single-thread guards
-   (`if (threadIdx.x == 0)`) caused warp-0 divergence → undefined. Fix:
-   `if (threadIdx.x < 32)` so all 32 threads of warp 0 issue together.
-   Applies to `tcgen05_alloc / mma / commit / relinquish / dealloc`.
-2. **Instruction-descriptor encoding was off** in the original
-   handcoded layout — the actual SM100 `InstrDescriptor` bit fields
-   (per CUTLASS `include/cute/arch/mma_sm100_desc.hpp:412`):
-   ```
-   c_format @ bits [4,6)   (F32 = 1)
-   a_format @ bits [7,10)  (BF16 = 1)
-   b_format @ bits [10,13)
-   n_dim    @ bits [17,23) -- N >> 3 (N=128 → 16)
-   m_dim    @ bits [24,29) -- M >> 4 (M=64 → 4, M=128 → 8)
-   ```
-   I had c_format at bit 9, a_format at bit 12, M-shift by 5 instead of
-   4 -- malformed across the board. Now using a CUTLASS-style bitfield
-   `union Tcgen05InstrDescriptor` in `utils/ptx/tcgen05.cuh` so we don't
-   re-make this class of mistake.
-3. **Codegen emitted wrong MmaShape.** `kernel/humming.py:185` only
-   special-cased WGMMA, so TCGEN05 fell through to `mma_shape_m=16,
-   n=8, k=variable` -- the mma.sync shape. Fixed to make tcgen05 use
-   `MmaShape = (BlockM, BlockN, 16)` since tcgen05.mma covers the full
-   block tile per issue.
-4. **Epilogue array typedefs were tcgen05-hostile.**
-   `epilogue/smem_reducer.cuh:19` and `smem_writer.cuh:86` declared
-   `WGMMA_CRegistersArrayType = CRegisters[WarpN*4/MmaM][WarpM/MmaN]`
-   without `MAX(.., 1)`. When `MmaShape == BlockShape` (tcgen05 case)
-   the second dimension is 0 → "the size of an array must be greater
-   than zero" compile error even though the typedef isn't selected by
-   the `std::conditional_t`. Fixed with `MAX(.., 1)` guards.
-
-Also resolved this iteration:
-
-5. **CRegisters now sized per-warp, not whole-tile.**
-   `Tcgen05OpClassImpl` accepts `warp_shape` (threaded through
-   `MmaOpClass.from_config(warp_shape=...)` in `kernel/humming.py`).
-   `reg_cd_count = warp_M * warp_N * cd_bits / (32 * 32)`. Dropped
-   the `regs_c[2]` double-buffer (tcgen05 doesn't need WMMA's
-   scale-gating buffer) — single `regs_c`.
-6. **t2r loop with multi-call coverage** of the per-warp slice.
-   `final_regs_c_as_ptr` issues `kCallsM * kCallsN` invocations of
-   `tcgen05_ld_32x32b_x32`, each covering a 32x32 fp32 chunk, with
-   TMEM addresses encoded as `(col | row<<16)` and per-warp base
-   offsets `(m_warp_id * WarpM, n_warp_id * WarpN)`. Compile-time
-   `static_assert(sizeof(regs_c) == kCallsM*kCallsN*32*4)` catches
-   codegen-to-runtime drift.
-
-Phase B.6 progress this iteration (multiple real bugs fixed by reading
-CUTLASS source):
-
-7a. ~~**SmemDescriptor stride fields**~~ FIXED. SM100 layout is at
-    bits [61,63] (3-bit, not 2-bit like SM90), and SBO is
-    tile-dependent (= `BlockKElems` uint128_t units), not
-    swizzle-dependent. New parameterised
-    `tcgen05_smem_desc<SwizzleBytes, BlockKElems>` mirrors CUTLASS's
-    `make_umma_desc`. Bit-by-bit construction, not the
-    happy-coincidence-of-overlap that humming's wgmma helper relied on.
-
-7b. ~~**K-iter pointer advancement**~~ FIXED. `TCGEN05::run(iter_id)`
-    now advances `smem_ptr += iter_id * kKChunkUint128` (2 uint128_t
-    per .kind::f16 iter). Was always reading the first K-chunk.
-
-7c. ~~**WarpShape::K mismatch**~~ FIXED. Test now uses
-    `WarpShape::K == BlockShape::K = 128`, so `K_WARPS = 1` and one
-    warp drives all K-iters. tcgen05.mma is CTA-level so multiple
-    K-warps would stomp on the same TMEM column.
-
-7d. ~~**Missing `.shared::cluster` qualifier on `tcgen05.commit`**~~
-    FIXED. CUTLASS uses
-    `tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64`
-    -- I had the unqualified `.b64`. ptxas accepts both but hardware
-    treats them differently; without the qualifier the commit never
-    actually arrives on the mbar.
-
-Phase B.6 continued -- HANG RESOLVED by compute-sanitizer + bisection:
-
-7e. **Missing 128-bit mask operand on `tcgen05.mma`**. The real CUTLASS
-    asm (`cute/arch/mma_sm100_umma.hpp:111`) has a `{m0,m1,m2,m3}`
-    sparsity-disable mask before the predicate:
-    `tcgen05.mma.cta_group::1.kind::f16 [d], a, b, idesc, {0,0,0,0}, p`
-    My wrapper had `[d], a, b, idesc, p` -- ptxas accepted but the
-    hardware silently misinterprets and never retires. Found by
-    `compute-sanitizer --tool synccheck`, which fingered the post-MMA
-    `mbarrier_wait` as a "Missing wait".
-
-7f. **`.sync.aligned` instructions need WARP-UNIFORM execution, NOT
-    `elect_one_sync`.** This was the actual hang. Per PTX 8.7:
-       - `tcgen05.alloc.cta_group.sync.aligned`     -> all 32 lanes
-       - `tcgen05.dealloc.cta_group.sync.aligned`   -> all 32 lanes
-       - `tcgen05.relinquish_alloc_permit.cta_group.sync.aligned` -> all 32
-       - `tcgen05.mma.cta_group.kind::<...>`        -> elect_one_sync (CUTLASS)
-       - `tcgen05.commit.cta_group.mbarrier::arrive::one` -> elect_one_sync
-    My initial `if (threadIdx.x < 32 && elect_one_sync())` for alloc
-    diverged the warp -> spin. Reverted alloc/dealloc/relinquish to
-    `if (threadIdx.x < 32)` (all 32 lanes); kept elect_one_sync for
-    mma/commit. **Kernel now runs to completion.**
-
-Debug methodology that found this (worth reusing):
-  1. `compute-sanitizer --tool synccheck` -> caught "Missing wait" at
-     a specific SMEM address corresponding to the tcgen05_mbar.
-  2. `nvidia-smi pmon` during the hang -> SM utilisation 99 % meant
-     busy-loop, not idle-wait -> mbarrier polling.
-  3. Bisection: temporarily replace `final_regs_c_as_ptr` body with
-     `__syncthreads + return`. Still hung. Then bypass `run()`. Still
-     hung. Then bypass alloc/dealloc. **Completed.** So the alloc was
-     the culprit, not anything in the math/wait path.
-
-SASS structure of the working kernel:
-  * `UTCATOMSWS.FIND_AND_SET.ALIGN` = tcgen05.alloc -- emitted (1x)
-  * `UTCHMMA` = tcgen05.mma -- emitted (16x for K_block=128 / K_inst=16
-    * 2 outer K-stages from problem_K=256)
-  * `UTCBAR` = tcgen05.commit -- emitted (one per output tile)
-  * `UTCATOMSWS.AND` = tcgen05.dealloc -- emitted (1x)
-
-First-correctness output trajectory across iterations:
+## Quick file nav
 
 ```
-1. Naive thread-contig r2s, swizzle=128 desc, BlockK=128:
-   out|: mean 10.2  nonzero_frac 0.94  mismatch 85%  max_err 136
-   -> magnitudes match, values scrambled
+/home/mgoin/code/vllm/humming/
+├── workbook.md                                                   ← you are here
+├── humming/include/humming/kernel/humming.cuh                    ← mainloop driver
+├── humming/include/humming/mma/{wmma,wgmma,tcgen05_mma}.cuh      ← MMA classes
+├── humming/include/humming/utils/ptx/tcgen05.cuh                 ← PTX wrappers
+├── humming/include/humming/utils/storage.cuh                     ← SharedStorage
+├── humming/config/{enum,config,mma}.py                           ← codegen
+├── humming/kernel/humming.py                                     ← MMA op-class selection
+├── humming/tune/sm100.py                                         ← heuristics
+└── tests/{test_sm100_smoke,test_tcgen05,bench_w4a16_baseline}.py
 
-2. m16n8k16-fragment-aware r2s + swizzle XOR, BlockK=128:
-   out|: mean ~10  nonzero_frac 0.11  mismatch 84%  max_err 133
-   -> only ~10% of slots written, suggests bad XOR or stride math
+/home/mgoin/code/vllm/.scratch/sablefish/                         ← perf reference
+├── final_bench.py                                                ← target numbers
+└── README.md                                                     ← CUTLASS baseline plumbing
 
-3. Same r2s + BlockK=64 (row stride = swizzle atom = 128 B):
-   out|: nonzero_frac 0.06  mismatch 85%  max_err 153
-   -> still scrambled; smaller BlockK didn't help, so the XOR
-      formula or the m16n8k16 fragment (n,k) mapping itself
-      is the bug, not the row-stride mismatch.
-```
-
-Diagnosis: the canonical UMMA-K B128 layout is
-`Swizzle<3,4,3> o ((8,n),2):((8,SBO),1)` and our handcoded swizzle
-formula `linear ^ (((linear >> 7) & 0x7) << 4)` isn't producing the
-addresses the descriptor actually reads from. Need to verify by
-emitting a sentinel pattern (thread_id << 16 | reg_index) from the
-r2s, dumping the SMEM through TMA store, and comparing against the
-descriptor's read order. That's the next-iteration step.
-
-Two structural options still on the table:
-
-8a. **Stick with humming's fragment-layout dequant + swizzled r2s.**
-    Need to instrument with sentinel writes and decode the actual
-    (n, k) the descriptor maps each lane to. Possibly the m16n8k16
-    BLayout mapping from CUTLASS `mma_traits_sm80.hpp:89` is
-    correct on its own but our additional swizzle XOR is wrong.
-    Try removing the XOR and switching descriptor to swizzle=NONE
-    -- if that's still scrambled, the fragment math itself needs
-    work.
-
-8b. **Switch to a row-major-direct dequant.** Skip humming's
-    `dequant<>` for B and write per-thread row-major output (still
-    using `dequant_single` for the bit-twiddling). Cleaner, lets us
-    pick swizzle=NONE or swizzle=128 freely. User's preference is
-    to keep humming's dequant if not "excessively slow" so we hold
-    on this.
-
-9. **TMEM column count hardcoded 128.** Constexpr-derive from
-   `BlockN * cd_bits / 32` -- once correctness lands.
-
-10. **K-warp distribution.** Forced `WarpShape::K = BlockShape::K`
-    so K_WARPS = 1. Not a correctness blocker but limits perf;
-    eventually want a tcgen05-aware mainloop that doesn't rely on
-    humming's implicit per-warp K reduction.
-
-Concrete next-iteration plan:
-
-  a. Copy CUTLASS's `make_smem_desc` builder out of
-     `cute/arch/mma_sm100_umma.hpp` (any cutlass-src checkout under
-     `.deps/`). It takes a layout explicitly and produces a uint64
-     with LDB/SDB correct for both swizzled and non-swizzled tiles.
-  b. Pick a path:
-       * **B2 (recommended)**: use `swizzle=128` everywhere, refactor
-         `transform_b`'s r2s to write the 128B-swizzled layout.
-         More arithmetic but matches what humming's existing TMA
-         path already does for A, so we share the descriptor math.
-       * **B1 (smaller delta)**: keep `swizzle=0` but compute the
-         non-swizzled LDB/SDB correctly from BlockShape.
-  c. With (a) + (b), the kernel should at minimum *run to
-     completion*; expect wrong math the first time, iterate.
-
-Test (`tests/test_tcgen05.py::test_tcgen05_w4a16_smallest`) is
-xfail-marked. Block shape is now (64, 64, 128), warp (64, 64, 32):
-1 epilogue warp, 4 t2r calls covering the warp's 64x64 slice.
-
-### Phase B.2 (still pending) — `mma/tcgen05_mma.cuh`
-
-The `TCGEN05` MMA class. Mirrors the `WMMA` / `WGMMA` shape. Roughly:
-
-```
-struct TCGEN05 {
-  // members
-  SharedStorage& smem;
-  ArithClass& arith;
-  uint32_t regs_qb[2][...];                   // int4 codes loaded by S2R
-  uint32_t tmem_col_base;                     // TMEM allocation start
-  uint32_t mbar_smem_addr;                    // for commit_to_mbarrier
-  typename MmaOpClass::CRegisters regs_c[2][...][...];  // post-t2r RMEM
-
-  // interface (matches WMMA/WGMMA)
-  void zero_accum();        // zero TMEM tile via tcgen05.mma scale_d=0?
-                            // or just set scale_d=false on first issue
-  void transform_b(buffer_id);  // dequant + r2s into smem.b_bf16_staging
-  void run(stage_id, iter_id);  // issue tcgen05.mma (single instr per K-blk)
-  uint32_t* final_regs_c_as_ptr();  // t2r from TMEM into regs_c, return ptr
-};
-```
-
-Open structural questions:
-1. **SMEM bf16 staging buffer** — add `smem.b_bf16_staging[NumStages][...]`
-   to `utils/storage.cuh::SharedStorage`. Sized as `BlockN × BlockK × 2 B
-   / num_stages`. For (M=128, N=128, K=128) at num_stages=2 that's 32 KB
-   per stage = 64 KB total. Fits comfortably in the 227 KiB budget.
-2. **TMEM allocation site** — must happen in the kernel entry (one warp
-   issues `tcgen05.alloc<N>`, all warps sync before reading the col
-   index). Probably belongs in `humming.cuh` body just before
-   `while (scheduler.get_next_block())`, before `mma.zero_accum()`.
-3. **Where does `tcgen05_fence` live?** — at the end of every k-iter
-   `mma.run()`, before the next `transform_b` reads the SMEM staging
-   buffer. Should be inside `TCGEN05::run()`.
-4. **A operand handling** — for W4A16 with bf16 A, A is *already* in SMEM
-   (after the cp.async/TMA G2S step). The existing `s2r_pipe` also pulls
-   it into `regs_a` for the WMMA path; for TCGEN05 we ignore that and
-   build a `tcgen05_smem_desc` for `smem.a[stage_id]` directly. Wasted
-   reg-load on a hop tcgen05 doesn't use — workbook decision is to leave
-   it for v1 and profile.
-
-## Open questions to revisit
-
-## Open questions to revisit
-
-1. **One mainloop file vs. two?** Sticking with the existing `humming.cuh`
-   (single dispatch) is preferable for code reuse, but if the s2r/r2s
-   pattern forces too many `constexpr if` branches, we fork to
-   `kernel/humming_tcgen05.cuh`. Decide after Phase 0 compiles.
-2. **`cta_group::1` first, `::2` later?** Yes — 2-CTA needs cluster
-   coordination that humming's scheduler doesn't issue today.
-3. **TMEM lifecycle** — alloc at kernel start, free before exit. Where
-   does that bookkeeping live? Probably in `humming.cuh` (kernel entry/exit)
-   not the `TCGEN05` class. May need a small `tmem_storage.cuh`.
-4. **e8m0 fused scales (`kUseFusedE8m0Scale`)** — humming has a fused-scale
-   path for mxfp4. Out of scope for Phase 0, but the dequant kernel exposes
-   it through the same `transform_b` interface so it should land cleanly
-   once Phase 0 works.
-
-## File locations (quick nav)
-
-```
-/home/mgoin/code/vllm/humming/                                  ← this repo
-├── workbook.md                                                  ← you are here
-├── humming/include/humming/kernel/humming.cuh                   ← main driver
-├── humming/include/humming/kernel/humming_ws.cuh                ← warp-spec driver
-├── humming/include/humming/mma/wmma.cuh                         ← model for TCGEN05
-├── humming/include/humming/mma/wgmma.cuh                        ← model #2
-├── humming/include/humming/datatype/dequant*.cuh                ← int4→bf16 (reusable)
-├── humming/include/humming/kernel/pack_weight.cuh               ← pack format (reuse)
-├── humming/config/{enum,config,mma}.py                          ← MmaType, dispatch
-├── humming/tune/{sm89,sm90,sm100}.py                            ← heuristics
-└── humming/layer.py                                             ← Python layer
-
-/home/mgoin/code/vllm/.scratch/sablefish/                        ← reference impl
-├── sablefish.py                                                 ← CUTLASS-based ref
-├── final_bench.py                                               ← target perf numbers
-└── README.md                                                    ← Marlin baseline plumbing
+/home/mgoin/code/vllm/.deps/cutlass-src/include/cute/             ← spec reference
+├── arch/mma_sm100_desc.hpp                                       ← SmemDescriptor + InstrDescriptor
+├── arch/mma_sm100_umma.hpp                                       ← canonical SM100_MMA_*_SS callers
+├── arch/copy_sm100.hpp                                           ← TMEM_LOAD variants
+└── atom/mma_traits_sm80.hpp:78                                   ← m16n8k16 BLayout
 ```
