@@ -28,6 +28,7 @@
 //     the pipeline plumbing lands an mbarrier slot.
 //   * No accumulator double-buffering -- one TMEM region per CTA.
 
+#include <humming/arith/exp_offset.cuh>
 #include <humming/utils/all.cuh>
 #include <humming/utils/ptx/barrier.cuh>
 #include <humming/utils/ptx/shared.cuh>
@@ -561,6 +562,24 @@ public:
               f1 += __bfloat162float(smem_bias_bf16[n0 + 1u]);
             }
             __nv_bfloat162 v = __floats2bfloat162_rn(f0, f1);
+            // Epilogue residual exponent rescale (mirrors
+            // `EpilogueArithmetic::may_apply_on_smem_write` ->
+            // `apply_exp_offset()`): for dtype combos that need a
+            // total exp_offset > the mainloop's max_allowed_offset,
+            // the leftover lives in `kEpilogueExpOffset.x` and must
+            // be applied here before the bf16 lands in smem.reduce.
+            // WMMA/WGMMA pick this up via smem_writer; TCGEN05 bypasses
+            // smem_writer so we replicate the multiply inline.
+            // (`!kIsTensorWeightScale` mirrors the smem_writer guard
+            // -- for tensor_weight_scale the rescale is already folded
+            // into `gs` by `may_process_on_smem_write`.)
+            if constexpr (ArithClass::kEpilogueExpOffset.x
+                          && !LayerConfig::kIsTensorWeightScale) {
+              __nv_bfloat162 scale =
+                  prepare_exp_scale_factor<__nv_bfloat162,
+                                           ArithClass::kEpilogueExpOffset.x>();
+              v = __hmul2(v, scale);
+            }
             packed_u32[pair] = *reinterpret_cast<uint32_t *>(&v);
           }
           // gmem_writer.cuh:100-108 treats smem.reduce as 8-int4-wide

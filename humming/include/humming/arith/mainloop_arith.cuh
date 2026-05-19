@@ -42,6 +42,21 @@ private:
       ElementA, ElementB, ElementBS, kHasZeroPoint,
       kIsF16Accum, kIsGroupInputScale, kIsGroupOrBlockWeightScale>();
 
+public:
+  // Epilogue-side residual exponent offset. The mainloop applies
+  // `kExpOffset.x` to bring dequant output into the normal-bf16 range,
+  // but the full conversion exponent (`get_total_exp_offset`) may be
+  // larger than what max_allowed_offset permits in a single mainloop
+  // multiply. The leftover lives here and must be applied during the
+  // epilogue write to SMEM. The WMMA / WGMMA paths read this through
+  // `EpilogueArithmetic::kExpOffset.x` via `smem_writer`, but the
+  // TCGEN05 path bypasses smem_writer and reads this directly from
+  // ArithClass when building its final SMEM-write payload.
+  static constexpr uint2 kEpilogueExpOffset = get_epilogue_exp_offset<
+      ElementA, ElementB, ElementC, ElementBS, kHasZeroPoint,
+      kIsF16Accum, kIsGroupInputScale, kIsGroupOrBlockWeightScale>();
+private:
+
   static constexpr uint32_t kDequantBSBits = (ElementA::kBits < 16 && !kIsF16Accum) ? 32 : 16;
   static constexpr uint32_t kNumSubBlocksM = CEIL_DIV(WarpShape::M, 16);
   static constexpr uint32_t kNumSubBlocksN = WarpShape::N / 16;

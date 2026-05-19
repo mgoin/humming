@@ -88,6 +88,62 @@ Files we added or extended (everything else is unchanged):
 | `tests/bench_w4a16_baseline.py`                 | 3-way perf vs Sablefish + Marlin                           |
 | `tests/baseline_phaseA.tsv`                     | Snapshot of humming's mma.sync perf, pre-tcgen05            |
 
+## Phase B.30: dtype-sweep correctness — missing epilogue exp_offset rescale (2026-05-19)
+
+**TL;DR**: TCGEN05 was wrong for any (A, B) combo whose
+`get_epilogue_exp_offset` was non-zero. The mainloop rescale was correct,
+but TCGEN05's `final_regs_c_as_ptr()` writes directly into `smem.reduce`
+and bypasses `EpilogueSmemWriter`, which is where WMMA/WGMMA pick up the
+residual `kExpOffset.x` rescale (via `may_apply_on_smem_write` →
+`apply_exp_offset()`). Result: wrong by `2^kEpilogueExpOffset.x` for those
+combos. 64x for bf16×uint8(no_zp), 4-16x for bf16×{fp4e2m1, fp6e2m3,
+fp6e3m2}, etc.
+
+**Diagnosis path that worked** (so the next dtype regression doesn't
+re-do this from scratch):
+1. Added a tests/test_tcgen05_dtypes.py sweep across bf16/fp16 A × all
+   narrower B types. 4 bf16-A combos passed in WMMA but failed in
+   TCGEN05 (uint8 no_zp, fp4e2m1, fp6e2m3, fp6e3m2).
+2. Hypothesised dequant-output-layout differences. Confirmed false by
+   printf-dumping `regs_b_tmp` for thread 0 in both paths against a
+   deterministic weight pattern -- bit-identical between WMMA and
+   TCGEN05.
+3. Ran a `weight = const + small_pattern` smoke test: WMMA = expected
+   ref, TCGEN05 = ref / 64 for bf16×uint8 no_zp. The 64x = 2^6, which
+   matched `get_epilogue_exp_offset<bf16, uint8, bf16, false, false>.x`.
+
+**Fix** (commits: see git log):
+* `mainloop_arith.cuh`: expose `static constexpr uint2
+  kEpilogueExpOffset` so the TCGEN05 path can read what the epilogue
+  arith would have computed.
+* `tcgen05_mma.cuh::final_regs_c_as_ptr()`: after the f32→bf162 cast,
+  multiply by `prepare_exp_scale_factor<bf162, kEpilogueExpOffset.x>()`
+  when non-zero (and `!kIsTensorWeightScale`, mirroring the
+  `may_apply_on_smem_write` guard).
+
+**Coverage now**:
+* `tests/test_tcgen05_dtypes.py`: 12 passed / 5 skipped (humming
+  check_dtype rejects: signed-int B × fp A; uint with zp + kBits ≤ 6
+  requirement; etc) / 21 xfail (humming-level bugs that ALSO fail in
+  WMMA -- fp16-A entirely, bf16×uint{7,8}+zp).
+* The "humming-level" bucket isn't a TCGEN05 regression. The WMMA path
+  also produces wrong numbers vs the float reference humming builds in
+  `utils/weight.py::dequantize_weight`. Separate investigation needed in
+  humming itself before that group becomes testable.
+
+**Still NOT supported in TCGEN05's bypass-smem_writer path**:
+* `kIsChannelInputScale` (would need `may_apply_f32_on_smem_write` on
+  f32 before bf162 cast)
+* `kIsChannelWeightScale` (would need bs[col] multiply on bf162)
+* `kIsTensorWeightScale` (would need `gs * 2^kExpOffset.x` precompute +
+  bf162 multiply)
+* `kIsBlockWeightScale` (untested; should follow channel-weight-scale
+  pattern)
+* `kIsF16Accum` (the apply_exp_offset+bs+gs+bias ordering differs)
+These are not exercised by the current test suite. When the first
+caller asks for one of them, replicate the matching smem_writer branch
+into `final_regs_c_as_ptr()`.
+
 ## Current state (Phase B.14 / B.15 partial, 2026-05-19)
 
 * `tests/test_sm100_smoke.py` (10 tests, mma.sync path): **passes**.
