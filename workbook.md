@@ -153,11 +153,25 @@ doesn't model yet.
   kNumStages==2 so SMEM A isn't overwritten before the last K-iter's
   tcgen05.mma reads it via the SS descriptor.
 
-### Current perf bar (sm_103a, single CTA, no warp-spec, no TMA):
-TCGEN05 is correctly handling configurations across BlockShape ∈ {64,
-128} × {64, 128, 256} × {64, 128, 256}, but is consistently **2-3×
-SLOWER** than mma.sync at all measured shapes. Speedup peaks at 1.09×
-on one specific (m=512, n=256, k=1024, BlockN=128) point.
+### Current perf bar (sm_103a, single CTA, no warp-spec; Phase B.23):
+TCGEN05 correctness covers BlockShape ∈ {64, 128} × {64, 128, 256} ×
+{64, 128, 256}, kNumStages ∈ {2, 3, 4}, has_{zp, bias} ∈ {T, F}, TMA
+on/off. **Perf is 0.62-0.70× of mma.sync** at all measured shapes,
+down from the initial 0.37× ratio at the start of perf work.
+
+The B.21→B.23 perf rounds gave:
+  k=4096, BlockN=128: 114 us → 62 us (1.84× internal speedup)
+  ratio vs WMMA:      0.37× → 0.69× (gap shrunk from 2.7× to 1.45×)
+
+Optimization wins:
+- B.20a: skip s2r_loader_a (small win + cleaner code)
+- B.21: pack 2 bf16 per b32 SMEM store (1.5× win)
+- B.22: drop redundant fence_proxy_async_shared_cta (8-15% win)
+- B.23: drop per-`ni` fence in t2r (cleanliness, within noise)
+- kNumStages=3 (vs default 2): ~10% win at large k
+
+NUM_CTAS_PER_SM > 1 makes perf WORSE (tcgen05 reserves TMEM
+per-CTA; 2 CTAs/SM compete for TMEM allocation). Stay at 1.
 
 The naive 1-CTA implementation pays:
 * `__syncthreads` per K-iter (vs WMMA's per-stage)
