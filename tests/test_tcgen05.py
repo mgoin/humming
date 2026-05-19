@@ -306,15 +306,14 @@ def test_tcgen05_zero_point(has_zero_point):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="Phase B.15 open: BlockN>64 fails -- the multi-N-warp scatter "
-    "writes the right locations but tcgen05.mma reads back the wrong "
-    "half-tile (see workbook 'B.15 N>64'). Gated by static_assert in "
-    "tcgen05_mma.cuh.",
-    strict=False, run=False,
-)
 @pytest.mark.parametrize("block_n", [128, 256])
 def test_tcgen05_block_n_large(block_n):
+    """Phase B.16: BlockN > 64 works after the smem.reduce write fix.
+    The t2r write now uses gmem_writer's 8-int4-wide-row "section"
+    layout (section_idx = int4_col // 8, smem_row = section_idx *
+    BlockM + m_full) -- before this, BlockN=128 wrote 16-int4-wide
+    rows that gmem_writer reinterpreted as two BlockM-row sections,
+    producing the "N=64..127 mirrors N=0..63" symptom."""
     outputs, outputs_ref = _run_tcgen05(
         shape_m=128, shape_n=max(block_n, 128), shape_k=256,
         block_shape=(64, block_n, 64), warp_shape=(16, 64, 64),

@@ -47,6 +47,7 @@
 // #define TCGEN05_DEBUG_SCATTER_SENTINEL 1
 // #define TCGEN05_DEBUG_REGS_B_SENTINEL 1
 // #define TCGEN05_DEBUG_NO_SCATTER 1
+// #define TCGEN05_DEBUG_TMEM_DUMP 1
 // (the regs_qb alignas(16) fix above is the actual production change)
 
 
@@ -161,12 +162,19 @@ public:
   // silently producing wrong outputs.
   static_assert(BlockShape::M == 64,
                 "TCGEN05 path Phase B.15: only BlockM==64 is verified");
-  static_assert(BlockShape::N == 64,
-                "TCGEN05 path Phase B.15: only BlockN==64 is verified "
-                "(workbook 'B.15 N>64 / N<64 open')");
+  // BlockN ∈ {64, 128, 256}: BlockN=64 = single-N-warp config; BlockN
+  // >= 128 requires the section-aware smem.reduce write below to match
+  // gmem_writer's 8-int4-wide-row layout.
+  static_assert(BlockShape::N == 64 || BlockShape::N == 128
+                || BlockShape::N == 256,
+                "TCGEN05 path Phase B.15: BlockN must be 64, 128, or 256");
+  // WarpShape::N == 64 keeps `kIsWarpHalfGroup=false` in loader_b
+  // (true at WarpN == ElementA::kBits*2 == 32 -- unmodelled). With
+  // BlockN > 64 this gives multiple N-warps, which the scatter +
+  // smem.reduce write now both handle.
   static_assert(WarpShape::N == 64,
-                "TCGEN05 path Phase B.15: only WarpN==64 (single "
-                "N-warp) is verified");
+                "TCGEN05 path Phase B.15: WarpN<64 hits loader_b "
+                "half-group path (unmodelled in scatter)");
   static_assert(BlockShape::K == 64,
                 "TCGEN05 path Phase B.15: only BlockK==64 is verified "
                 "(workbook 'B.15 BlockK>64 open')");
@@ -441,10 +449,26 @@ public:
       uint32_t addr = base_addr + ni * 32u;
       tcgen05_ld_32x32b_x32(addr, tmp);
       tcgen05_fence_view_async_tmem_store();
+#ifdef TCGEN05_DEBUG_TMEM_DUMP
+      // Print tmp[0..3] (= C[M=laneid, N=n_base+ni*32 + 0..3]) for lane
+      // 0 of each warp. With A=delta(k=0) + SCATTER_SENTINEL, C[M=lane,
+      // N=n] should equal sentinel(n) = n+1. If TMEM has wrong values
+      // for n_warp_id==1, MMA's B-read is wrong; if TMEM is right but
+      // smem.reduce ends up wrong, the t2r-to-smem mapping is wrong.
+      if (laneid == 0 && blockIdx.x == 0 && blockIdx.y == 0
+          && m_warp_id == 0) {
+        uint32_t n0 = n_warp_id * WarpShape::N + ni * 32u;
+        float *t_f = reinterpret_cast<float *>(tmp);
+        printf("t2r warp=%u n_warp=%u ni=%u n_base=%u "
+               "tmp[0..3]=%.1f,%.1f,%.1f,%.1f tmp[28..31]=%.1f,%.1f,%.1f,%.1f\n",
+               warp_id, n_warp_id, ni, n0,
+               t_f[0], t_f[1], t_f[2], t_f[3],
+               t_f[28], t_f[29], t_f[30], t_f[31]);
+      }
+#endif
 #endif
       if (laneid < 16u) {
         uint32_t m_full = (m_warp_id * WarpShape::M) + laneid;
-        uint32_t row_xor = (m_full + smem_reduce_base) % 8u;
         uint32_t col_int4_base = (n_warp_id * WarpShape::N + ni * 32u) / 8u;
         PRAGMA_UNROLL
         for (uint32_t int4_in_quarter = 0; int4_in_quarter < 4u;
@@ -460,9 +484,22 @@ public:
             __nv_bfloat162 v = __floats2bfloat162_rn(f0, f1);
             packed_u32[pair] = *reinterpret_cast<uint32_t *>(&v);
           }
-          uint32_t int4_col = col_int4_base + int4_in_quarter;
-          uint32_t swizzled = int4_col ^ row_xor;
-          smem_reduce[m_full * kInt4ColsPerRow + swizzled] = packed;
+          // gmem_writer.cuh:100-108 treats smem.reduce as 8-int4-wide
+          // rows -- the "smem_row" coord is `gmem_row + (gmem_col / 8) *
+          // BlockM`, and the "smem_col" is `gmem_col % 8`. For BlockN<=
+          // 64 the high-section is empty and `m_full * kInt4ColsPerRow +
+          // int4_col` happened to collapse to the same offset; for
+          // BlockN > 64 we MUST split high-N int4 cols (8..15, 16..23,
+          // ...) into separate "rows" at offset (section_idx * BlockM
+          // + m_full) * 8 + section_col. Apply the gmem_writer XOR
+          // swizzle on the (smem_row, smem_col) coord, not on int4_col.
+          uint32_t int4_col_global = col_int4_base + int4_in_quarter;
+          uint32_t section_idx = int4_col_global / 8u;        // gmem_col / 8
+          uint32_t section_col = int4_col_global % 8u;        // gmem_col % 8
+          uint32_t smem_row = section_idx * BlockShape::M + m_full;
+          uint32_t row_xor = (smem_row + smem_reduce_base) % 8u;
+          uint32_t swizzled_col = section_col ^ row_xor;
+          smem_reduce[smem_row * 8u + swizzled_col] = packed;
         }
       }
     }
