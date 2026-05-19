@@ -92,13 +92,15 @@ class Sm100Heuristics(Sm89Heuristics):
             #
             #   BlockN=128: sweet spot. (BlockN=64 underuses each CTA;
             #     BlockN=256 saturates SMEM and loses occupancy.)
-            #   BlockK=64 at M=128 (single M-tile per CTA): the K-loop
-            #     pipeline depth matters more than larger MMA per
-            #     issue, so stages=4 + BlockK=64 wins by ~10% over
-            #     BlockK=128.
-            #   BlockK=128 at M >= 256: bigger MMA per issue halves
-            #     the K-iter count and wins 5-8% over BlockK=64. Fits
-            #     SMEM at stages=3 (227 KiB budget).
+            #   BlockK=128 + stages=3 is BEST whenever shape_k % 128
+            #     == 0 -- the bigger MMA per issue halves the K-iter
+            #     count and wins 3-8% over BlockK=64 across ALL
+            #     measured shapes / M values (including M=128 with a
+            #     single M-tile per CTA, where the noise in earlier
+            #     sweeps had pointed the other way; see B.28 clean
+            #     re-bench).
+            #   BlockK=64 + stages=4 is the fallback when shape_k
+            #     isn't divisible by 128.
             block_n = 128
             # shape_n must be a multiple of block_n; humming asserts
             # this in `check_shape`. Fall back to 64 if shape_n's only
@@ -119,7 +121,7 @@ class Sm100Heuristics(Sm89Heuristics):
             #   bk=64  -> stages=4 (≈ 192 KiB used)
             #   bk=128 -> stages=3 (≈ 272 KiB used; we use 227 KiB
             #             budget so bk=128 + stages=4 doesn't fit).
-            if shape_m >= 256 and meta.shape_k % 128 == 0:
+            if meta.shape_k % 128 == 0:
                 block_k = 128
                 num_stages = 3
             else:
