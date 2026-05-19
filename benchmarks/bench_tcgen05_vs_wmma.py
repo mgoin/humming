@@ -46,11 +46,12 @@ def time_kernel(launch_fn, warmup=10, iters=50):
 
 
 def build_launcher(shape_m, shape_n, shape_k, mma_type, block_m=64,
-                   block_n=128, num_stages=3, use_warp_spec=False):
+                   block_n=128, block_k=64, num_stages=3,
+                   use_warp_spec=False):
     if mma_type == "tcgen05":
         # TCGEN05 path: BlockM ∈ {64, 128}, WarpM = BlockM/4.
-        block_shape = (block_m, block_n, 64)
-        warp_shape = (block_m // 4, 64, 64)
+        block_shape = (block_m, block_n, block_k)
+        warp_shape = (block_m // 4, 64, block_k)
     else:
         block_shape = (block_m, block_n, 64)
         warp_shape = (16, 64, 64)
@@ -127,36 +128,44 @@ def fmt(t):
 
 
 def best_tcgen05(m, n, k):
-    """Pick the best TCGEN05 launcher across (block_m, use_warp_spec)."""
+    """Pick the best TCGEN05 launcher across (block_m, block_k,
+    use_warp_spec)."""
     candidates = []
     for bm in [64, 128] if m >= 128 else [64]:
-        for ws in [False, True]:
-            t = bench_one(m, n, k, "tcgen05", block_m=bm, use_warp_spec=ws)
-            if isinstance(t, float):
-                candidates.append((t, bm, ws))
+        for bk in [64, 128]:
+            if bk == 128 and k % 128 != 0:
+                continue
+            for ws in [False, True]:
+                # bk=128 + stages=4 exceeds SMEM budget at BlockN=128.
+                ns = 3 if bk == 128 else 4
+                t = bench_one(m, n, k, "tcgen05",
+                              block_m=bm, block_k=bk,
+                              num_stages=ns, use_warp_spec=ws)
+                if isinstance(t, float):
+                    candidates.append((t, bm, bk, ws))
     if not candidates:
-        return None, None, None
-    t, bm, ws = min(candidates)
-    return t, bm, ws
+        return None, None, None, None
+    t, bm, bk, ws = min(candidates)
+    return t, bm, bk, ws
 
 
 def main():
     print(
         f"{'shape':<22s} {'M':>5s} {'wmma µs':>10s} {'tcg µs':>10s} "
-        f"{'tcg cfg':>10s} {'tcg/wmma':>10s}"
+        f"{'tcg cfg':>13s} {'tcg/wmma':>10s}"
     )
     for label, n, k in SHAPES:
         for m in MS:
             t_wmma = bench_one(m, n, k, "mma")
-            t_tcg, bm, ws = best_tcgen05(m, n, k)
+            t_tcg, bm, bk, ws = best_tcgen05(m, n, k)
             if isinstance(t_wmma, float) and isinstance(t_tcg, float):
                 ratio = f"{t_wmma / t_tcg:>9.2f}x"
-                cfg = f"M{bm}{'+ws' if ws else ''}"
+                cfg = f"M{bm}K{bk}{'+ws' if ws else ''}"
             else:
                 ratio = "   --   "
                 cfg = "  --  "
             print(f"  {label:<20s} {m:>5d} {fmt(t_wmma):>10s} "
-                  f"{fmt(t_tcg):>10s} {cfg:>10s} {ratio:>10s}")
+                  f"{fmt(t_tcg):>10s} {cfg:>13s} {ratio:>10s}")
         print()
 
 
