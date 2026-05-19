@@ -99,22 +99,13 @@ public:
   SharedStorage &smem;
   ArithClass &arith;
 
-  // We KEEP the same regs_a layout as WMMA even though tcgen05.mma reads
-  // A from SMEM, because humming's existing s2r_pipe unconditionally
-  // loads A into RMEM via mma.regs_a_as_ptr(). Wastes registers but
-  // avoids forking the s2r path for Phase 0.
-  //
-  // Size MUST match what `s2r_loader_a.load` actually writes per call:
-  // it issues `ldmatrix.x4 (smem_ptr, int4 *regs_ptr + load_iter_id)`
-  // per `load_iter_id in [0, CEIL_DIV(WarpShape::M, 16))`, with each
-  // ldmatrix.x4 writing 4 b32 per thread = 16 bytes = 1 int4 slot.
-  // Undersizing this array silently overflowed into `regs_qb` and
-  // corrupted the next iteration's quantised codes for any
-  // WarpShape::M > 4 (the prior `[1][1]` shape held only 2 uint32).
-  // alignas(16) keeps the compiler from spilling to local memory at a
-  // non-16-aligned offset, which would silently drop bytes in the
-  // vectorised store half of the same ldmatrix.x4.
-  alignas(16) int4 regs_a[2][MAX(1u, CEIL_DIV(WarpShape::M, 16u))];
+  // Phase B.20: `s2r_pipeline.cuh` now skips `loader_a.load` for the
+  // TCGEN05 path (tcgen05.mma reads A from SMEM via descriptor), so
+  // this storage is never written. Keep a single dummy int4 so the
+  // `regs_a_as_ptr()` accessor below has somewhere to point -- the
+  // s2r pipe takes the pointer unconditionally even when it doesn't
+  // dereference. alignas(16) is defensive.
+  alignas(16) int4 regs_a[1];
 
   // Quantised B codes loaded by s2r_pipe (same layout as WMMA).
   alignas(16) uint32_t regs_qb[2][ElementB::kBits * (16 / ElementA::kBits)];

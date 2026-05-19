@@ -86,6 +86,7 @@ def _run_tcgen05(
     has_zero_point=True,
     has_bias=False,
     group_size=128,
+    use_tma=False,
 ):
     """Construct a TCGEN05 kernel, run it on a random problem, and
     return (outputs, outputs_ref). Reference is computed BEFORE the
@@ -117,8 +118,12 @@ def _run_tcgen05(
         has_zero_point=has_zero_point,
         num_stages=num_stages,
         use_warp_spec=False,
-        use_tma=False,
-        use_cp_async=True,
+        use_tma=use_tma,
+        use_cp_async=not use_tma,
+        use_mbarrier=use_tma,
+        # use_tma_bzp must be False when has_zero_point + is_group_weight_scale --
+        # humming's tensor.h asserts on TMA for that combination.
+        use_tma_bzp=False,
         has_bias=has_bias,
         mma_type="tcgen05",
         use_tcgen05=True,
@@ -294,6 +299,28 @@ def test_tcgen05_zero_point(has_zero_point):
         block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
         num_stages=2,
         has_zero_point=has_zero_point,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# TMA load path (Phase B.20). Replaces cp.async for A and B with TMA
+# `tma_load_2d` (humming's existing WMMA-side wiring; the TCGEN05 mma
+# code is independent of the load mechanism so it just works). BZP
+# still uses cp.async since `tensor.h:275` asserts TMA isn't supported
+# for is_group_weight_scale BZP descriptors.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("use_tma", [False, True])
+@pytest.mark.parametrize("has_zero_point", [True, False])
+def test_tcgen05_tma(use_tma, has_zero_point):
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=128, shape_n=64, shape_k=512,
+        block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
+        num_stages=2,
+        has_zero_point=has_zero_point,
+        use_tma=use_tma,
     )
     _assert_close(outputs, outputs_ref)
 
