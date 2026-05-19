@@ -166,12 +166,16 @@ public:
   static_assert(WarpShape::N == 64,
                 "TCGEN05 path Phase B.18: WarpN<64 hits loader_b "
                 "half-group path (unmodelled in scatter)");
-  static_assert(BlockShape::K == 64,
-                "TCGEN05 path Phase B.18: only BlockK==64 is verified "
-                "(workbook 'B.18 BlockK>64 open')");
+  static_assert(BlockShape::K == 64 || BlockShape::K == 128
+                || BlockShape::K == 256,
+                "TCGEN05 path Phase B.18: BlockK must be 64, 128, or 256");
   static_assert(WarpShape::M * 4 == BlockShape::M,
                 "TCGEN05 path Phase B.18: must have exactly 4 M-warps "
                 "so each warp owns one TMEM sub-partition's worth of M");
+  static_assert(WarpShape::K == BlockShape::K,
+                "TCGEN05 path Phase B.18: K-warps not supported -- "
+                "tcgen05.mma covers the full BlockK by issuing one MMA "
+                "per 16-K-bf16 atom from a single warp.");
 
   // Dequant int4 (from regs_qb) -> bf16 (RMEM) -> SMEM b_dequant staging.
   CUDA_INLINE
@@ -275,7 +279,17 @@ public:
           reinterpret_cast<__nv_bfloat16 *>(&smem.b_dequant[buffer_id][0]);
       __nv_bfloat16 *regs_b_bf16 =
           reinterpret_cast<__nv_bfloat16 *>(regs_b_tmp[buffer_id]);
-      constexpr uint32_t kRowBytes = BlockShape::K * sizeof(__nv_bfloat16);
+      // For BlockK > 64 we section-major-ise B in SMEM (same as A in
+      // loader_a -- each section holds 64 K-bf16 of all N) so the
+      // descriptor's `((8, n), 2):((8, SBO_uint128=64), 1)` matches
+      // the SMEM layout regardless of total BlockK. Each section's
+      // row stride is 128 B (= 64 K-bf16 × 2 B), and we step the
+      // descriptor's start address by `section_size = BlockN * 128 B`
+      // when crossing section boundaries.
+      constexpr uint32_t kKPerSectionB =
+          BlockShape::K < 64u ? BlockShape::K : 64u;
+      constexpr uint32_t kRowBytes = kKPerSectionB * sizeof(__nv_bfloat16);
+      constexpr uint32_t kBSectionSizeBytes = BlockShape::N * kRowBytes;
       uint32_t t = threadIdx.x % 32u;
       uint32_t k_base = iter_id * kPartMmaShapeK;
       constexpr uint32_t kBf16PerCall = 8;
@@ -309,9 +323,27 @@ public:
           uint32_t n = n_base + i * 16u + 8u * frag_id + (t / 4u);
           uint32_t k = k_base + 2u * (t % 4u) + (v_in_frag & 1u)
                      + 8u * (v_in_frag >> 1);
-          uint32_t linear_bytes = n * kRowBytes + k * sizeof(__nv_bfloat16);
-          // HW Swizzle<3,4,3> uses abs byte; include smem_base.
-          uint32_t xor_shift = (smem_base_div_128 + n) & 7u;
+          // Section-major B: K is split into 64-K-bf16 sections; each
+          // section's row stride is fixed at 128 B. linear_in_section
+          // uses the within-section K offset (`k % kKPerSectionB`),
+          // and the section_offset_bytes jumps over the previous
+          // sections.
+          uint32_t k_section = k / kKPerSectionB;
+          uint32_t k_in_section = k % kKPerSectionB;
+          uint32_t section_offset_bytes = k_section * kBSectionSizeBytes;
+          uint32_t linear_in_section =
+              n * kRowBytes + k_in_section * sizeof(__nv_bfloat16);
+          uint32_t linear_bytes = section_offset_bytes + linear_in_section;
+          // HW Swizzle<3,4,3> XORs bits [4..7) with bits [7..10) of
+          // the absolute byte address. Within a 128B-row section, the
+          // row stride is 128 B so `linear_in_section >> 7 == n`
+          // (the per-section row index). The section_offset always
+          // moves by a multiple of 128 B × (BlockN / 8) -- which is
+          // 0 mod 8 for any BlockN multiple of 8, so it doesn't
+          // affect the XOR phase. Use the within-section bytes for
+          // the XOR contribution.
+          uint32_t xor_shift =
+              (smem_base_div_128 + (linear_in_section >> 7)) & 7u;
           uint32_t swizzled = linear_bytes ^ (xor_shift << 4);
           uint32_t reg_index = i * kBf16PerCall + v;
 #ifdef TCGEN05_DEBUG_SCATTER_SENTINEL
@@ -342,11 +374,37 @@ public:
     // `iter_id * kKChunkUint128` so this MMA processes K-chunk `iter_id`.
     // (tcgen05.mma.kind::f16 only sees 16 bf16 of K per issue; the
     // outer mainloop's K-loop drives `iter_id` over the BlockK range.)
-    int4 *a_ptr = &smem.a[stage_id][0] + iter_id * kKChunkUint128;
-    int4 *b_ptr = &smem.b_dequant[buffer_id][0] + iter_id * kKChunkUint128;
+    //
+    // For BlockK > 64, humming's loader_a sectionises A into chunks of
+    // 64 K-bf16 each (loader_a.cuh:110: `gmem_col = smem_row /
+    // BlockM * 8 + smem_col` -- rows 0..BlockM-1 hold K=0..63,
+    // BlockM..2*BlockM-1 hold K=64..127, ...). The descriptor's
+    // 8-M-row group stride is 1024 B = 64 uint128 (= 64 K-bf16 worth)
+    // *within* a section regardless of BlockK, so SBO for A is always
+    // `kKPerSection` = MIN(BlockK, 64). To advance the descriptor
+    // start across section boundaries we jump by the section size
+    // (`BlockM * 128 B = BlockM * 8` uint128) instead of by atoms.
+    constexpr uint32_t kKPerSection = BlockShape::K < 64u ? BlockShape::K : 64u;
+    constexpr uint32_t kKItersPerSection = kKPerSection / 16u;
+    constexpr uint32_t kSectionSizeUint128 = BlockShape::M * 8u;
+    uint32_t section_idx = iter_id / kKItersPerSection;
+    uint32_t iter_in_section = iter_id % kKItersPerSection;
+    int4 *a_ptr = &smem.a[stage_id][0]
+                  + section_idx * kSectionSizeUint128
+                  + iter_in_section * kKChunkUint128;
+    // B is now sectionised the same way A is (since Phase B.19): the
+    // scatter above writes section-major, with each section holding
+    // 64 K-bf16 of all N. So B's descriptor SBO is also fixed at 64
+    // K-bf16, and the iter advance crosses sections via `section_idx
+    // * kBSectionSizeUint128` (where the B section size in uint128
+    // is `BlockN * 8`).
+    constexpr uint32_t kBSectionSizeUint128 = BlockShape::N * 8u;
+    int4 *b_ptr = &smem.b_dequant[buffer_id][0]
+                  + section_idx * kBSectionSizeUint128
+                  + iter_in_section * kKChunkUint128;
 
-    uint64_t a_desc = tcgen05_smem_desc<kSwizzleBytesA, BlockShape::K>(a_ptr);
-    uint64_t b_desc = tcgen05_smem_desc<kSwizzleBytesB, BlockShape::K>(b_ptr);
+    uint64_t a_desc = tcgen05_smem_desc<kSwizzleBytesA, kKPerSection>(a_ptr);
+    uint64_t b_desc = tcgen05_smem_desc<kSwizzleBytesB, kKPerSection>(b_ptr);
 
     uint32_t idesc =
         tcgen05_instr_desc_bf16_bf16_f32(BlockShape::M, BlockShape::N);

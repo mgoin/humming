@@ -336,15 +336,15 @@ def test_tcgen05_block_m_large(block_n):
     _assert_close(outputs, outputs_ref)
 
 
-@pytest.mark.xfail(
-    reason="Phase B.15 open: BlockK>64 needs multi-atom-per-row swizzle "
-    "(SBO recomputation). Gated by static_assert.",
-    strict=False, run=False,
-)
-def test_tcgen05_block_k_large():
+@pytest.mark.parametrize("block_k", [128, 256])
+def test_tcgen05_block_k_large(block_k):
+    """Phase B.19: BlockK > 64 works after section-major B layout +
+    section-aware descriptor advance for BOTH A and B. Each section
+    holds 64 K-bf16 of all N (matching A's loader sectioning); the
+    iter advance crosses sections via `section_idx * section_size`."""
     outputs, outputs_ref = _run_tcgen05(
-        shape_m=128, shape_n=64, shape_k=256,
-        block_shape=(64, 64, 128), warp_shape=(16, 64, 128),
+        shape_m=128, shape_n=64, shape_k=max(block_k * 2, 256),
+        block_shape=(64, 64, block_k), warp_shape=(16, 64, block_k),
         num_stages=2,
     )
     _assert_close(outputs, outputs_ref)
