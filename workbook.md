@@ -152,6 +152,84 @@ the cluster-init in `humming/include/humming/kernel/humming.cuh` /
 This is a substantial refactor (~200 LoC of branching in
 `tcgen05_mma.cuh`) but the PTX wrappers are already in place.
 
+### B.31 follow-up attempt (reverted): cta_group::2 needs cluster-level lockstep
+
+Tried wiring `tcgen05.mma.cta_group::2` into the TCGEN05 path:
+1. `init_tmem_alloc()` / `release_tmem()` helpers branching on
+   `kMultiCastSizeB == 2`.
+2. Leader-only `tcgen05_alloc_2cta` / `tcgen05_dealloc_2cta`, peer
+   seeds local `tcgen05_tmem_col = 0` (fresh-TMEM assumption avoids
+   a cluster sync at init).
+3. Per-K-iter: leader-only `tcgen05_mma_ss_bf16_2cta`. Each CTA
+   issues `tcgen05_commit_to_mbarrier_2cta` so each lands an
+   arrival on its OWN local mbar (peer's commit batches an empty
+   set of MMAs and arrives immediately; the cluster-shared MMA
+   that the leader issued completes together).
+4. Instruction descriptor uses **effective** MMA M = 2 * BlockM
+   (HW splits the output between leader's and peer's TMEM).
+
+**PTX gotchas found:**
+* `tcgen05.mma.cta_group::2.kind::f16` does NOT accept the 4-uint32
+  sparsity mask that the cta_group::1 variant requires (ptxas:
+  "Argument vector size mismatch"). The wrapper had to drop the
+  `{m0..m3}` operand.
+* A single kernel function cannot mix `cta_group::1` and
+  `cta_group::2` tcgen05 instructions: alloc/mma/commit/dealloc must
+  all be the same group. Forced the alloc/dealloc to also branch.
+* `mbarrier.try_wait.parity.shared::cluster` is rejected by ptxas
+  ("Illegal modifier '::cluster' for instruction 'mbarrier.try_wait.parity'").
+  Reusing `.shared::cta` with a cluster-mapped pointer crashes
+  with `cudaErrorIllegalInstruction`. Worked around by having both
+  CTAs issue the cta_group::2 commit (cluster-shared, each lands an
+  arrival on its own local mbar) and waiting locally with the
+  regular `.shared::cta` form.
+
+**Hang/correctness state with all of the above:**
+* mc_b=1: still works (rel ~5e-3).
+* mc_b=2 with cta_group::2: kernel runs to completion (no hang), but
+  outputs are wrong (rel ~1.2). The FIRST few output elements of
+  each M-block are correct (`out[0, 0..3] ~= ref[0, 0..3]`) but
+  per-block `max_err ~= ref_max`, so SOME positions are very wrong.
+
+**Root cause analysis** (why it's wrong):
+
+  `tcgen05.mma.cta_group::2` reads A from both CTAs' SMEM via
+  cluster-distributed addressing -- leader contributes A for its
+  m_block, peer contributes A for m_block+1. But the producer-side
+  mbar pipeline (`load_mbar`, math `consumer.wait_stage`) is
+  CTA-LOCAL: each CTA waits independently for its own stage's TMA
+  loads. There is no cluster-level lockstep guaranteeing that when
+  leader's math issues the MMA at K-iter N, peer's A for K-iter N
+  is committed to peer's SMEM (peer's pipeline may be ahead or
+  behind by one stage). The MMA reads stale-or-future A from peer
+  and produces noisy output.
+
+**Fix that's needed** (deferred):
+
+  Either:
+  (a) Add a cluster barrier per K-iter so leader and peer are
+      lockstep. Adds a cluster-sync to every MMA issue -- likely
+      eats the cta_group::2 perf win. CUTLASS's `Sm100UmmaPipeline`
+      does this with a cluster-aware mbar pair, not raw
+      `barrier.cluster.arrive`.
+  (b) Replace the per-CTA `consumer.wait_stage` mbar with a
+      cluster-shared mbar so that "stage ready" means "ready on
+      BOTH CTAs". Requires reworking producer/consumer pipeline
+      mbars to be cluster-scope, and threading the cluster_rank
+      through producer's TMA arrives.
+
+  Both are substantial -- (b) is what CUTLASS does and is the right
+  long-term answer. ~400-600 LoC across `g2s_pipeline.cuh`,
+  `s2r_pipeline.cuh`, `barrier.cuh`, `tcgen05_mma.cuh`.
+
+**What's committed**: only B.31 (cluster-bar fix) -- unblocks
+multi-cast B and is correct-but-perf-neutral on its own.
+
+**What's reverted**: the cta_group::2 wiring attempt
+(`tcgen05_mma.cuh::init_tmem_alloc/release_tmem`, dual-commit, idesc
+M doubling). Worth picking up again when we're ready to take the
+cluster-shared producer/consumer pipeline refactor.
+
 ## Phase B.30: dtype-sweep correctness — missing epilogue exp_offset rescale (2026-05-19)
 
 **TL;DR**: TCGEN05 was wrong for any (A, B) combo whose
