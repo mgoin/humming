@@ -15,6 +15,12 @@ template <
 class S2RMemoryPipeline {
 private:
   static constexpr bool kUseWgmma = MMA::MmaOpClass::kMmaType == MmaType::WGMMA;
+  // For TCGEN05, tcgen05.mma reads A directly from SMEM via the
+  // SS descriptor -- the s2r path's `loader_a.load` into RMEM is
+  // dead work. Skip it to save ~16 bytes-per-thread-per-K-iter of
+  // ldmatrix.x4 plus the register pressure those held.
+  static constexpr bool kUseTcgen05 =
+      MMA::MmaOpClass::kMmaType == MmaType::TCGEN05;
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kWarpItersK = WarpShape::K / kPartMmaShapeK;
   static constexpr uint32_t kNumStages = TuningConfig::kNumStages;
@@ -61,7 +67,7 @@ public:
     uint32_t buffer_id = iter_id % 2;
 
     loader_b.load(smem.b[stage_id], mma.regs_qb_as_ptr(buffer_id), iter_id);
-    if constexpr (!kUseWgmma)
+    if constexpr (!kUseWgmma && !kUseTcgen05)
       loader_a.load(smem.a[stage_id], mma.regs_a_as_ptr(buffer_id), iter_id);
     if constexpr (kIsGroupInputScale)
       loader_as.load(smem.as[stage_id], mma.arith.regs_as_as_ptr(buffer_id), iter_id);
