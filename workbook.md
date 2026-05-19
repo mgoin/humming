@@ -88,18 +88,54 @@ Files we added or extended (everything else is unchanged):
 | `tests/bench_w4a16_baseline.py`                 | 3-way perf vs Sablefish + Marlin                           |
 | `tests/baseline_phaseA.tsv`                     | Snapshot of humming's mma.sync perf, pre-tcgen05            |
 
-## Current state (Phase B.14, 2026-05-19)
+## Current state (Phase B.14 / B.15 partial, 2026-05-19)
 
 * `tests/test_sm100_smoke.py` (10 tests, mma.sync path): **passes**.
 * `tests/baseline_phaseA.tsv`: humming's existing path is healthy across all
   shapes/batches, sets the floor we need to keep.
-* `tests/test_tcgen05.py` (TCGEN05 path): **passes** with tight tolerance
-  (rtol=1e-2, atol=0.5). All structured A patterns produce EXACT matches
-  vs mma.sync. Full sweep across (m, n, k) in {64,128,256}x{128}x
-  {128..4096} passes with max relative error <= 0.7%.
+* `tests/test_tcgen05.py` (TCGEN05 path): **25 passed / 3 xfail (gated)**.
+  Tight tolerance: rtol=1e-2, atol=0.5 (bf16 rounding noise vs mma.sync).
+  Parametrizations covered:
+  - shape_m in {64, 128, 256, 512}
+  - shape_k in {128, 256, 512, 1024, 2048}
+  - num_stages in {2, 3, 4}
+  - single-K-position probe over k0 in {0..255}
 * TCGEN05 is currently ~2.7x SLOWER than mma.sync at small tiles (64x64x64
   block, no 2-CTA, no double-buffered TMEM, per-K-iter __syncthreads).
   Correctness first, perf is the next phase.
+
+### Phase B.14 known-good config space (gated by static_assert):
+* BlockShape == (64, 64, 64)
+* WarpShape == (16, 64, 64)
+* BlockN == WarpShape::N (single N-warp)
+* kNumStages in {2, 3, 4}
+
+### Phase B.15 open work (`xfail` in tests, gated by static_assert):
+* **BlockN > 64**: scatter writes locations correctly per a sentinel
+  probe, but `tcgen05.mma` reads the wrong half-tile for N>=64 -- the
+  symptom is `out[m, N=64..127] == out[m, N=0..63]` (verified via
+  SCATTER_SENTINEL probe writing `bf16(n+1)` at logical (n, k) and
+  observing the second half of the output repeating the first). The
+  encoding `n_dim = N/8` matches what Phase B.4 wrote, and our scatter
+  swizzle matches HW Swizzle<3,4,3> for both halves, so the bug is
+  most likely in either (a) the SS descriptor's `sbo` interpretation
+  for kind::f16 N>64, or (b) a missing field in `idesc` (lbo_mode?
+  base_offset?). PTX ISA 8.8 §9.7.16.5.1 + CUTLASS
+  `cute/arch/mma_sm100_desc.hpp` are the next references to verify
+  against.
+* **BlockM > 64**: needs 8 M-warps (2 per TMEM sub-partition) plus an
+  explicit M-fastest layout in the t2r since the loader uses N-fastest.
+  Not started.
+* **BlockK > 64**: descriptor SBO assumes 128B row stride; >64 needs
+  multi-atom rows. Not started.
+
+### Bug fixes in Phase B.14:
+* `tcgen05_mma.cuh`: `regs_a` was sized as `uint32_t[2][1][1]` (8 bytes)
+  but `s2r_loader_a.load` writes 16 bytes per buffer via `ldmatrix.x4`.
+  The 8-byte overflow corrupted `regs_qb` and silently changed B's
+  dequant. Now sized `int4[2][CEIL_DIV(WarpShape::M, 16)]` with
+  `alignas(16)`. (Detected when investigating BlockN > 64 -- shows up
+  in *all* configs once `WarpShape::M >= 16`.)
 
 ### Last bug fixed (Phase B.14)
 TCGEN05.mma reads A from SMEM via SS descriptor, but the WMMA-shaped

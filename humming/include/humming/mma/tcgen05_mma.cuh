@@ -102,14 +102,18 @@ public:
   // A from SMEM, because humming's existing s2r_pipe unconditionally
   // loads A into RMEM via mma.regs_a_as_ptr(). Wastes registers but
   // avoids forking the s2r path for Phase 0.
-  // alignas(16): humming's s2r_loader_a uses vectorized int4 stores;
-  // the same was true of regs_qb -- without explicit alignment the
-  // compiler spilled to local memory at a non-16-aligned offset and
-  // the int4 store silently produced zeros for the first 8 bytes.
-  static constexpr uint32_t kFakeMmaShapeM = 16;
-  static constexpr uint32_t kFakeMmaShapeK = 16;
-  alignas(16) uint32_t regs_a[2][MAX(1u, WarpShape::M / kFakeMmaShapeM)]
-                                [MAX(1u, kPartMmaShapeK / kFakeMmaShapeK)];
+  //
+  // Size MUST match what `s2r_loader_a.load` actually writes per call:
+  // it issues `ldmatrix.x4 (smem_ptr, int4 *regs_ptr + load_iter_id)`
+  // per `load_iter_id in [0, CEIL_DIV(WarpShape::M, 16))`, with each
+  // ldmatrix.x4 writing 4 b32 per thread = 16 bytes = 1 int4 slot.
+  // Undersizing this array silently overflowed into `regs_qb` and
+  // corrupted the next iteration's quantised codes for any
+  // WarpShape::M > 4 (the prior `[1][1]` shape held only 2 uint32).
+  // alignas(16) keeps the compiler from spilling to local memory at a
+  // non-16-aligned offset, which would silently drop bytes in the
+  // vectorised store half of the same ldmatrix.x4.
+  alignas(16) int4 regs_a[2][MAX(1u, CEIL_DIV(WarpShape::M, 16u))];
 
   // Quantised B codes loaded by s2r_pipe (same layout as WMMA).
   alignas(16) uint32_t regs_qb[2][ElementB::kBits * (16 / ElementA::kBits)];
@@ -138,6 +142,31 @@ public:
     for (uint32_t i = 0; i < sizeof(regs_c) / 4; i++) p[i] = 0;
     first_issue_ = true;
   }
+
+  // Phase B.14 known-good config space (verified by tests/test_tcgen05.py):
+  //   * BlockShape::M == 64
+  //   * BlockShape::N == 64  (== WarpShape::N -> exactly one N-warp)
+  //   * BlockShape::K == 64  (one 128B swizzle atom per A-row)
+  //   * WarpShape::M == 16   (4 M-warps, one per TMEM sub-partition)
+  //   * kNumStages    in {2, 3, 4}
+  //
+  // BlockN > 64 currently produces wrong output for N>=64 (verified
+  // with a SCATTER_SENTINEL probe: warp 0 writes n+1 at N=0..63 OK,
+  // warp 1 writes n+1 at N=64..127 LOCATIONS but the descriptor's
+  // n_dim=N/8 encoding causes the MMA to read the wrong half-tile of
+  // smem.b_dequant -- the workbook records the open question). Gate it
+  // here so the build fails clearly instead of silently producing 30%
+  // wrong outputs.
+  static_assert(BlockShape::M == 64,
+                "TCGEN05 path Phase B.14: only BlockM==64 is verified");
+  static_assert(BlockShape::N == WarpShape::N,
+                "TCGEN05 path Phase B.14: only single-N-warp configs "
+                "are verified (BlockN must equal WarpShape::N)");
+  static_assert(BlockShape::N <= 64,
+                "TCGEN05 path Phase B.14: BlockN > 64 currently produces "
+                "wrong output (workbook 'B.15 N>64 mismatch'); revert "
+                "this assert once the multi-N-warp scatter/descriptor "
+                "is fixed");
 
   // Dequant int4 (from regs_qb) -> bf16 (RMEM) -> SMEM b_dequant staging.
   CUDA_INLINE
@@ -246,6 +275,19 @@ public:
       uint32_t k_base = iter_id * kPartMmaShapeK;
       constexpr uint32_t kBf16PerCall = 8;
       constexpr uint32_t kCalls = WarpShape::N / 16u;
+      // Per-warp N-slice base. With BlockN == WarpShape::N (kNWarps==1)
+      // the only warp_id_scatter is 0 and n_base degenerates to 0;
+      // this matches the original working single-N-warp scatter. The
+      // BlockN > WarpShape::N path is gated by the static_assert
+      // above -- the scatter math here is N-fastest (matches loader_b
+      // and arith), but t2r and TMEM tile geometry need additional
+      // work for multi-N-warp configs (workbook: "Phase B.15 - N>64
+      // descriptor + scatter mismatch") and that mode is rejected at
+      // build time until that lands.
+      constexpr uint32_t kNWarps = MAX(BlockShape::N / WarpShape::N, 1u);
+      uint32_t warp_id_local = threadIdx.x / 32u;
+      uint32_t n_warp_id_scatter = warp_id_local % kNWarps;
+      uint32_t n_base = n_warp_id_scatter * WarpShape::N;
       // Hardware Swizzle<3,4,3> applies to the absolute byte address:
       // the descriptor encodes (smem_base >> 4) in its start_address,
       // and the HW XOR'ing of bits [4, 7) uses bits [7, 10) of the
@@ -259,7 +301,7 @@ public:
         for (uint32_t v = 0; v < kBf16PerCall; v++) {
           uint32_t frag_id = v / 4u;
           uint32_t v_in_frag = v % 4u;
-          uint32_t n = i * 16u + 8u * frag_id + (t / 4u);
+          uint32_t n = n_base + i * 16u + 8u * frag_id + (t / 4u);
           uint32_t k = k_base + 2u * (t % 4u) + (v_in_frag & 1u)
                      + 8u * (v_in_frag >> 1);
           uint32_t linear_bytes = n * kRowBytes + k * sizeof(__nv_bfloat16);
@@ -362,6 +404,14 @@ public:
                   "warp's own sub-partition.");
 
     uint32_t warp_id = threadIdx.x / 32u;
+    // TMEM access is sub-partition-bound: warp `w` can ONLY read
+    // DPs (w % 4). The TMEM atom places M=0..15 in sub-part 0,
+    // M=16..31 in sub-part 1, M=32..47 in sub-part 2, M=48..63
+    // in sub-part 3 (per CUTE mma_traits_sm100.hpp:507). So the
+    // M dim MUST be fastest in warp_id, regardless of how the s2r
+    // loader_b assigns N -- the loader and t2r operate on different
+    // SMEM buffers (smem.b for s2r, TMEM for t2r), so they can use
+    // different warp layouts.
     uint32_t m_warp_id = warp_id % kMWarps;
     uint32_t n_warp_id = (warp_id / kMWarps) % kNWarps;
     uint32_t laneid = threadIdx.x % 32u;

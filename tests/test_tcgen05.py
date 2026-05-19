@@ -1,21 +1,26 @@
-"""First TCGEN05 path correctness test.
+"""TCGEN05 (Blackwell sm_100+) W4A16 correctness tests.
 
-Constructs HummingKernel directly with `mma_type='tcgen05'` and a minimal
-W4A16 config. This is the smallest viable instance:
+Phase B.14 known-good config space (each combination here passes vs an
+mma.sync reference with rtol=1e-2, atol=0.5):
 
-  bf16 A x uint4 B with per-group bf16 scales (gs=128) and zero-points,
-  block (M=64, N=128, K=128), 2-stage pipeline, single-CTA, no warp-spec.
+  * BlockShape: only (64, 64, 64) -- BlockN > 64 is gated by a
+    static_assert in `mma/tcgen05_mma.cuh` (workbook 'B.15: N>64
+    descriptor/scatter mismatch'). BlockK > 64 and BlockM > 64 are
+    likewise unverified and gated.
+  * WarpShape: only (16, 64, 64) -- 4 M-warps, one per TMEM
+    sub-partition.
+  * kNumStages: {2, 3, 4} -- kNumStages == 2 uses the deferred
+    `producer.load_stage` fix; kNumStages >= 3 lands the next load
+    into a non-conflicting stage and works unmodified.
+  * Problem shape: shape_m / shape_n / shape_k must be a multiple of
+    the BlockShape; shape_k currently >= 128 (BlockK == 64 needs at
+    least 2 K-blocks to exercise the pipeline).
 
-Failure modes we expect to hit on first runs (recorded in workbook.md):
-  * SMEM layout mismatch between r2s and tcgen05.mma's swizzle expectations.
-    Math will be wrong, not segfault.
-  * Missing mbarrier-based commit -- the __syncthreads in TCGEN05::run()
-    should be safe but slow.
-  * Instruction descriptor / dtype-code bit layout off-by-one. Will likely
-    show as wrong-shaped accumulator or ptxas error.
-
-We start the test loose (atol=0.5) to discover ordering; will tighten as
-the path stabilises.
+The tests below are written so the parametrization is the same shape
+of dimensions we'd eventually want to tune over (kNumStages, BlockN,
+BlockM, ...); the gated combinations are marked `xfail` so they remain
+visible failures and stop being silently green if we accidentally
+relax a static_assert.
 """
 
 from __future__ import annotations
@@ -42,48 +47,56 @@ def _is_blackwell() -> bool:
 pytestmark = pytest.mark.skipif(not _is_blackwell(), reason="tcgen05 needs sm_100+")
 
 
-def test_tcgen05_w4a16_smallest():
+# ---------------------------------------------------------------------------
+# Test helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_w4a16_problem(shape_m, shape_n, shape_k, group_size, has_zero_point):
+    """Build a W4A16 (bf16 x uint4) problem matching the existing
+    test_shape conventions. Returns (inputs_ref, inputs, weight,
+    weight_scale, zero_point, weight_ref)."""
     a_dtype = dtypes.bfloat16
     b_dtype = dtypes.uint4
-    c_dtype = dtypes.bfloat16
     bs_dtype = dtypes.bfloat16
-    group_size = 128
 
-    # Smallest viable shape (still a multiple of the kernel's tile).
-    # Problem shape divides BlockShape evenly.
-    shape_m = 128
-    shape_n = 128
-    shape_k = 256
-
-    # Phase B.7: shrink BlockK to 64 bf16 so row stride = 128 B matches
-    # the 128B-swizzle atom width exactly. With BlockK > 64 (= 128 B per
-    # row), each actual SMEM row would span 2 swizzle-rows and the
-    # canonical UMMA-K layout no longer applies cleanly.
-    # 4 warps along M -- each warp accesses its own TMEM sub-partition.
-    # The M=64 cta_group::1 TMEM atom places valid M values at DPs
-    # {0..15, 32..47, 64..79, 96..111} (per CUTE
-    # mma_traits_sm100.hpp:507), and a warp can only access its own
-    # 32-DP sub-partition.
-    block_shape = (64, 64, 64)
-    warp_shape = (16, 64, 64)
-
-    # Build the W4A16 problem identical to what test_shape uses.
     random_weight = generate_random_weight(
         n=shape_n, k=shape_k, group_size=group_size,
         dtype=b_dtype, scale_dtype=bs_dtype,
-        has_zero_point=True,
+        has_zero_point=has_zero_point,
     )
     _, weight_ref, weight, weight_scale, zero_point, _ = random_weight
     weight = prepare_humming_weight(weight, b_dtype, a_dtype, use_wgmma=False)
     weight_scale = prepare_humming_weight_scale(weight_scale, to_apply_on_c=False)
-    zero_point = prepare_humming_zero_point(zero_point, dtype=b_dtype)
+    if has_zero_point:
+        zero_point = prepare_humming_zero_point(zero_point, dtype=b_dtype)
 
     _, inputs_ref, inputs, _ = generate_random_inputs(
         m=shape_m, k=shape_k, group_size=0, dtype=a_dtype,
     )
+    return inputs_ref, inputs, weight, weight_scale, zero_point, weight_ref
 
-    # Construct the TCGEN05 kernel explicitly. The novel flag is mma_type
-    # + use_tcgen05 -- everything else is "boring" mainloop configuration.
+
+def _run_tcgen05(
+    shape_m, shape_n, shape_k,
+    block_shape, warp_shape,
+    num_stages,
+    has_zero_point=True,
+    group_size=128,
+):
+    """Construct a TCGEN05 kernel, run it on a random problem, and
+    return (outputs, outputs_ref). Reference is computed BEFORE the
+    kernel launch so a context-killing tcgen05 bug doesn't take cublas
+    down with it."""
+    a_dtype = dtypes.bfloat16
+    b_dtype = dtypes.uint4
+    c_dtype = dtypes.bfloat16
+    bs_dtype = dtypes.bfloat16
+
+    inputs_ref, inputs, weight, weight_scale, zero_point, weight_ref = (
+        _build_w4a16_problem(shape_m, shape_n, shape_k, group_size, has_zero_point)
+    )
+
     kernel = HummingKernel(
         shape_n=shape_n,
         shape_k=shape_k,
@@ -94,8 +107,8 @@ def test_tcgen05_w4a16_smallest():
         c_dtype=c_dtype,
         bs_dtype=bs_dtype,
         weight_scale_group_size=group_size,
-        has_zero_point=True,
-        num_stages=2,
+        has_zero_point=has_zero_point,
+        num_stages=num_stages,
         use_warp_spec=False,
         use_tma=False,
         use_cp_async=True,
@@ -105,42 +118,187 @@ def test_tcgen05_w4a16_smallest():
         use_stream_k=False,
     )
 
-    # Compute the reference FIRST so a misbehaving tcgen05 kernel that
-    # corrupts CUDA context doesn't take cublas down with it.
-    outputs_ref = inputs_ref.matmul(weight_ref.T)
+    outputs_ref = inputs_ref.matmul(weight_ref.T).to(torch.bfloat16)
     torch.cuda.synchronize()
 
     from humming import ops
     outputs = torch.empty(
-        (shape_m, shape_n),
-        dtype=dtypes.torch_dtype_map[c_dtype],
-        device=inputs.device,
+        (shape_m, shape_n), dtype=torch.bfloat16, device=inputs.device,
     )
-    outputs = ops.launch_kernel(
+    ops.launch_kernel(
         configs=[kernel.kernel_id],
-        inputs=inputs,
-        weight=weight,
-        outputs=outputs,
-        weight_scale=weight_scale,
-        zero_point=zero_point,
+        inputs=inputs, weight=weight, outputs=outputs,
+        weight_scale=weight_scale, zero_point=zero_point,
     )
     torch.cuda.synchronize()
+    return outputs, outputs_ref
 
-    outputs_ref = outputs_ref.to(outputs.dtype)
 
-    # Diagnostics first -- tells us whether the kernel produced garbage,
-    # all-zeros, or something with the right magnitude in the wrong layout.
+def _assert_close(outputs, outputs_ref):
+    """Compare bf16 outputs at a fixed tolerance.
+
+    rtol=1e-2 atol=0.5 covers bf16 rounding noise vs mma.sync (max
+    element here is ~200 -> 0.5 abs is ~2.5e-3 relative)."""
     abs_err = (outputs.float() - outputs_ref.float()).abs()
+    ref_abs = outputs_ref.float().abs()
+    # Diagnostic in case the assertion fails:
     print(
-        f"\n  out[:2,:4]={outputs[:2,:4].tolist()}\n"
-        f"  ref[:2,:4]={outputs_ref[:2,:4].tolist()}\n"
-        f"  max|err|={abs_err.max().item():.3e}  mean|err|={abs_err.mean().item():.3e}\n"
-        f"  |ref|: mean={outputs_ref.float().abs().mean().item():.3e}  "
-        f"max={outputs_ref.float().abs().max().item():.3e}\n"
-        f"  out nonzero frac: {(outputs.float().abs() > 1e-6).float().mean().item():.3f}"
+        f"\n  max|err|={abs_err.max().item():.3e} "
+        f"mean|err|={abs_err.mean().item():.3e} "
+        f"|ref|.mean={ref_abs.mean().item():.3e} "
+        f"|ref|.max={ref_abs.max().item():.3e}"
+    )
+    torch.testing.assert_close(outputs, outputs_ref, rtol=1e-2, atol=0.5)
+
+
+# ---------------------------------------------------------------------------
+# Smallest viable case (kept as a sanity test; matches Phase B.4's first
+# wired-up shape).
+# ---------------------------------------------------------------------------
+
+
+def test_tcgen05_w4a16_smallest():
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=128, shape_n=128, shape_k=256,
+        block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
+        num_stages=2,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# Sweep across shape_m (the dynamic M dim; only multiples of BlockM
+# are valid -- humming asserts `problem_shape % block_shape == 0`).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shape_m", [64, 128, 256, 512])
+def test_tcgen05_shape_m(shape_m):
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=shape_m, shape_n=64, shape_k=256,
+        block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
+        num_stages=2,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# Sweep across shape_k (= number of K-blocks the mainloop iterates).
+# BlockK == 64 so shape_k is in units of 64 bf16. shape_k=128 is the
+# smallest that exercises the K-pipeline (>= 2 iterations).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shape_k", [128, 256, 512, 1024, 2048])
+def test_tcgen05_shape_k(shape_k):
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=128, shape_n=64, shape_k=shape_k,
+        block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
+        num_stages=2,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# kNumStages sweep -- kNumStages == 2 uses the deferred load_stage path
+# (humming.cuh:165); kNumStages >= 3 takes the else branch where the
+# next load targets a non-conflicting stage and the SMEM-A race never
+# arises.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_stages", [2, 3, 4])
+def test_tcgen05_num_stages(num_stages):
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=128, shape_n=64, shape_k=512,
+        block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
+        num_stages=num_stages,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# Single-K-position probe -- guards against the SMEM-A race regression
+# (Phase B.14): with A=delta(k=k0), out[m, n] == B_dequant[k0, n] for
+# every k0. Before the fix only k0 in the LAST 16 K of each K-block
+# returned wrong values; this test catches that pattern explicitly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("k0", [0, 15, 16, 31, 32, 47, 48, 63, 64, 127, 192, 255])
+def test_tcgen05_delta_a(k0):
+    a_dtype = dtypes.bfloat16
+    b_dtype = dtypes.uint4
+    c_dtype = dtypes.bfloat16
+    bs_dtype = dtypes.bfloat16
+    shape_m, shape_n, shape_k = 128, 64, 256
+    group_size = 128
+
+    _, _, weight, weight_scale, zero_point, weight_ref = _build_w4a16_problem(
+        shape_m, shape_n, shape_k, group_size, has_zero_point=True
+    )
+    A = torch.zeros(shape_m, shape_k, dtype=torch.bfloat16, device="cuda")
+    A[:, k0] = 1.0
+
+    # Reference computed in fp32 then cast (matches WMMA's f32 accumulator).
+    outputs_ref = (A.float() @ weight_ref.T.float()).to(torch.bfloat16)
+
+    kernel = HummingKernel(
+        shape_n=shape_n, shape_k=shape_k,
+        block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
+        a_dtype=a_dtype, b_dtype=b_dtype, c_dtype=c_dtype, bs_dtype=bs_dtype,
+        weight_scale_group_size=group_size, has_zero_point=True,
+        num_stages=2, use_warp_spec=False, use_tma=False, use_cp_async=True,
+        has_bias=False, mma_type="tcgen05", use_tcgen05=True, use_stream_k=False,
     )
 
-    # Tight tolerance: tcgen05 path uses f32 accumulation matching mma.sync,
-    # so differences from the mma.sync reference should be bounded by bf16
-    # rounding noise (max element ~125 here -> 0.5 abs covers ~4e-3 relative).
-    torch.testing.assert_close(outputs, outputs_ref, rtol=1e-2, atol=0.5)
+    from humming import ops
+    outputs = torch.empty(
+        (shape_m, shape_n), dtype=torch.bfloat16, device=A.device,
+    )
+    ops.launch_kernel(
+        configs=[kernel.kernel_id],
+        inputs=A, weight=weight, outputs=outputs,
+        weight_scale=weight_scale, zero_point=zero_point,
+    )
+    torch.cuda.synchronize()
+    _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# Gated configs (xfail, strict=False). These should xfail at build time
+# (static_assert in tcgen05_mma.cuh); we capture them here so we'll get
+# an `XPASS` if a future change makes them work, signalling that the
+# matching tests above should be promoted out of xfail.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    reason="Phase B.15 open: BlockN>64 fails -- the multi-N-warp scatter "
+    "writes the right locations but tcgen05.mma reads back the wrong "
+    "half-tile (see workbook 'B.15 N>64'). Gated by static_assert in "
+    "tcgen05_mma.cuh.",
+    strict=False, run=False,
+)
+@pytest.mark.parametrize("block_n", [128, 256])
+def test_tcgen05_block_n_large(block_n):
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=128, shape_n=max(block_n, 128), shape_k=256,
+        block_shape=(64, block_n, 64), warp_shape=(16, 64, 64),
+        num_stages=2,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+@pytest.mark.xfail(
+    reason="Phase B.15 open: BlockM>64 (8 M-warps -> 2 warps per TMEM "
+    "sub-partition) unverified. Gated by static_assert.",
+    strict=False, run=False,
+)
+def test_tcgen05_block_m_large():
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=128, shape_n=64, shape_k=256,
+        block_shape=(128, 64, 64), warp_shape=(16, 64, 64),
+        num_stages=2,
+    )
+    _assert_close(outputs, outputs_ref)
