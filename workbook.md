@@ -104,38 +104,43 @@ Files we added or extended (everything else is unchanged):
   block, no 2-CTA, no double-buffered TMEM, per-K-iter __syncthreads).
   Correctness first, perf is the next phase.
 
-### Phase B.15 known-good config space (gated by static_assert):
-* BlockShape == (64, 64, 64)
-* WarpShape == (16, 64, 64)
+### Phase B.19 known-good config space (gated by static_assert):
+* BlockShape::M in {64, 128}
+* BlockShape::N in {64, 128, 256}
+* BlockShape::K in {64, 128, 256}
+* WarpShape::M = BlockShape::M / 4  (4 M-warps, one per TMEM sub-part)
+* WarpShape::N == 64                (single-N-warp + multi-N-warp work)
+* WarpShape::K == BlockShape::K     (no K-warp split)
 * kNumStages in {2, 3, 4}
 * has_zero_point in {True, False}
-* has_bias = False
-* All static W4A16: bf16 A × uint4 B × bf16 scales, group_size=128
+* has_bias in {True, False}
+* W4A16: bf16 A × uint4 B × bf16 scales, group_size=128
 
-### Phase B.15 open work (`xfail` in tests, gated by static_assert):
-* **BlockN > 64**: scatter writes locations correctly per a sentinel
-  probe, but `tcgen05.mma` reads the wrong half-tile for N>=64 -- the
-  symptom is `out[m, N=64..127] == out[m, N=0..63]` (verified via
-  SCATTER_SENTINEL probe writing `bf16(n+1)` at logical (n, k) and
-  observing the second half of the output repeating the first).
-  Researched CUTLASS `cute/arch/mma_sm100_desc.hpp` -- our `n_dim`,
-  `m_dim`, `sbo`, `lbo`, `version`, `base_offset`, `layout_type`
-  values all match what CUTLASS emits for BlockN >= 128. The agent's
-  best guess: a per-warp SMEM store offset miscalculation in the
-  scatter, even though the printf'd offsets look correct. Next step
-  is a host-side memcpy of `smem.b_dequant` after scatter to verify
-  the bytes physically present at N=64..127 are what we think they
-  are.
-* **BlockN < 64**: hits `kIsWarpHalfGroup=true` (WarpShape::N ==
-  ElementA::kBits*2 == 32) in loader_b, which expects a different
-  scatter pattern than the one in `tcgen05_mma.cuh::run`.
-* **BlockM > 64**: needs 8 M-warps (2 per TMEM sub-partition) plus
-  TMEM-allocation > 128 cols. Not started.
-* **BlockK > 64**: descriptor SBO assumes one 128B swizzle atom per
-  row; >64 needs multi-atom rows or 64B-swizzle. Not started.
-* **has_bias=True**: ~1.5% mismatched output. Our custom TCGEN05
-  epilogue (which bypasses smem_writer) doesn't apply bias the way
-  the gmem_writer expects. Not yet root-caused.
+### Tests: 38 passed / 1 xfail
+The remaining xfail is `WarpShape::N < 64`, which hits the
+`kIsWarpHalfGroup=true` branch in `loader_b.cuh:17` that our scatter
+doesn't model yet.
+
+### Phase B.16-B.19 resolved correctness gaps:
+* **B.16 BlockN > 64**: ✅ fixed (t2r write must use gmem_writer's
+  section-aware row layout: `smem_row = section_idx * BlockM +
+  m_full`, `smem_col = int4_col % 8`).
+* **B.17 has_bias=True**: ✅ fixed (apply bias from smem.bias in the
+  t2r f32→bf16 cast).
+* **B.18 BlockM > 64**: ✅ fixed (WarpShape::M=32 for M=128 atom, all
+  32 lanes participate in t2r).
+* **B.19 BlockK > 64**: ✅ fixed (B scatter becomes section-major to
+  match A; both descriptors use section-aware advance and SBO=64
+  fixed regardless of BlockK).
+
+### Phase B.20 open work:
+* **WarpShape::N < 64**: hits `kIsWarpHalfGroup=true` in loader_b.cuh
+  at WarpN == ElementA::kBits*2 = 32. Loader halves n_warp_id (2 N-
+  warps share an N-slice with a row offset) -- the scatter would
+  need to model this. Lower priority since other WarpN values cover
+  the useful cases.
+
+### Bug fixes (Phase B.14-B.19):
 
 ### Bug fixes in Phase B.14/B.15:
 * `tcgen05_mma.cuh`: `regs_a` was sized as `uint32_t[2][1][1]` (8 bytes)
@@ -147,6 +152,33 @@ Files we added or extended (everything else is unchanged):
 * `kernel/humming.cuh`: deferred `producer.load_stage` for TCGEN05
   kNumStages==2 so SMEM A isn't overwritten before the last K-iter's
   tcgen05.mma reads it via the SS descriptor.
+
+### Current perf bar (sm_103a, single CTA, no warp-spec, no TMA):
+TCGEN05 is correctly handling configurations across BlockShape ∈ {64,
+128} × {64, 128, 256} × {64, 128, 256}, but is consistently **2-3×
+SLOWER** than mma.sync at all measured shapes. Speedup peaks at 1.09×
+on one specific (m=512, n=256, k=1024, BlockN=128) point.
+
+The naive 1-CTA implementation pays:
+* `__syncthreads` per K-iter (vs WMMA's per-stage)
+* No TMA -- cp.async for all loads
+* No TMEM double-buffer -- can't overlap t2r with next MMA
+* Custom epilogue does serial pack-and-write
+* Each tcgen05.mma is followed by a fence-wait pair (4× per K-block)
+
+The CUTLASS strategy roadmap is the same as before but now sequenced:
+1. **Mbarrier-based MMA completion** (replace `__syncthreads` after
+   the scatter; the existing `tcgen05_commit_to_mbarrier + mbar_wait`
+   already runs at the END of the slice, just need to gate each
+   intermediate K-iter on a per-iter mbar).
+2. **Warp specialization** (load warps + math warps; remove the
+   producer.load_stage from the math-warp critical path).
+3. **TMA loads** (humming already has it for the WMMA path; needs
+   tcgen05-aware descriptor geometry).
+4. **TMEM double-buffer** (alloc 2× cols, alternate between K-blocks
+   so the t2r of block N overlaps the MMA of block N+1).
+5. **cta_group::2** (pair-of-CTAs MMA: doubles effective M tile,
+   required for peak Blackwell throughput).
 
 ### CUTLASS-style strategies to add next (after BlockN/M/K limits open):
 The current TCGEN05 path is roughly the SM100 equivalent of a naive
