@@ -88,14 +88,36 @@ Files we added or extended (everything else is unchanged):
 | `tests/bench_w4a16_baseline.py`                 | 3-way perf vs Sablefish + Marlin                           |
 | `tests/baseline_phaseA.tsv`                     | Snapshot of humming's mma.sync perf, pre-tcgen05            |
 
-## Current state
+## Current state (Phase B.14, 2026-05-19)
 
 * `tests/test_sm100_smoke.py` (10 tests, mma.sync path): **passes**.
 * `tests/baseline_phaseA.tsv`: humming's existing path is healthy across all
   shapes/batches, sets the floor we need to keep.
-* `tests/test_tcgen05.py` (TCGEN05 path): **xfail**. Kernel compiles, runs
-  to completion in ~4 s, output magnitudes match reference, but values are
-  scrambled (~85% mismatched). Layout bug in the bf16 r2s.
+* `tests/test_tcgen05.py` (TCGEN05 path): **passes** with tight tolerance
+  (rtol=1e-2, atol=0.5). All structured A patterns produce EXACT matches
+  vs mma.sync. Full sweep across (m, n, k) in {64,128,256}x{128}x
+  {128..4096} passes with max relative error <= 0.7%.
+* TCGEN05 is currently ~2.7x SLOWER than mma.sync at small tiles (64x64x64
+  block, no 2-CTA, no double-buffered TMEM, per-K-iter __syncthreads).
+  Correctness first, perf is the next phase.
+
+### Last bug fixed (Phase B.14)
+TCGEN05.mma reads A from SMEM via SS descriptor, but the WMMA-shaped
+mainloop assumes A has been pulled into RMEM by `warp_k_iters - 2`,
+after which `producer.load_stage(stage_id, ...)` starts the next
+K-block's cp.async OVER the in-use stage. For TCGEN05 that race
+corrupts the last 16 K of each K-block (verified with a single-K-
+position A=delta probe showing only k0 in {48..63, 112..127, 240..255}
+returning wrong output). Fix: for `MmaType::TCGEN05 && kNumStages==2`,
+keep the wait_stage at iter `warp_k_iters - 2` but defer the actual
+`producer.load_stage` to iter `warp_k_iters - 1`. See
+`humming/include/humming/kernel/humming.cuh:146-202`.
+
+Also `alignas(16)` is required on every per-thread storage that
+receives a vectorized int4 store (regs_a / regs_qb / regs_b_tmp in
+tcgen05_mma.cuh; as / q_as / bs / dq_bs / zp in mainloop_arith.cuh) --
+without it the compiler will silently spill to local memory at an
+unaligned offset and drop the first 8 bytes.
 
 ## Sharp edges already paid for (don't re-discover)
 
