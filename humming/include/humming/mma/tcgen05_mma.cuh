@@ -47,6 +47,7 @@
 // #define TCGEN05_DEBUG_SCATTER_SENTINEL 1
 // #define TCGEN05_DEBUG_REGS_B_SENTINEL 1
 // #define TCGEN05_DEBUG_NO_SCATTER 1
+// (the regs_qb alignas(16) fix above is the actual production change)
 
 
 // fence_proxy.async.shared::cta -- ensures prior r2s of dequantised B
@@ -100,21 +101,22 @@ public:
   // We KEEP the same regs_a layout as WMMA even though tcgen05.mma reads
   // A from SMEM, because humming's existing s2r_pipe unconditionally
   // loads A into RMEM via mma.regs_a_as_ptr(). Wastes registers but
-  // avoids forking the s2r path for Phase 0. Profile to confirm it's
-  // tolerable; if not, branch s2r_pipe on kUseTcgen05.
-  // The number of MmaShape entries here mirrors WMMA's: warp tile divided
-  // by the per-warp MmaShape.
+  // avoids forking the s2r path for Phase 0.
+  // alignas(16): humming's s2r_loader_a uses vectorized int4 stores;
+  // the same was true of regs_qb -- without explicit alignment the
+  // compiler spilled to local memory at a non-16-aligned offset and
+  // the int4 store silently produced zeros for the first 8 bytes.
   static constexpr uint32_t kFakeMmaShapeM = 16;
   static constexpr uint32_t kFakeMmaShapeK = 16;
-  uint32_t regs_a[2][MAX(1u, WarpShape::M / kFakeMmaShapeM)]
-                    [MAX(1u, kPartMmaShapeK / kFakeMmaShapeK)];
+  alignas(16) uint32_t regs_a[2][MAX(1u, WarpShape::M / kFakeMmaShapeM)]
+                                [MAX(1u, kPartMmaShapeK / kFakeMmaShapeK)];
 
   // Quantised B codes loaded by s2r_pipe (same layout as WMMA).
-  uint32_t regs_qb[2][ElementB::kBits * (16 / ElementA::kBits)];
+  alignas(16) uint32_t regs_qb[2][ElementB::kBits * (16 / ElementA::kBits)];
   // Dequantised B in RMEM, pre-r2s. Sized to the per-thread slice of the
   // BlockN x BlockK B tile (matches the post-dequant footprint of WMMA's
   // regs_b for the same warp shape).
-  uint32_t regs_b_tmp[2][WarpShape::N * kPartMmaShapeK * ElementA::kBits / 32 / 32];
+  alignas(16) uint32_t regs_b_tmp[2][WarpShape::N * kPartMmaShapeK * ElementA::kBits / 32 / 32];
   // Final post-t2r RMEM accumulator the epilogue reads. Single buffer
   // (no double-buffer like WMMA needs for register/scale gating).
   // MmaOpClass::CRegisters comes from Tcgen05OpClassImpl codegen and is
@@ -152,7 +154,7 @@ public:
     // the base pointer and overwriting on every call).
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < WarpShape::N / 16; i++) {
-      uint32_t *regs_b_ptr = regs_b_tmp[buffer_id] + i * 4u;
+      uint32_t *regs_b_ptr = &regs_b_tmp[buffer_id][i * 4u];
       uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, i);
       uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
       dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(

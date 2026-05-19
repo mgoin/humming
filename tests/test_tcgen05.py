@@ -42,16 +42,6 @@ def _is_blackwell() -> bool:
 pytestmark = pytest.mark.skipif(not _is_blackwell(), reason="tcgen05 needs sm_100+")
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Phase B.4 in progress: completion path (mbarrier-based commit/wait) "
-        "is wired up so the kernel runs to completion, but the r2s lane "
-        "mapping in transform_b doesn't yet match what tcgen05.mma expects "
-        "from the SMEM B descriptor (workbook 'B1 vs B2'). Expect wrong "
-        "math until the m16n8k16 B-fragment scatter lands."
-    ),
-    strict=False,
-)
 def test_tcgen05_w4a16_smallest():
     a_dtype = dtypes.bfloat16
     b_dtype = dtypes.uint4
@@ -150,5 +140,7 @@ def test_tcgen05_w4a16_smallest():
         f"  out nonzero frac: {(outputs.float().abs() > 1e-6).float().mean().item():.3f}"
     )
 
-    # Loose tolerance for first pass -- tighten once correct.
-    torch.testing.assert_close(outputs, outputs_ref, rtol=0.5, atol=0.5)
+    # Tight tolerance: tcgen05 path uses f32 accumulation matching mma.sync,
+    # so differences from the mma.sync reference should be bounded by bf16
+    # rounding noise (max element ~125 here -> 0.5 abs covers ~4e-3 relative).
+    torch.testing.assert_close(outputs, outputs_ref, rtol=1e-2, atol=0.5)

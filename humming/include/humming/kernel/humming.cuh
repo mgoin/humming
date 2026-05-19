@@ -150,18 +150,48 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
         constexpr uint32_t warp_k_iters = WarpShape::K / kPartMmaShapeK;
 
+        // TCGEN05 with kNumStages == 2 cannot start the next producer.load_stage
+        // for the CURRENT stage at warp_k_iter_id == warp_k_iters - 2, because
+        // the WMMA / WGMMA paths rely on s2r having already pulled the stage's
+        // A operand into RMEM by that point -- TCGEN05.mma reads A from SMEM
+        // directly via the SS descriptor, so an in-flight cp.async overwrite
+        // of smem.a[stage_id] races with the descriptor read of the last
+        // K-iter. Defer the load (and its paired sync+wait) by one iter for
+        // that case so SMEM A is stable through the final mma.run; verified
+        // empirically by the single-K-position probe showing only k=48..63
+        // / k=112..127 / k=240..255 (the last 16 K of each K-block) returning
+        // wrong output.
+        constexpr bool kIsTcgen05TwoStage =
+            MmaOpClass::kMmaType == MmaType::TCGEN05 && kNumStages == 2;
+        constexpr uint32_t kLoadTriggerIter = kIsTcgen05TwoStage
+            ? (warp_k_iters - 1) : (warp_k_iters - 2);
+
         PRAGMA_UNROLL
         for (uint32_t warp_k_iter_id = 0; warp_k_iter_id < warp_k_iters; warp_k_iter_id++) {
+          // For non-TCGEN05 paths, the wait_stage at iter `warp_k_iters - 2`
+          // also gates the s2r reads of the NEXT stage at iter
+          // `warp_k_iters - 1`. With TCGEN05's deferred load_stage, we still
+          // need that gating: split the wait_stage out so it stays at iter
+          // `warp_k_iters - 2`, but the actual load_stage moves to iter
+          // `warp_k_iters - 1`.
           s2r_pipe.load_stage_iter(stage_id, warp_k_iter_id + 1);
           mma.run(stage_id, warp_k_iter_id);
           if (warp_k_iter_id == warp_k_iters - 2) {
             if constexpr (kNumStages == 2) {
               __syncthreads();
               if (slice_iters > 1) consumer.wait_stage((stage_id + 1) % kNumStages);
-              producer.load_stage(stage_id, slice_iters > kNumStages);
+              if constexpr (!kIsTcgen05TwoStage) {
+                producer.load_stage(stage_id, slice_iters > kNumStages);
+              }
             } else {
               producer.load_stage(stage_id + kNumStages - 1, slice_iters >= kNumStages);
               if (slice_iters > 1) consumer.wait_stage((stage_id + 1) % kNumStages);
+            }
+          }
+          if constexpr (kIsTcgen05TwoStage) {
+            if (warp_k_iter_id == warp_k_iters - 1) {
+              __syncthreads();
+              producer.load_stage(stage_id, slice_iters > kNumStages);
             }
           }
 

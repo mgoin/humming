@@ -51,11 +51,14 @@ private:
   static constexpr uint32_t kNumBSPerGroup = kNumSubBlocksN * kNumBSPerSubBlock;
 
 public:
-  uint32_t as[2][kNumASPerGroup];
-  uint32_t q_as[kNumASPerGroup];
-  uint32_t bs[2][MAX(kNumBSPerGroup, 8) * ElementBS::kBits / 32];
-  uint32_t dq_bs[MAX(kNumBSPerGroup, 8) * kDequantBSBits / 32];
-  uint32_t zp[2][kIsFpZeroPoint ? 4 : CEIL_DIV(ElementB::kBits, 4)];
+  // alignas(16) on storage that may be loaded with vectorized int4
+  // stores -- without it the compiler can spill to local memory at
+  // unaligned offsets, silently dropping bytes.
+  alignas(16) uint32_t as[2][kNumASPerGroup];
+  alignas(16) uint32_t q_as[kNumASPerGroup];
+  alignas(16) uint32_t bs[2][MAX(kNumBSPerGroup, 8) * ElementBS::kBits / 32];
+  alignas(16) uint32_t dq_bs[MAX(kNumBSPerGroup, 8) * kDequantBSBits / 32];
+  alignas(16) uint32_t zp[2][kIsFpZeroPoint ? 4 : CEIL_DIV(ElementB::kBits, 4)];
 
   uint32_t _dummy;
 
