@@ -322,15 +322,15 @@ def test_tcgen05_block_n_large(block_n):
     _assert_close(outputs, outputs_ref)
 
 
-@pytest.mark.xfail(
-    reason="Phase B.15 open: BlockM>64 (8 M-warps -> 2 warps per TMEM "
-    "sub-partition) unverified. Gated by static_assert.",
-    strict=False, run=False,
-)
-def test_tcgen05_block_m_large():
+@pytest.mark.parametrize("block_n", [64, 128, 256])
+def test_tcgen05_block_m_large(block_n):
+    """Phase B.18: BlockM=128 via WarpShape::M=32 (the M=128 TMEM atom
+    places 32 valid M-values per sub-partition vs 16 for M=64). All 32
+    lanes per warp participate (the laneid<WarpShape::M gate covers
+    both cases)."""
     outputs, outputs_ref = _run_tcgen05(
-        shape_m=128, shape_n=64, shape_k=256,
-        block_shape=(128, 64, 64), warp_shape=(16, 64, 64),
+        shape_m=128, shape_n=max(block_n, 128), shape_k=256,
+        block_shape=(128, block_n, 64), warp_shape=(32, 64, 64),
         num_stages=2,
     )
     _assert_close(outputs, outputs_ref)

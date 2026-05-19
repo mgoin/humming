@@ -144,40 +144,34 @@ public:
     first_issue_ = true;
   }
 
-  // Phase B.14/B.15 known-good config space (verified by
+  // Phase B.18 known-good config space (verified by
   // tests/test_tcgen05.py):
-  //   * BlockShape::M == 64
-  //   * BlockShape::N == 64  (the smallest tcgen05.mma kind::f16 atom
-  //                           we can fit; BlockN > 64 fails with the
-  //                           N>=64 half mirroring N=0..63, BlockN<64
-  //                           hits the s2r loader_b half-group path
-  //                           that the scatter doesn't model yet)
-  //   * BlockShape::K == 64  (one 128B swizzle atom per A-row)
-  //   * WarpShape::M == 16   (4 M-warps, one per TMEM sub-partition)
-  //   * WarpShape::N == 64   (single N-warp -- 2+ N-warps unverified)
-  //   * kNumStages    in {2, 3, 4}
-  //
-  // Gate everything that ISN'T this single working configuration so
-  // unverified combinations fail clearly at build time instead of
-  // silently producing wrong outputs.
-  static_assert(BlockShape::M == 64,
-                "TCGEN05 path Phase B.15: only BlockM==64 is verified");
-  // BlockN ∈ {64, 128, 256}: BlockN=64 = single-N-warp config; BlockN
-  // >= 128 requires the section-aware smem.reduce write below to match
-  // gmem_writer's 8-int4-wide-row layout.
+  //   * BlockShape::M in {64, 128}
+  //   * BlockShape::N in {64, 128, 256}
+  //   * BlockShape::K == 64    (one 128B swizzle atom per A-row)
+  //   * WarpShape::M == BlockShape::M / 4   (4 M-warps, one per TMEM
+  //                                          sub-partition; M=64 atom
+  //                                          has 16 valid M per sub-
+  //                                          part, M=128 atom has 32)
+  //   * WarpShape::N == 64     (loader_b's kIsWarpHalfGroup path
+  //                             unmodelled at WarpN < 64)
+  //   * kNumStages in {2, 3, 4}
+  //   * has_zero_point in {True, False}
+  //   * has_bias in {True, False}
+  static_assert(BlockShape::M == 64 || BlockShape::M == 128,
+                "TCGEN05 path Phase B.18: BlockM must be 64 or 128");
   static_assert(BlockShape::N == 64 || BlockShape::N == 128
                 || BlockShape::N == 256,
-                "TCGEN05 path Phase B.15: BlockN must be 64, 128, or 256");
-  // WarpShape::N == 64 keeps `kIsWarpHalfGroup=false` in loader_b
-  // (true at WarpN == ElementA::kBits*2 == 32 -- unmodelled). With
-  // BlockN > 64 this gives multiple N-warps, which the scatter +
-  // smem.reduce write now both handle.
+                "TCGEN05 path Phase B.18: BlockN must be 64, 128, or 256");
   static_assert(WarpShape::N == 64,
-                "TCGEN05 path Phase B.15: WarpN<64 hits loader_b "
+                "TCGEN05 path Phase B.18: WarpN<64 hits loader_b "
                 "half-group path (unmodelled in scatter)");
   static_assert(BlockShape::K == 64,
-                "TCGEN05 path Phase B.15: only BlockK==64 is verified "
-                "(workbook 'B.15 BlockK>64 open')");
+                "TCGEN05 path Phase B.18: only BlockK==64 is verified "
+                "(workbook 'B.18 BlockK>64 open')");
+  static_assert(WarpShape::M * 4 == BlockShape::M,
+                "TCGEN05 path Phase B.18: must have exactly 4 M-warps "
+                "so each warp owns one TMEM sub-partition's worth of M");
 
   // Dequant int4 (from regs_qb) -> bf16 (RMEM) -> SMEM b_dequant staging.
   CUDA_INLINE
@@ -409,10 +403,10 @@ public:
     static constexpr uint32_t kMWarps = MAX(BlockShape::M / WarpShape::M, 1u);
     static constexpr uint32_t kNWarps = MAX(BlockShape::N / WarpShape::N, 1u);
     static constexpr uint32_t kCallsN = MAX(WarpShape::N / 32u, 1u);
-    static_assert(WarpShape::M == 16,
-                  "TCGEN05 path requires WarpShape::M == 16 so the 4 "
-                  "M-sub-blocks of the M=64 TMEM atom each map to a "
-                  "warp's own sub-partition.");
+    static_assert(WarpShape::M == 16 || WarpShape::M == 32,
+                  "TCGEN05 path requires WarpShape::M to be 16 (M=64 "
+                  "atom, 16 valid M per sub-partition) or 32 (M=128 "
+                  "atom, 32 valid M per sub-partition).");
 
     uint32_t warp_id = threadIdx.x / 32u;
     // TMEM access is sub-partition-bound: warp `w` can ONLY read
@@ -467,7 +461,11 @@ public:
       }
 #endif
 #endif
-      if (laneid < 16u) {
+      // For M=64 atom, only the FIRST 16 DPs per sub-partition hold
+      // valid M values (DPs 16..31 are uninitialised); for M=128 atom
+      // ALL 32 DPs are valid. Gate the SMEM write by `laneid <
+      // WarpShape::M` so the same code handles both cases.
+      if (laneid < WarpShape::M) {
         uint32_t m_full = (m_warp_id * WarpShape::M) + laneid;
         uint32_t col_int4_base = (n_warp_id * WarpShape::N + ni * 32u) / 8u;
         PRAGMA_UNROLL
