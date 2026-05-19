@@ -230,6 +230,84 @@ multi-cast B and is correct-but-perf-neutral on its own.
 M doubling). Worth picking up again when we're ready to take the
 cluster-shared producer/consumer pipeline refactor.
 
+## Phase B.33: TMEM double-buffer attempt -- two blockers found, reverted
+
+Goal: alloc 2x TMEM cols (Acc0 at base+0, Acc1 at base+128), alternate
+per tile, defer wait+t2r+epilogue so HW pipelines tile T's MMAs in
+parallel with tile T-1's mbar wait + t2r. CUTLASS's `Acc0/Acc1`
+pattern.
+
+### Blocker 1: `smem.reduce` is unioned with `smem.a/b`
+
+`storage.cuh:154` puts the epilogue staging buffer (`smem.reduce`)
+in a `union` with the K-loop stages (`smem.a`, `smem.b`,
+`smem.b_dequant`, ...) to save SMEM. Once we defer the drain to the
+NEXT iteration:
+
+  iter T: K-loop T (uses smem.a/b for tile T) -> commit T
+  iter T+1: K-loop T+1 (overwrites smem.a/b with tile T+1's data) ->
+            commit T+1 -> drain pending=T (t2r writes smem.reduce,
+            which ALIASES smem.a/b at this point)
+
+The t2r write to smem.reduce now collides with whatever producer
+iter T+2 (started after consumer.arrive(kNumStages) for tile T+1)
+has written to the same SMEM. Output is correct on the FIRST few
+elements (where the writes happen to agree) but wildly wrong on
+the rest (rel ~0.5-1.2 across our shapes).
+
+Fix would require splitting `smem.reduce` out of the union so it
+has its own SMEM, which costs another ~32KB per CTA -- may or may
+not fit at our typical BlockN=128 + stages=3 SMEM budget. Worth
+re-examining when we're ready to do the SharedStorage refactor.
+
+### Blocker 2: alternating TMEM cols 0..127 vs 128..255 is 2.7x slower
+
+Even WITHOUT the deferred-drain pipelining (i.e. just alternating
+`acc_buf` per tile, keeping commit+wait+t2r+epilogue sequential),
+the WS path regresses on Llama70B-down M=2048:
+
+```
+tcgen05 bm=128 bk=128 ws=True (baseline / HEAD):    2848 us
+tcgen05 bm=128 bk=128 ws=True (alloc<256>, no alt): 2853 us  (~no change)
+tcgen05 bm=128 bk=128 ws=True (alloc<256>, alt):    7812 us  (2.7x SLOWER)
+```
+
+Bisection: `alloc<256>` alone does not regress (alloc returns col=0
+and the kernel keeps using cols 0..127). `acc_buf` alternation per
+tile -- using cols 128..255 on alternating tiles -- causes the
+regression. Plausible explanations (none verified):
+* tcgen05.mma at high TMEM col bases hits a different sub-partition
+  layout that the kind::f16 atom doesn't pipeline as well.
+* d_tmem encoding subtlety -- the col index bit-range may interact
+  with M-coord bits when the col exceeds 128.
+* TMEM allocator places the 256-col region in a way that splits
+  the (M=128, N=128) accumulator across two physical regions for
+  acc_buf=1.
+
+Worth instrumenting with NCU's `gpc__cycles_active_per_warp` or
+similar to see whether the slowdown is on the MMA side (HW
+pipelining) or the t2r side (TMEM read latency).
+
+### Status: reverted
+
+Both blockers are real. The plumbing changes (SharedStorage
+`tcgen05_mbar[2]`, `init_tmem_alloc()` / `release_tmem()` helpers,
+per-buf `first_issue_` / `mbar_phase_` arrays, `final_regs_c(buf_id)`
+split from commit) are correct and pass tests/test_tcgen05.py
+unchanged, but they don't deliver a perf win without resolving (1)
+and (2). The whole attempt is reverted.
+
+Next perf step is uncertain -- options:
+* **Investigate blocker 2 with NCU.** If the cause is e.g. col-range
+  bit interactions, we may be able to use `tcgen05_alloc<128>` x2
+  (two separate 128-col allocs) instead of one alloc<256>.
+* **Take the SharedStorage refactor** to split smem.reduce out of
+  the union. If that fits the SMEM budget, blocker 1 dissolves.
+  We can then re-attempt pipelining, IF blocker 2 is also resolved.
+* **Different perf lever**. stmatrix-based scatter (workbook B.30
+  followup), or revisiting the cta_group::2 path now that we've
+  documented its inter-CTA sync requirement.
+
 ## Phase B.30: dtype-sweep correctness — missing epilogue exp_offset rescale (2026-05-19)
 
 **TL;DR**: TCGEN05 was wrong for any (A, B) combo whose
