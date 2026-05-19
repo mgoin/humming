@@ -298,6 +298,10 @@ public:
       uint32_t warp_id_local = threadIdx.x / 32u;
       uint32_t n_warp_id_scatter = warp_id_local % kNWarps;
       uint32_t n_base = n_warp_id_scatter * WarpShape::N;
+      // (Phase B.24 experiment: gating the scatter to a single M-warp
+      // per N-group regressed perf slightly -- the HW serialises the
+      // 4-way bank conflict in the duplicate stores better than the
+      // divergent branch overhead. Documented in workbook 'B.24'.)
       // Hardware Swizzle<3,4,3> applies to the absolute byte address:
       // the descriptor encodes (smem_base >> 4) in its start_address,
       // and the HW XOR'ing of bits [4, 7) uses bits [7, 10) of the
