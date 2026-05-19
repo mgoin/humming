@@ -116,10 +116,13 @@ Files we added or extended (everything else is unchanged):
 * has_bias in {True, False}
 * W4A16: bf16 A × uint4 B × bf16 scales, group_size=128
 
-### Tests: 38 passed / 1 xfail
-The remaining xfail is `WarpShape::N < 64`, which hits the
-`kIsWarpHalfGroup=true` branch in `loader_b.cuh:17` that our scatter
-doesn't model yet.
+### Tests: 69 passed / 1 xfail (Phase B.27)
+* 44 tcgen05 path tests (block shapes / stages / zp / bias / TMA / WS)
+* 15 sm100-heuristic tests (TCGEN05 crossover decisions)
+* 10 sm100 smoke + 66 zp/shape tests still pass
+* Single remaining xfail: `WarpShape::N < 64` (kIsWarpHalfGroup loader_b
+  path unmodelled in scatter; low priority since other configs cover
+  the useful cases)
 
 ### Phase B.16-B.19 resolved correctness gaps:
 * **B.16 BlockN > 64**: ✅ fixed (t2r write must use gmem_writer's
@@ -219,12 +222,16 @@ The CUTLASS strategy roadmap, with status:
    between K-blocks so the t2r of block N overlaps the MMA of block
    N+1. Requires restructuring the outer loop to process multiple
    output tiles per CTA.
-10. **cta_group::2** (still TODO, big potential): pair-of-CTAs MMA;
-    doubles effective M tile. Required for peak Blackwell throughput.
-11. **Heuristic tune.sm100 update** (still TODO): pick TCGEN05 vs
-    mma.sync per (shape_m, shape_n, shape_k); currently the user
-    must pass `mma_type="tcgen05"` explicitly. The bench identifies
-    the M >= 128 crossover for our supported configs.
+10. **cta_group::2** (TODO, big potential, B.27 PTX wrappers landed):
+    pair-of-CTAs MMA; doubles effective M tile. Required for peak
+    Blackwell throughput. Wrappers in `tcgen05.cuh` are stubbed but
+    unreferenced; wiring requires multi-CTA cluster launch + leader/
+    peer cooperation in the mainloop. Multi-day effort.
+11. ✅ **Heuristic tune.sm100 update** (Phase B.26 / B.26-followup):
+    `Sm100Heuristics.get_config()` auto-selects TCGEN05 for W4A16
+    bf16 at M >= 128 (fat-N) / M >= 512 (fat-K). Uses BlockM=128,
+    BlockN=128 (fallback to 64 if shape_n % 128 != 0), stages=4,
+    WS+TMA on. 15-case test suite pins the crossover behaviour.
 
 ### CUTLASS-style strategies to add next (after BlockN/M/K limits open):
 The current TCGEN05 path is roughly the SM100 equivalent of a naive
