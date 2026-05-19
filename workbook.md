@@ -153,11 +153,27 @@ doesn't model yet.
   kNumStages==2 so SMEM A isn't overwritten before the last K-iter's
   tcgen05.mma reads it via the SS descriptor.
 
-### Current perf bar (sm_103a, single CTA, no warp-spec; Phase B.23):
+### Current perf bar (sm_103a, Phase B.24, BlockM=128 + stages=3 + WS):
 TCGEN05 correctness covers BlockShape ∈ {64, 128} × {64, 128, 256} ×
 {64, 128, 256}, kNumStages ∈ {2, 3, 4}, has_{zp, bias} ∈ {T, F}, TMA
-on/off. **Perf is 0.62-0.70× of mma.sync** at all measured shapes,
-down from the initial 0.37× ratio at the start of perf work.
+on/off, warp-spec on/off (44 tests pass / 1 xfail).
+
+**TCGEN05 is consistently 1.13-1.33× FASTER than mma.sync at M >=
+128** on realistic LLM weight shapes. Realistic-bench summary:
+
+  shape                  M=128  M=256  M=512  M=1024  M=2048
+  Llama8B  qkv (6144/4096)  1.28x  1.28x  0.98x  1.29x  1.20x
+  Llama8B  gate(14336/4096) 1.28x  1.29x  1.14x  1.21x  1.26x
+  Llama8B  down(4096/14336) 0.67x  0.67x  1.26x  1.28x  1.15x
+  Llama70B qkv (10240/8192) 1.29x  0.98x  1.09x  1.17x  1.30x
+  Llama70B gate(28672/8192) 1.33x  1.17x  1.24x  1.28x  1.31x  (peak)
+  Llama70B down(8192/28672) 0.69x  1.30x  1.32x  1.15x  1.30x
+
+  (full sweep in benchmarks/bench_tcgen05_vs_wmma.py)
+
+M < 128 still slower (~0.68×) because BlockM=64 minimum pads up and
+the per-CTA setup is amortised over very few output tiles. M=128-256
+is the crossover; > 256 is consistently TCGEN05's territory.
 
 The B.21→B.23 perf rounds gave:
   k=4096, BlockN=128: 114 us → 62 us (1.84× internal speedup)

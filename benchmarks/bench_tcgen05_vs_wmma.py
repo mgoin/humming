@@ -46,7 +46,7 @@ def time_kernel(launch_fn, warmup=10, iters=50):
 
 
 def build_launcher(shape_m, shape_n, shape_k, mma_type, block_m=64,
-                   block_n=128, num_stages=3):
+                   block_n=128, num_stages=3, use_warp_spec=False):
     if mma_type == "tcgen05":
         # TCGEN05 path: BlockM ∈ {64, 128}, WarpM = BlockM/4.
         block_shape = (block_m, block_n, 64)
@@ -54,6 +54,7 @@ def build_launcher(shape_m, shape_n, shape_k, mma_type, block_m=64,
     else:
         block_shape = (block_m, block_n, 64)
         warp_shape = (16, 64, 64)
+        use_warp_spec = False  # WS for wmma reference disabled
 
     torch.manual_seed(123)
     w = generate_random_weight(
@@ -74,7 +75,11 @@ def build_launcher(shape_m, shape_n, shape_k, mma_type, block_m=64,
         a_dtype=A_DTYPE, b_dtype=B_DTYPE, c_dtype=C_DTYPE, bs_dtype=BS_DTYPE,
         weight_scale_group_size=GROUP_SIZE, has_zero_point=True,
         num_stages=num_stages,
-        use_warp_spec=False, use_tma=False, use_cp_async=True,
+        use_warp_spec=use_warp_spec,
+        use_tma=use_warp_spec,
+        use_cp_async=not use_warp_spec,
+        use_mbarrier=use_warp_spec,
+        use_tma_bzp=False,
         has_bias=False, mma_type=mma_type,
         use_tcgen05=(mma_type == "tcgen05"), use_stream_k=False,
     )
@@ -121,25 +126,37 @@ def fmt(t):
     return f"{t:>9.2f}" if isinstance(t, float) else f"{t:>9s}"[:9]
 
 
+def best_tcgen05(m, n, k):
+    """Pick the best TCGEN05 launcher across (block_m, use_warp_spec)."""
+    candidates = []
+    for bm in [64, 128] if m >= 128 else [64]:
+        for ws in [False, True]:
+            t = bench_one(m, n, k, "tcgen05", block_m=bm, use_warp_spec=ws)
+            if isinstance(t, float):
+                candidates.append((t, bm, ws))
+    if not candidates:
+        return None, None, None
+    t, bm, ws = min(candidates)
+    return t, bm, ws
+
+
 def main():
     print(
-        f"{'shape':<22s} {'M':>5s} {'wmma µs':>10s} {'tcg µs':>10s} {'tcg/wmma':>10s}"
+        f"{'shape':<22s} {'M':>5s} {'wmma µs':>10s} {'tcg µs':>10s} "
+        f"{'tcg cfg':>10s} {'tcg/wmma':>10s}"
     )
     for label, n, k in SHAPES:
         for m in MS:
             t_wmma = bench_one(m, n, k, "mma")
-            # Try BlockM=64 first; at higher M, BlockM=128 may be faster.
-            t_tcg = bench_one(m, n, k, "tcgen05", block_m=64)
-            if isinstance(t_tcg, float) and m >= 128:
-                t_tcg2 = bench_one(m, n, k, "tcgen05", block_m=128)
-                if isinstance(t_tcg2, float):
-                    t_tcg = min(t_tcg, t_tcg2)
+            t_tcg, bm, ws = best_tcgen05(m, n, k)
             if isinstance(t_wmma, float) and isinstance(t_tcg, float):
                 ratio = f"{t_wmma / t_tcg:>9.2f}x"
+                cfg = f"M{bm}{'+ws' if ws else ''}"
             else:
                 ratio = "   --   "
+                cfg = "  --  "
             print(f"  {label:<20s} {m:>5d} {fmt(t_wmma):>10s} "
-                  f"{fmt(t_tcg):>10s} {ratio:>10s}")
+                  f"{fmt(t_tcg):>10s} {cfg:>10s} {ratio:>10s}")
         print()
 
 
