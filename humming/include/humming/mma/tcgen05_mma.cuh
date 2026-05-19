@@ -477,10 +477,25 @@ public:
           uint32_t *packed_u32 = reinterpret_cast<uint32_t *>(&packed);
           float *src_fp32 =
               reinterpret_cast<float *>(tmp + int4_in_quarter * 8u);
+          // Per-N base for the 8 bf16 we're about to pack into one
+          // int4. With LayerConfig::kHasBias, smem.bias holds
+          // BlockN bf16 values laid out linearly (bias[n] = bias for
+          // output column n); add it to C before the f32->bf16 cast.
+          uint32_t int4_col_global_for_n =
+              (n_warp_id * WarpShape::N + ni * 32u) / 8u
+              + int4_in_quarter;
+          uint32_t n_base_pack = int4_col_global_for_n * 8u;
           PRAGMA_UNROLL
           for (uint32_t pair = 0; pair < 4u; pair++) {
             float f0 = src_fp32[pair * 2u + 0u];
             float f1 = src_fp32[pair * 2u + 1u];
+            if constexpr (LayerConfig::kHasBias) {
+              const __nv_bfloat16 *smem_bias_bf16 =
+                  reinterpret_cast<const __nv_bfloat16 *>(&smem.bias[0]);
+              uint32_t n0 = n_base_pack + pair * 2u;
+              f0 += __bfloat162float(smem_bias_bf16[n0]);
+              f1 += __bfloat162float(smem_bias_bf16[n0 + 1u]);
+            }
             __nv_bfloat162 v = __floats2bfloat162_rn(f0, f1);
             packed_u32[pair] = *reinterpret_cast<uint32_t *>(&v);
           }

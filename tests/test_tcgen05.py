@@ -365,19 +365,24 @@ def test_tcgen05_warp_n_small():
     _assert_close(outputs, outputs_ref)
 
 
-@pytest.mark.xfail(
-    reason="Phase B.15 open: has_bias=True path adds bias in the epilogue, "
-    "but our custom TCGEN05 epilogue (which skips smem_writer.write) "
-    "doesn't currently apply bias correctly -- max|err| ~ 2 at |ref|.max "
-    "~ 140 (~1.5%), 50%+ mismatched.",
-    strict=False, run=False,
+# ---------------------------------------------------------------------------
+# has_bias=True: the t2r-pack loop now reads `smem.bias` and applies it
+# in fp32 before the f32->bf16 cast. (Originally we just skipped
+# smem_writer.write for TCGEN05, which lost the WMMA path's bias
+# add.) All 4 (has_zero_point, has_bias) combinations pass.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "has_zero_point, has_bias",
+    [(True, False), (False, False), (True, True), (False, True)],
 )
-def test_tcgen05_has_bias():
+def test_tcgen05_zp_bias(has_zero_point, has_bias):
     outputs, outputs_ref = _run_tcgen05(
         shape_m=128, shape_n=64, shape_k=256,
         block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
         num_stages=2,
-        has_zero_point=True,
-        has_bias=True,
+        has_zero_point=has_zero_point,
+        has_bias=has_bias,
     )
     _assert_close(outputs, outputs_ref)
