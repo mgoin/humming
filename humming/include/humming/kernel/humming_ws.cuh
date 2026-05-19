@@ -213,8 +213,15 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   }
 
   __syncthreads();
-  if constexpr (TuningConfig::kMultiCastSizeA > 0 || TuningConfig::kMultiCastSizeB > 0) {
-    asm volatile("barrier.cluster.arrive;\n");
-    asm volatile("barrier.cluster.wait;\n");
-  }
+  // Phase B.31: The previous version issued
+  //   barrier.cluster.arrive; barrier.cluster.wait;
+  // here, gated by `kMultiCastSizeA > 0 || kMultiCastSizeB > 0` (which
+  // is ALWAYS true since both default to 1). That cluster barrier was
+  // the actual cause of the long-standing "TMA multi-cast B hangs"
+  // bit-rot documented in workbook B.29 -- cluster-size>1 launches
+  // would deadlock here. The cluster barrier is not required for
+  // correctness (the non-WS humming.cuh path also has no end-of-kernel
+  // cluster sync, and produces correct results under multi-cast),
+  // and removing it is sufficient to make multi-cast B work in the
+  // WS path on Blackwell.
 };
