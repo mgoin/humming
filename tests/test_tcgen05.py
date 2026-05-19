@@ -70,6 +70,8 @@ def _build_w4a16_problem(shape_m, shape_n, shape_k, group_size, has_zero_point):
     weight_scale = prepare_humming_weight_scale(weight_scale, to_apply_on_c=False)
     if has_zero_point:
         zero_point = prepare_humming_zero_point(zero_point, dtype=b_dtype)
+    else:
+        zero_point = None
 
     _, inputs_ref, inputs, _ = generate_random_inputs(
         m=shape_m, k=shape_k, group_size=0, dtype=a_dtype,
@@ -82,6 +84,7 @@ def _run_tcgen05(
     block_shape, warp_shape,
     num_stages,
     has_zero_point=True,
+    has_bias=False,
     group_size=128,
 ):
     """Construct a TCGEN05 kernel, run it on a random problem, and
@@ -96,6 +99,10 @@ def _run_tcgen05(
     inputs_ref, inputs, weight, weight_scale, zero_point, weight_ref = (
         _build_w4a16_problem(shape_m, shape_n, shape_k, group_size, has_zero_point)
     )
+    bias = None
+    if has_bias:
+        torch.manual_seed(456)
+        bias = torch.randn(shape_n, dtype=torch.bfloat16, device=inputs.device)
 
     kernel = HummingKernel(
         shape_n=shape_n,
@@ -112,24 +119,32 @@ def _run_tcgen05(
         use_warp_spec=False,
         use_tma=False,
         use_cp_async=True,
-        has_bias=False,
+        has_bias=has_bias,
         mma_type="tcgen05",
         use_tcgen05=True,
         use_stream_k=False,
     )
 
-    outputs_ref = inputs_ref.matmul(weight_ref.T).to(torch.bfloat16)
+    outputs_ref = inputs_ref.matmul(weight_ref.T)
+    if has_bias:
+        outputs_ref = outputs_ref + bias
+    outputs_ref = outputs_ref.to(torch.bfloat16)
     torch.cuda.synchronize()
 
     from humming import ops
     outputs = torch.empty(
         (shape_m, shape_n), dtype=torch.bfloat16, device=inputs.device,
     )
-    ops.launch_kernel(
+    launch_kwargs = dict(
         configs=[kernel.kernel_id],
         inputs=inputs, weight=weight, outputs=outputs,
-        weight_scale=weight_scale, zero_point=zero_point,
+        weight_scale=weight_scale,
     )
+    if zero_point is not None:
+        launch_kwargs["zero_point"] = zero_point
+    if bias is not None:
+        launch_kwargs["bias"] = bias
+    ops.launch_kernel(**launch_kwargs)
     torch.cuda.synchronize()
     return outputs, outputs_ref
 
@@ -266,6 +281,24 @@ def test_tcgen05_delta_a(k0):
 
 
 # ---------------------------------------------------------------------------
+# LayerConfig variant: zero-point on/off. The (has_zero_point=False)
+# path skips the zp-load + zp-apply branches in
+# `mainloop_arith.cuh::may_apply_bs_and_zp_on_b`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("has_zero_point", [True, False])
+def test_tcgen05_zero_point(has_zero_point):
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=128, shape_n=64, shape_k=256,
+        block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
+        num_stages=2,
+        has_zero_point=has_zero_point,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
 # Gated configs (xfail, strict=False). These should xfail at build time
 # (static_assert in tcgen05_mma.cuh); we capture them here so we'll get
 # an `XPASS` if a future change makes them work, signalling that the
@@ -300,5 +333,52 @@ def test_tcgen05_block_m_large():
         shape_m=128, shape_n=64, shape_k=256,
         block_shape=(128, 64, 64), warp_shape=(16, 64, 64),
         num_stages=2,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+@pytest.mark.xfail(
+    reason="Phase B.15 open: BlockK>64 needs multi-atom-per-row swizzle "
+    "(SBO recomputation). Gated by static_assert.",
+    strict=False, run=False,
+)
+def test_tcgen05_block_k_large():
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=128, shape_n=64, shape_k=256,
+        block_shape=(64, 64, 128), warp_shape=(16, 64, 128),
+        num_stages=2,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+@pytest.mark.xfail(
+    reason="Phase B.15 open: WarpN<64 hits the loader_b half-group path "
+    "(kIsWarpHalfGroup=true at WarpShape::N == ElementA::kBits*2 = 32) "
+    "that the scatter doesn't model.",
+    strict=False, run=False,
+)
+def test_tcgen05_warp_n_small():
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=128, shape_n=32, shape_k=256,
+        block_shape=(64, 32, 64), warp_shape=(16, 32, 64),
+        num_stages=2,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+@pytest.mark.xfail(
+    reason="Phase B.15 open: has_bias=True path adds bias in the epilogue, "
+    "but our custom TCGEN05 epilogue (which skips smem_writer.write) "
+    "doesn't currently apply bias correctly -- max|err| ~ 2 at |ref|.max "
+    "~ 140 (~1.5%), 50%+ mismatched.",
+    strict=False, run=False,
+)
+def test_tcgen05_has_bias():
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=128, shape_n=64, shape_k=256,
+        block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
+        num_stages=2,
+        has_zero_point=True,
+        has_bias=True,
     )
     _assert_close(outputs, outputs_ref)

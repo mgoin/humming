@@ -143,30 +143,33 @@ public:
     first_issue_ = true;
   }
 
-  // Phase B.14 known-good config space (verified by tests/test_tcgen05.py):
+  // Phase B.14/B.15 known-good config space (verified by
+  // tests/test_tcgen05.py):
   //   * BlockShape::M == 64
-  //   * BlockShape::N == 64  (== WarpShape::N -> exactly one N-warp)
+  //   * BlockShape::N == 64  (the smallest tcgen05.mma kind::f16 atom
+  //                           we can fit; BlockN > 64 fails with the
+  //                           N>=64 half mirroring N=0..63, BlockN<64
+  //                           hits the s2r loader_b half-group path
+  //                           that the scatter doesn't model yet)
   //   * BlockShape::K == 64  (one 128B swizzle atom per A-row)
   //   * WarpShape::M == 16   (4 M-warps, one per TMEM sub-partition)
+  //   * WarpShape::N == 64   (single N-warp -- 2+ N-warps unverified)
   //   * kNumStages    in {2, 3, 4}
   //
-  // BlockN > 64 currently produces wrong output for N>=64 (verified
-  // with a SCATTER_SENTINEL probe: warp 0 writes n+1 at N=0..63 OK,
-  // warp 1 writes n+1 at N=64..127 LOCATIONS but the descriptor's
-  // n_dim=N/8 encoding causes the MMA to read the wrong half-tile of
-  // smem.b_dequant -- the workbook records the open question). Gate it
-  // here so the build fails clearly instead of silently producing 30%
-  // wrong outputs.
+  // Gate everything that ISN'T this single working configuration so
+  // unverified combinations fail clearly at build time instead of
+  // silently producing wrong outputs.
   static_assert(BlockShape::M == 64,
-                "TCGEN05 path Phase B.14: only BlockM==64 is verified");
-  static_assert(BlockShape::N == WarpShape::N,
-                "TCGEN05 path Phase B.14: only single-N-warp configs "
-                "are verified (BlockN must equal WarpShape::N)");
-  static_assert(BlockShape::N <= 64,
-                "TCGEN05 path Phase B.14: BlockN > 64 currently produces "
-                "wrong output (workbook 'B.15 N>64 mismatch'); revert "
-                "this assert once the multi-N-warp scatter/descriptor "
-                "is fixed");
+                "TCGEN05 path Phase B.15: only BlockM==64 is verified");
+  static_assert(BlockShape::N == 64,
+                "TCGEN05 path Phase B.15: only BlockN==64 is verified "
+                "(workbook 'B.15 N>64 / N<64 open')");
+  static_assert(WarpShape::N == 64,
+                "TCGEN05 path Phase B.15: only WarpN==64 (single "
+                "N-warp) is verified");
+  static_assert(BlockShape::K == 64,
+                "TCGEN05 path Phase B.15: only BlockK==64 is verified "
+                "(workbook 'B.15 BlockK>64 open')");
 
   // Dequant int4 (from regs_qb) -> bf16 (RMEM) -> SMEM b_dequant staging.
   CUDA_INLINE
