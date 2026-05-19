@@ -196,26 +196,35 @@ The naive 1-CTA implementation pays:
 * Custom epilogue does serial pack-and-write
 * Each tcgen05.mma is followed by a fence-wait pair (4× per K-block)
 
-The CUTLASS strategy roadmap is now sequenced:
-1. ✅ **TMA loads** (Phase B.20, no measurable wall-time delta -- not
-   the bottleneck for our shapes).
+The CUTLASS strategy roadmap, with status:
+1. ✅ **TMA loads** (Phase B.20, no measurable wall-time delta).
 2. ✅ **Vectorised scatter** (Phase B.21, 1.5× win).
-3. ✅ **Drop redundant fences** (Phase B.22/B.23).
-4. **Math-only `__syncthreads`** (replace the post-scatter
-   `__syncthreads` in `TCGEN05::run` with a `bar.sync 1, N` named
-   barrier covering only the math threads). Required prerequisite
-   for warp-spec.
-5. **Warp specialization** with the named barrier in place.
-   Empirically `use_warp_spec=True` for TCGEN05 currently deadlocks
-   -- the math-side `__syncthreads` waits for the producer threads
-   who never reach it. Needs #4 first.
-6. **Mbarrier-based MMA completion** per K-iter (gate next scatter
-   on previous MMA retirement instead of overwriting after the
-   __syncthreads).
-7. **TMEM double-buffer** (alloc 2× cols, alternate between K-blocks
-   so the t2r of block N overlaps the MMA of block N+1).
-8. **cta_group::2** (pair-of-CTAs MMA: doubles effective M tile,
-   required for peak Blackwell throughput).
+3. ✅ **Drop redundant fences** (Phase B.22/B.23, +8-15%).
+4. ✅ **Math-only `__syncthreads`** (Phase B.24, prerequisite for WS).
+5. ✅ **Warp specialization** (Phase B.24, 2-3% on top of others).
+6. ❌ **M-warp scatter split** (Phase B.25 NEG, reverted): assigning
+   each M-warp a different `i` slice (instead of all 4 M-warps doing
+   the full scatter) regressed perf 5-8% with WS enabled. HW
+   serialises the 4-way bank conflict of duplicate stores faster than
+   the divergent branch overhead. **Don't retry this.**
+7. ❌ **stmatrix.x4 scatter** (analytically rejected): the
+   `mma.m16n8k16` B fragment per-thread bf16 layout doesn't match
+   stmatrix's expected (row=lane%8, col=2*(lane/8)+i) layout. Would
+   need a warp shuffle to remap before stmatrix; not free.
+8. **Per-K-iter mbarrier-based MMA completion** (still TODO): gate
+   the next scatter on previous MMA retirement instead of the broad
+   bar.sync. Likely small win (~5%) since the bar.sync over math
+   threads is already cheap.
+9. **TMEM double-buffer** (still TODO): alloc 2× cols, alternate
+   between K-blocks so the t2r of block N overlaps the MMA of block
+   N+1. Requires restructuring the outer loop to process multiple
+   output tiles per CTA.
+10. **cta_group::2** (still TODO, big potential): pair-of-CTAs MMA;
+    doubles effective M tile. Required for peak Blackwell throughput.
+11. **Heuristic tune.sm100 update** (still TODO): pick TCGEN05 vs
+    mma.sync per (shape_m, shape_n, shape_k); currently the user
+    must pass `mma_type="tcgen05"` explicitly. The bench identifies
+    the M >= 128 crossover for our supported configs.
 
 ### CUTLASS-style strategies to add next (after BlockN/M/K limits open):
 The current TCGEN05 path is roughly the SM100 equivalent of a naive
