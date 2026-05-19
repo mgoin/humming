@@ -63,7 +63,16 @@ def build_launcher(shape_m, shape_n, shape_k, mma_type, block_m=64,
         dtype=B_DTYPE, scale_dtype=BS_DTYPE, has_zero_point=True,
     )
     _, _, weight, weight_scale, zero_point, _ = w
-    weight_p = prepare_humming_weight(weight, B_DTYPE, A_DTYPE, use_wgmma=False)
+    # Phase B.30: `prepare_humming_weight` must receive `zero_point` so the
+    # repacker takes the sign-magnitude with-zp preprocessing path the
+    # kernel expects (utils/weight.py:203-211). Without it, the repacker
+    # silently produces no-zp-shaped weight bytes and the kernel runs the
+    # with-zp dequant on them -- the timing is similar but the output is
+    # garbage. We don't check correctness here, but if you ever copy this
+    # block to a correctness test, remember the kwarg.
+    weight_p = prepare_humming_weight(
+        weight, B_DTYPE, A_DTYPE, zero_point=zero_point, use_wgmma=False,
+    )
     weight_scale_p = prepare_humming_weight_scale(weight_scale, to_apply_on_c=False)
     zero_point_p = prepare_humming_zero_point(zero_point, dtype=B_DTYPE)
     _, _, inputs, _ = generate_random_inputs(
