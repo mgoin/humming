@@ -69,7 +69,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       LayerConfig, TuningConfig>;
   using WMMA = WMMA<MmaOpClass, SharedStorage, MainloopArithmetic, WarpShape, ElementA, ElementB, LayerConfig>;
   using WGMMA = WGMMA<MmaOpClass, SharedStorage, MainloopArithmetic, BlockShape, WarpShape, ElementA, ElementB, LayerConfig>;
-  using TCGEN05 = TCGEN05<MmaOpClass, SharedStorage, MainloopArithmetic, BlockShape, WarpShape, ElementA, ElementB, LayerConfig>;
+  using TCGEN05 = TCGEN05<MmaOpClass, SharedStorage, MainloopArithmetic, BlockShape, WarpShape, ElementA, ElementB, LayerConfig, TuningConfig>;
   using MMA = std::conditional_t<
       MmaOpClass::kMmaType == MmaType::TCGEN05, TCGEN05,
       std::conditional_t<MmaOpClass::kMmaType == MmaType::WGMMA, WGMMA, WMMA>>;
@@ -140,6 +140,21 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     auto s2r_pipe = S2RMemoryPipeline(smem, mma, epilogue);
 
     consumer.init_mbarrir();
+    // TCGEN05 init (mirrors humming.cuh:114-124): the math side
+    // performs `tcgen05.alloc<128>` from warp 0 and initialises the
+    // mbar for tcgen05.commit. Both must complete before the first
+    // MMA issues. The producer side is parked at its own
+    // __syncthreads above and isn't affected by this init.
+    if constexpr (MmaOpClass::kMmaType == MmaType::TCGEN05) {
+      if (threadIdx.x < 32) {
+        uint32_t smem_addr =
+            cast_smem_ptr_to_uint(&smem.tcgen05_tmem_col);
+        tcgen05_alloc<128>(smem_addr);
+      }
+      if (threadIdx.x == 0) {
+        __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
+      }
+    }
     __syncthreads();
     consumer.arrive(kNumStages);
 
@@ -184,6 +199,16 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       epilogue.call(mma.final_regs_c_as_ptr());
       if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
       consumer.arrive(kNumStages);
+    }
+    // Release TMEM (mirrors humming.cuh:185-191). All 32 threads of
+    // warp 0 must execute together since tcgen05.{dealloc,
+    // relinquish_alloc_permit} are .sync.aligned.
+    if constexpr (MmaOpClass::kMmaType == MmaType::TCGEN05) {
+      __syncthreads();
+      if (threadIdx.x < 32) {
+        tcgen05_relinquish_alloc_permit();
+        tcgen05_dealloc<128>(smem.tcgen05_tmem_col);
+      }
     }
   }
 

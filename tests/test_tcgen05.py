@@ -87,6 +87,7 @@ def _run_tcgen05(
     has_bias=False,
     group_size=128,
     use_tma=False,
+    use_warp_spec=False,
 ):
     """Construct a TCGEN05 kernel, run it on a random problem, and
     return (outputs, outputs_ref). Reference is computed BEFORE the
@@ -117,10 +118,10 @@ def _run_tcgen05(
         weight_scale_group_size=group_size,
         has_zero_point=has_zero_point,
         num_stages=num_stages,
-        use_warp_spec=False,
-        use_tma=use_tma,
-        use_cp_async=not use_tma,
-        use_mbarrier=use_tma,
+        use_warp_spec=use_warp_spec,
+        use_tma=use_tma or use_warp_spec,
+        use_cp_async=not (use_tma or use_warp_spec),
+        use_mbarrier=use_tma or use_warp_spec,
         # use_tma_bzp must be False when has_zero_point + is_group_weight_scale --
         # humming's tensor.h asserts on TMA for that combination.
         use_tma_bzp=False,
@@ -321,6 +322,27 @@ def test_tcgen05_tma(use_tma, has_zero_point):
         num_stages=2,
         has_zero_point=has_zero_point,
         use_tma=use_tma,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# Warp specialization (Phase B.24). Math threads use bar.sync 1, math
+# instead of __syncthreads so the producer warps aren't dragged into
+# every per-K-iter scatter sync. Requires use_tma + use_mbarrier (the
+# producer pipeline drives gmem -> smem via TMA + mbarrier-based
+# completion).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("has_zero_point", [True, False])
+def test_tcgen05_warp_spec(has_zero_point):
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=128, shape_n=64, shape_k=512,
+        block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
+        num_stages=3,
+        has_zero_point=has_zero_point,
+        use_warp_spec=True,
     )
     _assert_close(outputs, outputs_ref)
 

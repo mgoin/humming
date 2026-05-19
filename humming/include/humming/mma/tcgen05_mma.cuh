@@ -30,6 +30,7 @@
 
 #include <humming/utils/all.cuh>
 #include <humming/utils/ptx/barrier.cuh>
+#include <humming/utils/ptx/shared.cuh>
 #include <humming/utils/ptx/tcgen05.cuh>
 
 // Debug switches (set to non-zero to enable):
@@ -63,7 +64,7 @@ template <
     class MmaOpClass_, class SharedStorage, class ArithClass,
     class BlockShape, class WarpShape,
     class ElementA, class ElementB,
-    class LayerConfig>
+    class LayerConfig, class TuningConfig>
 struct TCGEN05 {
 public:
   using MmaOpClass = MmaOpClass_;
@@ -361,11 +362,16 @@ public:
     }
 #endif
     // The scatter above uses regular SMEM stores (non-async), so the
-    // implicit __threadfence_block from __syncthreads is sufficient
-    // to make them visible to subsequent tcgen05.mma SMEM reads. The
-    // earlier explicit `fence_proxy_async_shared_cta()` was a holdover
-    // from when we expected to use async copies for the scatter.
-    __syncthreads();
+    // implicit __threadfence_block from the bar.sync/__syncthreads is
+    // sufficient to make them visible to subsequent tcgen05.mma SMEM
+    // reads. We use sync_part_threads which becomes:
+    //   * __syncthreads() when kNumMathThreads == kNumThreads
+    //     (non-warp-spec path)
+    //   * bar.sync 1, kNumMathThreads when kNumMathThreads <
+    //     kNumThreads (warp-spec path; producer threads must NOT be
+    //     awaited here -- they're busy doing gmem->smem loads).
+    sync_part_threads<TuningConfig::kNumMathThreads,
+                      TuningConfig::kNumThreads>();
 
     // ---- now build descriptors + issue tcgen05.mma ----
     // A descriptor reads from smem.a[stage_id]; advance the pointer by
@@ -576,7 +582,10 @@ public:
         }
       }
     }
-    __syncthreads();
+    // Math-only barrier (same reasoning as the post-scatter one above):
+    // collapses to __syncthreads when not in warp-spec mode.
+    sync_part_threads<TuningConfig::kNumMathThreads,
+                      TuningConfig::kNumThreads>();
     return nullptr;
   }
 

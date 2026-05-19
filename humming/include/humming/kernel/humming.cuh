@@ -69,7 +69,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       LayerConfig, TuningConfig>;
   using WMMA = WMMA<MmaOpClass, SharedStorage, MainloopArithmetic, WarpShape, ElementA, ElementB, LayerConfig>;
   using WGMMA = WGMMA<MmaOpClass, SharedStorage, MainloopArithmetic, BlockShape, WarpShape, ElementA, ElementB, LayerConfig>;
-  using TCGEN05 = TCGEN05<MmaOpClass, SharedStorage, MainloopArithmetic, BlockShape, WarpShape, ElementA, ElementB, LayerConfig>;
+  using TCGEN05 = TCGEN05<MmaOpClass, SharedStorage, MainloopArithmetic, BlockShape, WarpShape, ElementA, ElementB, LayerConfig, TuningConfig>;
   using MMA = std::conditional_t<
       MmaOpClass::kMmaType == MmaType::TCGEN05, TCGEN05,
       std::conditional_t<MmaOpClass::kMmaType == MmaType::WGMMA, WGMMA, WMMA>>;
