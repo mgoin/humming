@@ -66,6 +66,17 @@ def _is_tcgen05_eligible(meta, shape_m: int, gemm_type: GemmType) -> bool:
         # cutoff we'll add after verification.
         if shape_m < 512:
             return False
+    # Tile-count check: TCGEN05's BlockM=128 + BlockN=128 means each
+    # CTA covers 128*128 output cells. For shapes with few output
+    # tiles (e.g. Llama-8B qkv at M=128 has just 1 M-tile × 48
+    # N-tiles = 48 CTAs, under 1/3 of B300's 144 SMs), mma.sync's
+    # smaller per-CTA tile size spreads the work across more SMs and
+    # wins by ~30%. Require at least 64 output tiles per slice
+    # before opting into TCGEN05.
+    n_tiles = (meta.shape_n + 127) // 128
+    m_tiles = (shape_m + 127) // 128
+    if n_tiles * m_tiles < 64:
+        return False
     return True
 
 

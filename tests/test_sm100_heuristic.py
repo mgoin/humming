@@ -127,3 +127,13 @@ def test_heuristic_non_w4a16_falls_through():
     )
     cfg = Sm100Heuristics.get_config(meta, shape_m=512)
     assert cfg.get("mma_type") != "tcgen05"
+
+
+def test_heuristic_tile_count_fallback():
+    """Small shape_n at M=128 -> too few CTAs -> fall back to mma.sync.
+    Llama-8B qkv (N=6144, K=4096) at M=128 has 1 M-tile × 48 N-tiles
+    = 48 output tiles, under our 64-tile floor."""
+    meta = _make_meta(6144, 4096)
+    assert not _is_tcgen05_eligible(meta, 128, GemmType.DENSE)
+    # Same shape at M=256 (96 tiles) crosses the floor.
+    assert _is_tcgen05_eligible(meta, 256, GemmType.DENSE)
