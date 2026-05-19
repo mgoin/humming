@@ -79,9 +79,43 @@ CUDA_INLINE void tcgen05_alloc(uint32_t smem_addr_for_col_index) {
   }
 }
 
+// cta_group::2 variant: leader CTA in a 2x cluster issues this; the
+// allocator returns a column index in shared::cluster (visible from
+// both CTAs' TMEM views). The peer CTA must NOT also call alloc; it
+// reads the result from the leader's smem_addr_for_col_index after
+// the cluster barrier.
+template <uint32_t NumColumns>
+CUDA_INLINE void tcgen05_alloc_2cta(uint32_t smem_addr_for_col_index) {
+  static_assert(NumColumns == 32 || NumColumns == 64 || NumColumns == 128 ||
+                NumColumns == 256 || NumColumns == 512,
+                "tcgen05_alloc_2cta<N>: N must be 32/64/128/256/512");
+  if constexpr (NumColumns == 32) {
+    asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], 32;\n"
+                 :: "r"(smem_addr_for_col_index) : "memory");
+  } else if constexpr (NumColumns == 64) {
+    asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], 64;\n"
+                 :: "r"(smem_addr_for_col_index) : "memory");
+  } else if constexpr (NumColumns == 128) {
+    asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], 128;\n"
+                 :: "r"(smem_addr_for_col_index) : "memory");
+  } else if constexpr (NumColumns == 256) {
+    asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], 256;\n"
+                 :: "r"(smem_addr_for_col_index) : "memory");
+  } else if constexpr (NumColumns == 512) {
+    asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], 512;\n"
+                 :: "r"(smem_addr_for_col_index) : "memory");
+  }
+}
+
 CUDA_INLINE void tcgen05_relinquish_alloc_permit() {
   asm volatile(
       "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;\n"
+      ::: "memory");
+}
+
+CUDA_INLINE void tcgen05_relinquish_alloc_permit_2cta() {
+  asm volatile(
+      "tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;\n"
       ::: "memory");
 }
 
@@ -125,6 +159,29 @@ CUDA_INLINE void tcgen05_dealloc(uint32_t tmem_col_index) {
                  :: "r"(tmem_col_index) : "memory");
   } else if constexpr (NumColumns == 512) {
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;\n"
+                 :: "r"(tmem_col_index) : "memory");
+  }
+}
+
+template <uint32_t NumColumns>
+CUDA_INLINE void tcgen05_dealloc_2cta(uint32_t tmem_col_index) {
+  static_assert(NumColumns == 32 || NumColumns == 64 || NumColumns == 128 ||
+                NumColumns == 256 || NumColumns == 512,
+                "tcgen05_dealloc_2cta<N>: N must be 32/64/128/256/512");
+  if constexpr (NumColumns == 32) {
+    asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, 32;\n"
+                 :: "r"(tmem_col_index) : "memory");
+  } else if constexpr (NumColumns == 64) {
+    asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, 64;\n"
+                 :: "r"(tmem_col_index) : "memory");
+  } else if constexpr (NumColumns == 128) {
+    asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, 128;\n"
+                 :: "r"(tmem_col_index) : "memory");
+  } else if constexpr (NumColumns == 256) {
+    asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, 256;\n"
+                 :: "r"(tmem_col_index) : "memory");
+  } else if constexpr (NumColumns == 512) {
+    asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, 512;\n"
                  :: "r"(tmem_col_index) : "memory");
   }
 }
@@ -331,6 +388,30 @@ CUDA_INLINE void tcgen05_mma_ss_bf16(uint32_t d_tmem,
       : "memory");
 }
 
+// cta_group::2 variant: issued by leader CTA in a 2x cluster. The
+// effective MMA shape is (2 * BlockM, BlockN); the leader writes
+// M=0..BlockM-1 to its TMEM, the peer CTA gets M=BlockM..2*BlockM-1
+// in its own TMEM (cluster-aligned). The peer MUST be at a cluster
+// barrier when this issues -- it does not call this PTX itself.
+CUDA_INLINE void tcgen05_mma_ss_bf16_2cta(uint32_t d_tmem,
+                                          uint64_t a_desc,
+                                          uint64_t b_desc,
+                                          uint32_t idesc,
+                                          bool scale_d) {
+  uint32_t mask[4] = {0u, 0u, 0u, 0u};
+  asm volatile(
+      "{\n\t"
+      "  .reg .pred p;\n\t"
+      "  setp.ne.b32 p, %4, 0;\n\t"
+      "  tcgen05.mma.cta_group::2.kind::f16 "
+      "    [%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t"
+      "}\n"
+      :: "r"(d_tmem), "l"(a_desc), "l"(b_desc), "r"(idesc),
+         "r"((uint32_t)scale_d),
+         "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
+      : "memory");
+}
+
 
 // ============================================================================
 // Group commit / wait
@@ -363,6 +444,12 @@ CUDA_INLINE void tcgen05_commit_to_mbarrier(uint32_t mbar_smem_addr) {
   // subsequent mbarrier.try_wait spins forever.
   asm volatile(
       "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n"
+      :: "r"(mbar_smem_addr) : "memory");
+}
+
+CUDA_INLINE void tcgen05_commit_to_mbarrier_2cta(uint32_t mbar_smem_addr) {
+  asm volatile(
+      "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.b64 [%0];\n"
       :: "r"(mbar_smem_addr) : "memory");
 }
 
