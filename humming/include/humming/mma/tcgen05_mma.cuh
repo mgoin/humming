@@ -305,54 +305,53 @@ public:
       // amount and must be included here.
       uint32_t smem_base_div_128 =
           cast_smem_ptr_to_uint(smem_b_bf16) >> 7;
+      // Pack 2 adjacent bf16 into one uint32 store: per PTX Table 32
+      // (mma.m16n8k16.f16 B fragment), v=2p and v=2p+1 share the same
+      // n and k_lo and have k_hi = k_lo + 1 -- so the 2 bf16 land at
+      // 2 adjacent SMEM bytes inside the same swizzle column. The XOR
+      // phase depends on bits [4..7) of the byte address and 2
+      // adjacent bytes differ only in bit 0, so both bf16's of a pair
+      // get the same `xor_shift` -- one uint32 store does both. This
+      // halves the per-K-iter SMEM store count vs the prior per-bf16
+      // loop.
+      uint32_t *regs_b_u32_buf =
+          reinterpret_cast<uint32_t *>(regs_b_tmp[buffer_id]);
+      uint32_t *smem_b_u32 =
+          reinterpret_cast<uint32_t *>(&smem.b_dequant[buffer_id][0]);
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kCalls; i++) {
         PRAGMA_UNROLL
-        for (uint32_t v = 0; v < kBf16PerCall; v++) {
-          uint32_t frag_id = v / 4u;
-          uint32_t v_in_frag = v % 4u;
+        for (uint32_t frag_id = 0; frag_id < 2u; frag_id++) {
           uint32_t n = n_base + i * 16u + 8u * frag_id + (t / 4u);
-          uint32_t k = k_base + 2u * (t % 4u) + (v_in_frag & 1u)
-                     + 8u * (v_in_frag >> 1);
-          // Section-major B: K is split into 64-K-bf16 sections; each
-          // section's row stride is fixed at 128 B. linear_in_section
-          // uses the within-section K offset (`k % kKPerSectionB`),
-          // and the section_offset_bytes jumps over the previous
-          // sections.
-          uint32_t k_section = k / kKPerSectionB;
-          uint32_t k_in_section = k % kKPerSectionB;
-          uint32_t section_offset_bytes = k_section * kBSectionSizeBytes;
-          uint32_t linear_in_section =
-              n * kRowBytes + k_in_section * sizeof(__nv_bfloat16);
-          uint32_t linear_bytes = section_offset_bytes + linear_in_section;
-          // HW Swizzle<3,4,3> XORs bits [4..7) with bits [7..10) of
-          // the absolute byte address. Within a 128B-row section, the
-          // row stride is 128 B so `linear_in_section >> 7 == n`
-          // (the per-section row index). The section_offset always
-          // moves by a multiple of 128 B × (BlockN / 8) -- which is
-          // 0 mod 8 for any BlockN multiple of 8, so it doesn't
-          // affect the XOR phase. Use the within-section bytes for
-          // the XOR contribution.
-          uint32_t xor_shift =
-              (smem_base_div_128 + (linear_in_section >> 7)) & 7u;
-          uint32_t swizzled = linear_bytes ^ (xor_shift << 4);
-          uint32_t reg_index = i * kBf16PerCall + v;
+          PRAGMA_UNROLL
+          for (uint32_t pair_idx = 0; pair_idx < 2u; pair_idx++) {
+            // pair (v_lo=4*frag_id+2*pair_idx, v_hi=v_lo+1) writes
+            // the bf16 pair at (n, k_lo) and (n, k_lo + 1).
+            uint32_t k_lo = k_base + 2u * (t % 4u) + 8u * pair_idx;
+            uint32_t v_lo = frag_id * 4u + pair_idx * 2u;
+            uint32_t reg_index_pair = (i * kBf16PerCall + v_lo) / 2u;
+            uint32_t k_section = k_lo / kKPerSectionB;
+            uint32_t k_in_section = k_lo % kKPerSectionB;
+            uint32_t section_offset_bytes = k_section * kBSectionSizeBytes;
+            uint32_t linear_in_section =
+                n * kRowBytes + k_in_section * sizeof(__nv_bfloat16);
+            uint32_t linear_bytes = section_offset_bytes + linear_in_section;
+            uint32_t xor_shift =
+                (smem_base_div_128 + (linear_in_section >> 7)) & 7u;
+            uint32_t swizzled = linear_bytes ^ (xor_shift << 4);
 #ifdef TCGEN05_DEBUG_SCATTER_SENTINEL
-          float sentinel_f = float(n) + 1.0f;
-          __nv_bfloat16 sentinel_bf16 = __float2bfloat16(sentinel_f);
-          smem_b_bf16[swizzled / sizeof(__nv_bfloat16)] = sentinel_bf16;
-#elif defined(TCGEN05_DEBUG_NO_SCATTER)
-          // Only thread 0 v=0 i=0 writes bf16(2.671875) at (n=0, k=0).
-          // Expected: output[m, 0] = A[m, 0] * 2.671875 = 2.671875 (for A=delta).
-          if (threadIdx.x % 32 == 0 && i == 0 && v == 0 && iter_id == 0) {
-            __nv_bfloat16 val = __float2bfloat16(2.671875f);
-            smem_b_bf16[swizzled / sizeof(__nv_bfloat16)] = val;
-          }
-          (void)regs_b_bf16;
-          (void)reg_index;
+            __nv_bfloat16 lo_bf16 = __float2bfloat16(float(n) + 1.0f);
+            __nv_bfloat16 hi_bf16 = __float2bfloat16(float(n) + 1.0f);
+            uint32_t packed =
+                (static_cast<uint32_t>(
+                     *reinterpret_cast<uint16_t *>(&hi_bf16)) << 16) |
+                static_cast<uint32_t>(
+                    *reinterpret_cast<uint16_t *>(&lo_bf16));
+            smem_b_u32[swizzled / sizeof(uint32_t)] = packed;
 #else
-          smem_b_bf16[swizzled / sizeof(__nv_bfloat16)] = regs_b_bf16[reg_index];
+            smem_b_u32[swizzled / sizeof(uint32_t)] = regs_b_u32_buf[reg_index_pair];
 #endif
+          }
         }
       }
     }
