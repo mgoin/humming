@@ -88,6 +88,70 @@ Files we added or extended (everything else is unchanged):
 | `tests/bench_w4a16_baseline.py`                 | 3-way perf vs Sablefish + Marlin                           |
 | `tests/baseline_phaseA.tsv`                     | Snapshot of humming's mma.sync perf, pre-tcgen05            |
 
+## Phase B.31: end-of-WS-kernel cluster barrier was the multi-cast B hang (2026-05-19)
+
+**TL;DR**: The "TMA multi-cast B hangs on Blackwell" bit-rot documented in
+B.29 was caused by an end-of-kernel
+`barrier.cluster.arrive; barrier.cluster.wait;` pair in
+`kernel/humming_ws.cuh`, gated by `kMultiCastSizeA > 0 || kMultiCastSizeB > 0`
+-- a gate that's ALWAYS true since both default to 1. For cluster_size==1
+the cluster barrier is a no-op, so the bug was invisible until you tried
+cluster_size>1 (= the multi-cast configurations). Removing the cluster bar
+makes multi-cast B work and produces correct outputs.
+
+**Bisection** (`humming/include/humming/kernel/humming_ws.cuh:228-246`):
+* remove only `__syncthreads()` -> hang shifts much earlier (kernel body
+  never reaches end)
+* keep `__syncthreads()`, remove the cluster bar -> kernel completes
+  with correct output (rel=5.21e-3 vs ref) on every tested shape
+
+The non-WS path (`humming.cuh`) has no equivalent end-of-kernel cluster
+sync and works correctly under multi-cast, confirming the cluster bar
+isn't load-bearing.
+
+**Multi-cast B alone is not a perf win**:
+After unblocking, swept Llama70B-down / Llama70B-gate / Llama8B-gate at
+M in {128, 256, 512, 1024, 2048}. Speedup of mc_b=2 over mc_b=1 is
+0.97x-0.99x across the board (essentially noise -- multi-cast B halves
+B-bandwidth but our kernel is not B-bandwidth-bound at these shapes).
+At very small M, mc_b=2 *regresses* (0.49x-0.51x) because the cluster
+needs >= 2 tile-clusters of work and we underfill.
+
+The real perf win from B.27's `cta_group::2` PTX wrappers comes from
+PAIRING cta_group::2 (1 MMA covers 2x M) with multi-cast B. That's the
+next step: see "Wiring cta_group::2 into TCGEN05" below.
+
+### Still-broken multi-cast configurations (out of scope for B.31):
+* `mma + (mc_a=2 AND mc_b=2)` simultaneously still hangs. The single
+  multi-cast configs (mc_a alone or mc_b alone) work; the combined
+  config doesn't. Not on the TCGEN05 critical path; needs separate
+  investigation if anyone wants the combined config.
+
+### Wiring cta_group::2 into TCGEN05 (next step, not yet done):
+Required edits in `humming/include/humming/mma/tcgen05_mma.cuh` and
+the cluster-init in `humming/include/humming/kernel/humming.cuh` /
+`humming/include/humming/kernel/humming_ws.cuh`:
+
+1. Branch on `kMultiCastSizeB == 2` to use the `_2cta` PTX wrappers
+   (`tcgen05_alloc_2cta`, `tcgen05_mma_ss_bf16_2cta`,
+   `tcgen05_commit_to_mbarrier_2cta`, `tcgen05_dealloc_2cta`).
+2. Only LEADER (cluster_rank=0) issues the tcgen05.mma; the peer must
+   be at a matching cluster barrier when the issue happens. The
+   `_2cta` mma writes the first BlockM rows of output to leader's
+   TMEM and the second BlockM rows to peer's TMEM (cluster-aligned).
+3. The current scheduler partitions m_block_id between leader/peer
+   with `m_block_id * mc_b + cluster_rank`. That's already correct
+   for cta_group::2 -- leader handles m=base, peer handles m=base+1,
+   and tcgen05.mma's 2*BlockM tile naturally covers both.
+4. Each CTA still does its own t2r locally (cta_group::2 only
+   couples the MMA issue, not the per-CTA TMEM read).
+5. Cluster init: switch `tcgen05_alloc<128>` to `tcgen05_alloc_2cta<128>`
+   when cluster_size==2, and gate it on `elect_one_sync()` of the
+   leader so only one CTA issues the cluster-shared alloc.
+
+This is a substantial refactor (~200 LoC of branching in
+`tcgen05_mma.cuh`) but the PTX wrappers are already in place.
+
 ## Phase B.30: dtype-sweep correctness — missing epilogue exp_offset rescale (2026-05-19)
 
 **TL;DR**: TCGEN05 was wrong for any (A, B) combo whose
