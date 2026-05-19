@@ -90,15 +90,38 @@ class Sm100Heuristics(Sm89Heuristics):
             # TCGEN05 config matches what
             # `benchmarks/bench_tcgen05_vs_wmma.py` shows as the
             # peak-throughput point (BlockM=128, BlockN=128, BlockK=64,
-            # 4 M-warps, single N-warp, kNumStages=3, warp-spec on).
-            # BlockN=128 is the sweet spot for the realistic shapes we
-            # measured -- BlockN=64 gives more parallelism per CTA but
-            # the per-CTA overhead dominates; BlockN=256 saturates SMEM
-            # too quickly and loses occupancy.
+            # 4 M-warps, single N-warp, kNumStages=4, warp-spec on).
+            #
+            # BlockN=128 is the sweet spot for the realistic shapes
+            # we measured -- BlockN=64 gives more parallelism per CTA
+            # but the per-CTA overhead dominates; BlockN=256 doesn't
+            # consistently win in our sweep (the heuristic is left at
+            # 128 for safety; benchmarks/bench_blocksize.py shows 256
+            # is within noise for almost all cases).
+            #
+            # stages=4 wins consistently over stages=3 in the sweep
+            # (Llama70B down M=2048: 2965 vs 3013 us, ~1.6%). SMEM
+            # cost rises but well within the 227 KiB budget.
+            block_n = 128
+            # shape_n must be a multiple of block_n; humming asserts
+            # this in `check_shape`. Fall back to 64 if shape_n's only
+            # divisible by 64.
+            if meta.shape_n % 128 != 0:
+                if meta.shape_n % 64 == 0:
+                    block_n = 64
+                else:
+                    # No valid TCGEN05 BlockN for this shape; fall
+                    # through to the mma.sync heuristic.
+                    return super().get_config(
+                        meta=meta, shape_m=shape_m,
+                        use_f16_accum=use_f16_accum,
+                        use_batch_invariant=use_batch_invariant,
+                        gemm_type=gemm_type,
+                    )
             return {
-                "block_shape": (128, 128, 64),
+                "block_shape": (128, block_n, 64),
                 "warp_shape": (32, 64, 64),
-                "num_stages": 3,
+                "num_stages": 4,
                 "num_ctas_per_sm": 1,
                 "num_write_splits": 1,
                 "mma_type": "tcgen05",
