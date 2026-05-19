@@ -169,6 +169,19 @@ public:
                 "TCGEN05 path Phase B.18: K-warps not supported -- "
                 "tcgen05.mma covers the full BlockK by issuing one MMA "
                 "per 16-K-bf16 atom from a single warp.");
+  // Phase B.30: TCGEN05 currently issues `tcgen05.mma.kind::f16` via
+  // `tcgen05_mma_ss_bf16` with `tcgen05_instr_desc_bf16_bf16_f32` --
+  // both hardcoded to bf16. Wiring up the fp16 A/B path requires
+  // distinct instruction-descriptor builders + the matching scatter
+  // (fp16 in SMEM has different exponent semantics than bf16) which
+  // is unimplemented today. Reject ElementA != BFloat16 at build time
+  // until that lands; otherwise the bf16-shaped instruction reads
+  // fp16 bit patterns and produces garbage (error magnitudes 1e16+).
+  static_assert(std::is_same<ElementA, BFloat16>::value,
+                "TCGEN05 path Phase B.30: only bf16 A is wired up "
+                "today. tcgen05.mma + scatter assume bf16 throughout; "
+                "fp16 A would need a parallel instruction-descriptor "
+                "+ scatter path.");
 
   // Dequant int4 (from regs_qb) -> bf16 (RMEM) -> SMEM b_dequant staging.
   CUDA_INLINE

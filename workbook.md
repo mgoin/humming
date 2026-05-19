@@ -122,14 +122,33 @@ re-do this from scratch):
   `may_apply_on_smem_write` guard).
 
 **Coverage now**:
-* `tests/test_tcgen05_dtypes.py`: 12 passed / 5 skipped (humming
-  check_dtype rejects: signed-int B × fp A; uint with zp + kBits ≤ 6
-  requirement; etc) / 21 xfail (humming-level bugs that ALSO fail in
-  WMMA -- fp16-A entirely, bf16×uint{7,8}+zp).
-* The "humming-level" bucket isn't a TCGEN05 regression. The WMMA path
-  also produces wrong numbers vs the float reference humming builds in
-  `utils/weight.py::dequantize_weight`. Separate investigation needed in
-  humming itself before that group becomes testable.
+* `tests/test_tcgen05_dtypes.py`: 14 passed / 24 skipped, 0 fails.
+* The earlier "humming-level bug" suspicion for bf16×uint{7,8}+zp was
+  a test bug: `prepare_humming_weight()` MUST receive
+  `zero_point=zero_point` when the kernel runs with has_zero_point.
+  Forgetting it makes the repacker skip the sign-magnitude preprocess
+  the dequant expects → garbage outputs in BOTH WMMA and TCGEN05. The
+  test file (and any /tmp scratch comparing WMMA vs TCGEN05) needs
+  that arg, which the new `test_tcgen05_dtypes.py::_run_w_a` does.
+* The fp16-A failure was real but for a different reason: TCGEN05's
+  instruction descriptor is hardcoded
+  (`tcgen05_instr_desc_bf16_bf16_f32`) and the issue helper is
+  `tcgen05_mma_ss_bf16` -- both bf16-only. Added a static_assert in
+  `tcgen05_mma.cuh` rejecting `ElementA != BFloat16`. The test skips
+  these combos explicitly since nvrtc surfaces the static_assert as a
+  generic `RuntimeError: run failed` rather than a parseable assert.
+
+**Wiring fp16-A into TCGEN05 (future work, B.31?)**:
+* tcgen05.mma.kind::f16 accepts both bf16 AND fp16, so the PTX side
+  exists. Need parallel `tcgen05_instr_desc_f16_f16_f32` +
+  `tcgen05_mma_ss_f16` helpers, plus a path-select in TCGEN05::run().
+* The scatter assumes nothing dtype-specific (it writes uint32 pairs
+  of generic 16-bit values), so it should be reusable as-is once the
+  SMEM contents are fp16 instead of bf16.
+* `final_regs_c_as_ptr()` casts f32 → bf162; would need a `kIsF16Out`
+  dispatch to cast to f162 instead. ElementC is currently
+  bf16-default; check whether any caller wants fp16-out before paying
+  for this.
 
 **Still NOT supported in TCGEN05's bypass-smem_writer path**:
 * `kIsChannelInputScale` (would need `may_apply_f32_on_smem_write` on

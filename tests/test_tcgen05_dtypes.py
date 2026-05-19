@@ -43,7 +43,15 @@ def _run_w_a(a_dtype, b_dtype, has_zero_point, shape_m=128, shape_n=128,
         has_zero_point=has_zero_point,
     )
     _, weight_ref, weight, weight_scale, zero_point, _ = random_weight
-    weight_prep = prepare_humming_weight(weight, b_dtype, a_dtype, use_wgmma=False)
+    # CRITICAL: pass zero_point into prepare_humming_weight so the
+    # repacker applies the sign-magnitude preprocessing the kernel
+    # expects. Forgetting this produces wildly wrong outputs that look
+    # like a kernel bug -- it's not.
+    weight_prep = prepare_humming_weight(
+        weight, b_dtype, a_dtype,
+        zero_point=zero_point if has_zero_point else None,
+        use_wgmma=False,
+    )
     weight_scale_prep = prepare_humming_weight_scale(weight_scale, to_apply_on_c=False)
     zp_prep = (prepare_humming_zero_point(zero_point, dtype=b_dtype)
                if has_zero_point else None)
@@ -128,20 +136,10 @@ B_DTYPES_BF16 = [
     ("float8e5m2", False),
 ]
 
-# (b_name, has_zp) -> humming-level bug (also fails in WMMA). The
-# preceding fix to TCGEN05's epilogue rescale (mainloop_arith.cuh +
-# tcgen05_mma.cuh) cleared up every bf16-A failure that was tcgen05-
-# specific; the cases remaining below produce wrong outputs from BOTH
-# WMMA and TCGEN05, so they're not TCGEN05 regressions to fix here.
-# Verified 2026-05-19 via tools/compare_wmma_tcgen05 -- both paths
-# diverge from the float reference by the same factor for these.
-HUMMING_LEVEL_BF16_BUGS = {
-    # `normalized_uint_to_fp` with zero-point: kBits > mantissa-1 cases
-    # produce values inconsistent with the float reference humming
-    # builds via `dequantize_weight` (utils/weight.py:122-156).
-    ("uint7", True),
-    ("uint8", True),
-}
+# bf16-A: every narrower B works after the Phase B.30 epilogue rescale
+# fix (commit 3f48690). No xfails required here; humming check_dtype
+# already skips the combos it rejects at build time.
+HUMMING_LEVEL_BF16_BUGS = set()
 
 
 @pytest.mark.parametrize("b_name, has_zp", B_DTYPES_BF16)
@@ -183,14 +181,14 @@ def test_tcgen05_fp16_x_b(b_name, has_zp):
     b_dtype = dtypes.DataType.from_str(b_name)
     if b_dtype.num_bits >= a_dtype.num_bits:
         pytest.skip(f"b={b_name} is not narrower than fp16")
-    # humming-level bug: fp16-A produces wrong outputs across the whole
-    # narrower-B sweep in BOTH WMMA and TCGEN05 (verified 2026-05-19).
-    # Likely a humming bug in the fp16 dequant exponent/zero-point math
-    # since the same combos work for bf16 A. Out of scope for the
-    # TCGEN05 fix that landed alongside this test file.
-    pytest.xfail(
-        f"humming-level bug: fp16 x {b_name} (zp={has_zp}) also fails "
-        "in WMMA -- not TCGEN05-specific"
+    # Phase B.30: TCGEN05 hard-rejects ElementA != BFloat16 via
+    # static_assert in tcgen05_mma.cuh (tcgen05.mma + scatter are
+    # bf16-only today). nvrtc surfaces this as a non-zero compiler
+    # exit, not a Python AssertionError, so skip explicitly rather
+    # than relying on the build-error catch.
+    pytest.skip(
+        f"TCGEN05 currently only supports bf16 A; fp16 A would need a "
+        "parallel instruction-descriptor + scatter path."
     )
     try:
         outputs, outputs_ref = _run_w_a(a_dtype, b_dtype, has_zp)
