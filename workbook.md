@@ -143,6 +143,23 @@ Files we added or extended (everything else is unchanged):
   need to model this. Lower priority since other WarpN values cover
   the useful cases.
 
+### B.29 negative experiments (documented for future to avoid retry):
+* **BlockN=256** (vs 128): 15-50% SLOWER across all measured shapes.
+  The bigger N per CTA means more scatter writes per K-iter, and
+  the SMEM budget for BlockK=128 + stages>=3 doesn't fit -- so we'd
+  have to drop to bk=64 or stages=2, both of which lose more than
+  the larger N coverage gains.
+* **num_stages=5** at BlockK=64 (vs 4): no measurable change. Load
+  latency is already hidden at 4 stages on B300.
+* **num_ctas_per_sm=2**: SMEM doesn't fit; even with bk=64 stages=2
+  the dual-CTA SMEM exceeds the 227 KiB budget.
+* **Per-M-warp scatter gating** (B.25 negative): hurts 5-8% with
+  warp-spec. HW serialises the bank-conflict in duplicate stores
+  faster than the divergent branch overhead.
+* **TMA multi-cast B** (B.29): hangs with TCGEN05 (humming's
+  `test_multi_cast.py` fails many cases on Blackwell anyway -- the
+  cluster mbarrier plumbing has bit-rotted independently).
+
 ### Bug fixes (Phase B.14-B.19):
 
 ### Bug fixes in Phase B.14/B.15:
@@ -236,6 +253,13 @@ The CUTLASS strategy roadmap, with status:
     Blackwell throughput. Wrappers in `tcgen05.cuh` are stubbed but
     unreferenced; wiring requires multi-CTA cluster launch + leader/
     peer cooperation in the mainloop. Multi-day effort.
+10a. **TMA multi-cast B (cluster=2)** as a SIMPLER precursor: just
+    set `multi_cast_size_b=2`, no MMA changes. **Tested in B.29 and
+    HANGS** with the TCGEN05 kernel — the existing tests
+    `test_multi_cast.py` also fail many cases on B300/sm_103a, so
+    humming's multi-cast wiring has bit-rotted on Blackwell
+    independently of TCGEN05. Fixing humming's cluster mbarrier
+    plumbing is a prerequisite. Not pursued further.
 11. ✅ **Heuristic tune.sm100 update** (Phase B.26 / B.26-followup):
     `Sm100Heuristics.get_config()` auto-selects TCGEN05 for W4A16
     bf16 at M >= 128 (fat-N) / M >= 512 (fat-K). Uses BlockM=128,
