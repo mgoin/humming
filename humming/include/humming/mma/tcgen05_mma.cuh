@@ -494,7 +494,11 @@ public:
 #else
       uint32_t addr = base_addr + ni * 32u;
       tcgen05_ld_32x32b_x32(addr, tmp);
-      tcgen05_fence_view_async_tmem_store();
+      // No per-ni `tcgen05_fence_view_async_tmem_store()` -- the
+      // outer commit+mbar_wait that drained the K-loop MMA chain
+      // (above) already ordered TMEM writes vs these reads, and
+      // consecutive `tcgen05.ld` calls within the same warp don't
+      // race against each other.
 #ifdef TCGEN05_DEBUG_TMEM_DUMP
       // Print tmp[0..3] (= C[M=laneid, N=n_base+ni*32 + 0..3]) for lane
       // 0 of each warp. With A=delta(k=0) + SCATTER_SENTINEL, C[M=lane,
