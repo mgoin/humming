@@ -87,21 +87,18 @@ class Sm100Heuristics(Sm89Heuristics):
         gemm_type=GemmType.DENSE,
     ):
         if _is_tcgen05_eligible(meta, shape_m, gemm_type):
-            # TCGEN05 config matches what
-            # `benchmarks/bench_tcgen05_vs_wmma.py` shows as the
-            # peak-throughput point (BlockM=128, BlockN=128, BlockK=64,
-            # 4 M-warps, single N-warp, kNumStages=4, warp-spec on).
+            # TCGEN05 config selected per benchmarks/bench_blocksize +
+            # bench_blockk_fatk:
             #
-            # BlockN=128 is the sweet spot for the realistic shapes
-            # we measured -- BlockN=64 gives more parallelism per CTA
-            # but the per-CTA overhead dominates; BlockN=256 doesn't
-            # consistently win in our sweep (the heuristic is left at
-            # 128 for safety; benchmarks/bench_blocksize.py shows 256
-            # is within noise for almost all cases).
-            #
-            # stages=4 wins consistently over stages=3 in the sweep
-            # (Llama70B down M=2048: 2965 vs 3013 us, ~1.6%). SMEM
-            # cost rises but well within the 227 KiB budget.
+            #   BlockN=128: sweet spot. (BlockN=64 underuses each CTA;
+            #     BlockN=256 saturates SMEM and loses occupancy.)
+            #   BlockK=64 at M=128 (single M-tile per CTA): the K-loop
+            #     pipeline depth matters more than larger MMA per
+            #     issue, so stages=4 + BlockK=64 wins by ~10% over
+            #     BlockK=128.
+            #   BlockK=128 at M >= 256: bigger MMA per issue halves
+            #     the K-iter count and wins 5-8% over BlockK=64. Fits
+            #     SMEM at stages=3 (227 KiB budget).
             block_n = 128
             # shape_n must be a multiple of block_n; humming asserts
             # this in `check_shape`. Fall back to 64 if shape_n's only
@@ -118,10 +115,20 @@ class Sm100Heuristics(Sm89Heuristics):
                         use_batch_invariant=use_batch_invariant,
                         gemm_type=gemm_type,
                     )
+            # BlockK + stages co-tuned by SMEM budget:
+            #   bk=64  -> stages=4 (≈ 192 KiB used)
+            #   bk=128 -> stages=3 (≈ 272 KiB used; we use 227 KiB
+            #             budget so bk=128 + stages=4 doesn't fit).
+            if shape_m >= 256 and meta.shape_k % 128 == 0:
+                block_k = 128
+                num_stages = 3
+            else:
+                block_k = 64
+                num_stages = 4
             return {
-                "block_shape": (128, block_n, 64),
-                "warp_shape": (32, 64, 64),
-                "num_stages": 4,
+                "block_shape": (128, block_n, block_k),
+                "warp_shape": (32, 64, block_k),
+                "num_stages": num_stages,
                 "num_ctas_per_sm": 1,
                 "num_write_splits": 1,
                 "mma_type": "tcgen05",

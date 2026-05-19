@@ -71,7 +71,9 @@ def test_heuristic_fat_k_crossover(shape_m, want_tcg):
 def test_heuristic_returns_tcgen05_config():
     """Verify the config dict has the right TCGEN05 fields set."""
     meta = _make_meta(14336, 4096)
-    cfg = Sm100Heuristics.get_config(meta, shape_m=512)
+    # M=128: single M-tile per CTA → bk=64 + stages=4 (more pipeline
+    # depth wins because there are few CTAs to hide load latency).
+    cfg = Sm100Heuristics.get_config(meta, shape_m=128)
     assert cfg["mma_type"] == "tcgen05"
     assert cfg["use_tcgen05"] is True
     assert cfg["use_warp_spec"] is True
@@ -80,6 +82,13 @@ def test_heuristic_returns_tcgen05_config():
     assert cfg["block_shape"] == (128, 128, 64)
     assert cfg["warp_shape"] == (32, 64, 64)
     assert cfg["num_stages"] == 4
+
+    # M=512: many CTAs → bk=128 + stages=3 (bigger MMA per issue,
+    # halves the K-iter scatter/sync count).
+    cfg = Sm100Heuristics.get_config(meta, shape_m=512)
+    assert cfg["block_shape"] == (128, 128, 128)
+    assert cfg["warp_shape"] == (32, 64, 128)
+    assert cfg["num_stages"] == 3
 
 
 def test_heuristic_falls_back_to_mma_for_small_m():
