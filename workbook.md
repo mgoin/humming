@@ -180,18 +180,25 @@ The naive 1-CTA implementation pays:
 * Custom epilogue does serial pack-and-write
 * Each tcgen05.mma is followed by a fence-wait pair (4× per K-block)
 
-The CUTLASS strategy roadmap is the same as before but now sequenced:
-1. **Mbarrier-based MMA completion** (replace `__syncthreads` after
-   the scatter; the existing `tcgen05_commit_to_mbarrier + mbar_wait`
-   already runs at the END of the slice, just need to gate each
-   intermediate K-iter on a per-iter mbar).
-2. **Warp specialization** (load warps + math warps; remove the
-   producer.load_stage from the math-warp critical path).
-3. **TMA loads** (humming already has it for the WMMA path; needs
-   tcgen05-aware descriptor geometry).
-4. **TMEM double-buffer** (alloc 2× cols, alternate between K-blocks
+The CUTLASS strategy roadmap is now sequenced:
+1. ✅ **TMA loads** (Phase B.20, no measurable wall-time delta -- not
+   the bottleneck for our shapes).
+2. ✅ **Vectorised scatter** (Phase B.21, 1.5× win).
+3. ✅ **Drop redundant fences** (Phase B.22/B.23).
+4. **Math-only `__syncthreads`** (replace the post-scatter
+   `__syncthreads` in `TCGEN05::run` with a `bar.sync 1, N` named
+   barrier covering only the math threads). Required prerequisite
+   for warp-spec.
+5. **Warp specialization** with the named barrier in place.
+   Empirically `use_warp_spec=True` for TCGEN05 currently deadlocks
+   -- the math-side `__syncthreads` waits for the producer threads
+   who never reach it. Needs #4 first.
+6. **Mbarrier-based MMA completion** per K-iter (gate next scatter
+   on previous MMA retirement instead of overwriting after the
+   __syncthreads).
+7. **TMEM double-buffer** (alloc 2× cols, alternate between K-blocks
    so the t2r of block N overlaps the MMA of block N+1).
-5. **cta_group::2** (pair-of-CTAs MMA: doubles effective M tile,
+8. **cta_group::2** (pair-of-CTAs MMA: doubles effective M tile,
    required for peak Blackwell throughput).
 
 ### CUTLASS-style strategies to add next (after BlockN/M/K limits open):
