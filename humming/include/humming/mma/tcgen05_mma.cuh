@@ -356,7 +356,11 @@ public:
       }
     }
 #endif
-    fence_proxy_async_shared_cta();
+    // The scatter above uses regular SMEM stores (non-async), so the
+    // implicit __threadfence_block from __syncthreads is sufficient
+    // to make them visible to subsequent tcgen05.mma SMEM reads. The
+    // earlier explicit `fence_proxy_async_shared_cta()` was a holdover
+    // from when we expected to use async copies for the scatter.
     __syncthreads();
 
     // ---- now build descriptors + issue tcgen05.mma ----
