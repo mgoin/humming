@@ -161,8 +161,17 @@ TCGEN05 correctness covers BlockShape ∈ {64, 128} × {64, 128, 256} ×
 {64, 128, 256}, kNumStages ∈ {2, 3, 4}, has_{zp, bias} ∈ {T, F}, TMA
 on/off, warp-spec on/off (44 tests pass / 1 xfail).
 
-**TCGEN05 is consistently 1.13-1.33× FASTER than mma.sync at M >=
-128** on realistic LLM weight shapes. Realistic-bench summary:
+**TCGEN05 is consistently 1.20-1.55× FASTER than mma.sync at M >=
+128** on realistic LLM weight shapes (after Phase B.28 BlockK=128).
+Realistic-bench summary (clean run with the heuristic-picked config
+for both paths):
+
+  Llama70B gate M=128:  1.40× (peak: BlockK=128 + WS + stages=3)
+  Llama70B gate M=1024: 1.36×
+  Llama8B  down M=2048: 1.54× (BlockK=128 doubles win vs B.26)
+  Llama70B down M=2048: 1.55× (was 1.30× before B.28)
+
+Older B.26 summary (BlockK=64 + stages=4):
 
   shape                  M=128  M=256  M=512  M=1024  M=2048
   Llama8B  qkv (6144/4096)  1.28x  1.28x  0.98x  1.29x  1.20x
