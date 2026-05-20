@@ -164,16 +164,23 @@ pipelining doesn't land because of:
   stages — corruption. Fix: split `smem.reduce` out of the union;
   costs ~32KB more SMEM per CTA and may exceed the budget at
   BlockN=128 + stages=3.
-* **Using TMEM cols 128..255 is ~2.7× slower than cols 0..127.**
-  Even with sequential commit+wait+t2r (no pipelining), just
-  alternating `acc_buf` between {0, 1} regresses Llama70B-down
-  M=2048 (ws=True bm=128 bk=128) from 2848us to 7812us. Bisected:
-  `alloc<256>` alone is fine if the kernel keeps using cols 0..127;
-  the regression is the alternating-cols access pattern. Cause
-  unknown — needs NCU profiling to disambiguate MMA-side vs t2r-side
-  latency. Plausible: high-col `d_tmem` interacts with sub-partition
-  layout or M-coord bits; `tcgen05_alloc<128>`×2 (two separate
-  allocs) might dodge it.
+* **Alternating between TMEM col regions per tile is ~2.7× slower.**
+  At Llama70B-down M=2048 (ws=True bm=128 bk=128, alloc<256>):
+
+  ```
+  d_tmem = base (static, baseline):           2848 us
+  d_tmem = base + 128 (static, hardcoded):    2897 us  (~no change)
+  d_tmem alternates base / base+128 per tile: 7812 us  (2.7× SLOWER)
+  ```
+
+  So the col location itself isn't the issue — STATIC col=128 is
+  within noise of static col=0. The slowdown is specifically the
+  *between-tile* alternation. Plausible explanations (none verified):
+  the HW maintains per-warp TMEM state that switching cols
+  invalidates; sub-partition routing has a per-tile warmup; or the
+  switching breaks a HW prefetcher. NCU profiling needed to
+  disambiguate MMA-issue, mbar-wait, or t2r as the regressed
+  component.
 
 ### Other (smaller) levers we haven't tried
 
