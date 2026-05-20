@@ -1,13 +1,12 @@
 """sm_100 (Blackwell) tuning heuristics.
 
-Phase B.26 (current): adds a TCGEN05 fast-path on top of the
-Sm89-style mma.sync baseline. For W4A16 (bf16 A × narrow-B with
-group scales + zero-points) at shape_m >= 128 with a "fat-N"
-weight (N >= K, e.g. gate/up projections), the heuristic returns a
-TCGEN05 config that benchmarks 1.13-1.33× faster than mma.sync on
-realistic LLM shapes. Everything else (decode, "fat-K" down
-projections, integer A, etc.) still falls through to the Sm89-style
-mma.sync config.
+Adds a TCGEN05 fast-path on top of the Sm89-style mma.sync baseline.
+For W4A16 (bf16 A x narrow-B with group scales + zero-points) at
+shape_m >= 128 with a "fat-N" weight (N >= K, e.g. gate/up
+projections), the heuristic returns a TCGEN05 config that benchmarks
+1.20-1.55x faster than mma.sync on realistic LLM shapes. Everything
+else (decode, "fat-K" down projections at small M, integer A, etc.)
+falls through to the Sm89-style mma.sync config.
 
 See `benchmarks/bench_tcgen05_vs_wmma.py` for the underlying perf
 data and `workbook.md` for the rationale of each cutoff.

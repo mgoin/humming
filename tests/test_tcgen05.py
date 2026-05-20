@@ -1,26 +1,26 @@
 """TCGEN05 (Blackwell sm_100+) W4A16 correctness tests.
 
-Phase B.14 known-good config space (each combination here passes vs an
-mma.sync reference with rtol=1e-2, atol=0.5):
+Verifies the bf16 x uint4 path (AWQ-style: per-group bf16 scales +
+uint4 zero-points, group_size=128) against an mma.sync reference
+with rtol=1e-2, atol=0.5.
 
-  * BlockShape: only (64, 64, 64) -- BlockN > 64 is gated by a
-    static_assert in `mma/tcgen05_mma.cuh` (workbook 'B.15: N>64
-    descriptor/scatter mismatch'). BlockK > 64 and BlockM > 64 are
-    likewise unverified and gated.
-  * WarpShape: only (16, 64, 64) -- 4 M-warps, one per TMEM
-    sub-partition.
-  * kNumStages: {2, 3, 4} -- kNumStages == 2 uses the deferred
-    `producer.load_stage` fix; kNumStages >= 3 lands the next load
-    into a non-conflicting stage and works unmodified.
-  * Problem shape: shape_m / shape_n / shape_k must be a multiple of
-    the BlockShape; shape_k currently >= 128 (BlockK == 64 needs at
-    least 2 K-blocks to exercise the pipeline).
+Supported config space (gated by static_asserts in
+`mma/tcgen05_mma.cuh`):
 
-The tests below are written so the parametrization is the same shape
-of dimensions we'd eventually want to tune over (kNumStages, BlockN,
-BlockM, ...); the gated combinations are marked `xfail` so they remain
-visible failures and stop being silently green if we accidentally
-relax a static_assert.
+  * BlockShape::M in {64, 128}
+  * BlockShape::N in {64, 128, 256}
+  * BlockShape::K in {64, 128, 256}
+  * WarpShape::M = BlockShape::M / 4   (4 M-warps, one per TMEM
+                                        sub-partition)
+  * WarpShape::N = 64                  (smaller hits loader_b's
+                                        half-group path -- xfail'd)
+  * WarpShape::K = BlockShape::K       (no K-warps)
+  * kNumStages in {2, 3, 4}
+  * has_zero_point, has_bias both in {True, False}
+
+Tests are parametrized over dimensions we'd tune over (kNumStages,
+BlockN, BlockM, ...). Known gated combinations are `xfail`'d so they
+stay visible if a static_assert is accidentally relaxed.
 """
 
 from __future__ import annotations
@@ -173,8 +173,7 @@ def _assert_close(outputs, outputs_ref):
 
 
 # ---------------------------------------------------------------------------
-# Smallest viable case (kept as a sanity test; matches Phase B.4's first
-# wired-up shape).
+# Smallest viable case (sanity check that the path is wired up at all).
 # ---------------------------------------------------------------------------
 
 
@@ -239,10 +238,9 @@ def test_tcgen05_num_stages(num_stages):
 
 
 # ---------------------------------------------------------------------------
-# Single-K-position probe -- guards against the SMEM-A race regression
-# (Phase B.14): with A=delta(k=k0), out[m, n] == B_dequant[k0, n] for
-# every k0. Before the fix only k0 in the LAST 16 K of each K-block
-# returned wrong values; this test catches that pattern explicitly.
+# Single-K-position probe. With A=delta(k=k0), out[m, n] should equal
+# B_dequant[k0, n] for every k0. Guards against the historic SMEM-A
+# race where only the LAST 16 K of each K-block returned wrong values.
 # ---------------------------------------------------------------------------
 
 
@@ -305,11 +303,11 @@ def test_tcgen05_zero_point(has_zero_point):
 
 
 # ---------------------------------------------------------------------------
-# TMA load path (Phase B.20). Replaces cp.async for A and B with TMA
-# `tma_load_2d` (humming's existing WMMA-side wiring; the TCGEN05 mma
-# code is independent of the load mechanism so it just works). BZP
-# still uses cp.async since `tensor.h:275` asserts TMA isn't supported
-# for is_group_weight_scale BZP descriptors.
+# TMA load path. Replaces cp.async for A and B with TMA `tma_load_2d`
+# (humming's existing WMMA-side wiring; the TCGEN05 mma code is
+# independent of the load mechanism). BZP still uses cp.async since
+# `tensor.h:275` asserts TMA isn't supported for is_group_weight_scale
+# BZP descriptors.
 # ---------------------------------------------------------------------------
 
 
@@ -327,9 +325,9 @@ def test_tcgen05_tma(use_tma, has_zero_point):
 
 
 # ---------------------------------------------------------------------------
-# Warp specialization (Phase B.24). Math threads use bar.sync 1, math
-# instead of __syncthreads so the producer warps aren't dragged into
-# every per-K-iter scatter sync. Requires use_tma + use_mbarrier (the
+# Warp specialization. Math threads use bar.sync 1, math instead of
+# __syncthreads so the producer warps aren't dragged into every
+# per-K-iter scatter sync. Requires use_tma + use_mbarrier (the
 # producer pipeline drives gmem -> smem via TMA + mbarrier-based
 # completion).
 # ---------------------------------------------------------------------------
@@ -357,12 +355,9 @@ def test_tcgen05_warp_spec(has_zero_point):
 
 @pytest.mark.parametrize("block_n", [128, 256])
 def test_tcgen05_block_n_large(block_n):
-    """Phase B.16: BlockN > 64 works after the smem.reduce write fix.
-    The t2r write now uses gmem_writer's 8-int4-wide-row "section"
-    layout (section_idx = int4_col // 8, smem_row = section_idx *
-    BlockM + m_full) -- before this, BlockN=128 wrote 16-int4-wide
-    rows that gmem_writer reinterpreted as two BlockM-row sections,
-    producing the "N=64..127 mirrors N=0..63" symptom."""
+    """BlockN > 64. The t2r write uses gmem_writer's 8-int4-wide-row
+    "section" layout (section_idx = int4_col // 8, smem_row =
+    section_idx * BlockM + m_full)."""
     outputs, outputs_ref = _run_tcgen05(
         shape_m=128, shape_n=max(block_n, 128), shape_k=256,
         block_shape=(64, block_n, 64), warp_shape=(16, 64, 64),
@@ -373,10 +368,10 @@ def test_tcgen05_block_n_large(block_n):
 
 @pytest.mark.parametrize("block_n", [64, 128, 256])
 def test_tcgen05_block_m_large(block_n):
-    """Phase B.18: BlockM=128 via WarpShape::M=32 (the M=128 TMEM atom
-    places 32 valid M-values per sub-partition vs 16 for M=64). All 32
-    lanes per warp participate (the laneid<WarpShape::M gate covers
-    both cases)."""
+    """BlockM=128 via WarpShape::M=32 (the M=128 TMEM atom places 32
+    valid M-values per sub-partition vs 16 for M=64). All 32 lanes
+    per warp participate (the laneid<WarpShape::M gate covers both
+    cases)."""
     outputs, outputs_ref = _run_tcgen05(
         shape_m=128, shape_n=max(block_n, 128), shape_k=256,
         block_shape=(128, block_n, 64), warp_shape=(32, 64, 64),
@@ -387,10 +382,9 @@ def test_tcgen05_block_m_large(block_n):
 
 @pytest.mark.parametrize("block_k", [128, 256])
 def test_tcgen05_block_k_large(block_k):
-    """Phase B.19: BlockK > 64 works after section-major B layout +
-    section-aware descriptor advance for BOTH A and B. Each section
-    holds 64 K-bf16 of all N (matching A's loader sectioning); the
-    iter advance crosses sections via `section_idx * section_size`."""
+    """BlockK > 64. B is sectionised the same way A is -- each section
+    holds 64 K-bf16 of all N; the iter advance crosses sections via
+    `section_idx * section_size`."""
     outputs, outputs_ref = _run_tcgen05(
         shape_m=128, shape_n=64, shape_k=max(block_k * 2, 256),
         block_shape=(64, 64, block_k), warp_shape=(16, 64, block_k),
@@ -400,9 +394,9 @@ def test_tcgen05_block_k_large(block_k):
 
 
 @pytest.mark.xfail(
-    reason="Phase B.15 open: WarpN<64 hits the loader_b half-group path "
+    reason="WarpN<64 hits loader_b's half-group path "
     "(kIsWarpHalfGroup=true at WarpShape::N == ElementA::kBits*2 = 32) "
-    "that the scatter doesn't model.",
+    "which the scatter doesn't model. Static_assert in tcgen05_mma.cuh.",
     strict=False, run=False,
 )
 def test_tcgen05_warp_n_small():

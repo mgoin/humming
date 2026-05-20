@@ -1,14 +1,14 @@
 """Benchmark TCGEN05 vs mma.sync across realistic LLM weight shapes.
 
-Sweeps M (= batch × seq) from 1 to 2048 for several common projection
+Sweeps M (= batch * seq) from 1 to 2048 for several common projection
 weight shapes from Llama-3 / Mixtral. Both kernels use the same
-W4A16 setup (bf16 A × uint4 B with bf16 group scales, zero-points).
+W4A16 setup (bf16 A x uint4 B with bf16 group scales, zero-points).
 
-Phase B.23 result (B300, sm_103a): TCGEN05 wins consistently at
-M >= 128 by 1.1×-1.3×. M < 64 is slower (TCGEN05 path has BlockM=64
-minimum and pads up; the M<64 case is dominated by the per-CTA setup
-overhead with very few output tiles). The crossover is around M=128
-for thin layers and M=256 for fat-K layers.
+Expected on B300 (sm_103a): TCGEN05 wins consistently at M >= 128 by
+1.2x-1.55x. M < 64 is slower because the TCGEN05 path has BlockM=64
+minimum and pads up; with very few output tiles the per-CTA setup
+overhead dominates. The crossover is around M=128 for thin layers
+and M=256 for fat-K layers.
 
 Run with: ~/venvs/vllm-rel/bin/python benchmarks/bench_tcgen05_vs_wmma.py
 """

@@ -1,32 +1,34 @@
 #pragma once
 //
-// TCGEN05 MMA class for Blackwell sm_100+.
+// TCGEN05 MMA class for Blackwell sm_100+ (1-CTA, SS-mode mainloop).
 //
 // Mirrors the WMMA / WGMMA interface (`zero_accum`, `transform_b`,
 // `run`, `final_regs_c_as_ptr`) so the existing `kernel/humming.cuh`
-// mainloop can drive it via the three-way dispatch at humming.cuh:71.
+// mainloop drives it via the three-way dispatch at humming.cuh:71.
 //
-// What differs from WMMA on the data flow:
-//   * A operand comes from SMEM (smem.a[stage]) via an SMEM descriptor,
-//     NOT from registers. The s2r_pipe still pulls A into regs_a but
-//     we ignore that copy here (workbook decision: profile first).
-//   * B operand: the s2r_pipe loads the *quantised* int4 codes into
-//     regs_qb, transform_b() dequantises them into RMEM bf16 and writes
-//     them to smem.b_dequant[buffer_id] via the helper r2s in this file.
-//     tcgen05.mma then reads that SMEM staging buffer.
-//   * Accumulator lives in TMEM (column allocated by the kernel entry).
-//     `run()` issues a single tcgen05.mma per K-block; no warp-level
-//     subdivision since the instruction shape covers the full BlockM/N.
+// Data flow (differences vs WMMA):
+//   * A operand comes from SMEM (`smem.a[stage]`) via an SMEM
+//     descriptor, not RMEM. `s2r_pipe` skips the A load for the
+//     TCGEN05 path (see `s2r_pipeline.cuh`).
+//   * B operand: `s2r_pipe` loads the *quantised* int4 codes into
+//     `regs_qb`, `transform_b()` dequantises into RMEM bf16, and the
+//     scatter inside `run()` writes them to `smem.b_dequant[buf_id]`.
+//     tcgen05.mma reads that SMEM staging buffer.
+//   * Accumulator lives in TMEM (one CTA-private allocation of 128
+//     cols, made once at kernel entry).
 //   * `final_regs_c_as_ptr` does the t2r dance (tcgen05.fence +
-//     tcgen05.ld_32x32b_x32) and exposes a plain RMEM `float*` to the
-//     epilogue.
+//     tcgen05.ld_32x32b_x32) and writes the result directly into
+//     `smem.reduce` in the layout the `gmem_writer` expects, bypassing
+//     `EpilogueSmemWriter` (which assumes >= 2 N-warps).
 //
-// Phase 0 simplifications (not final perf):
-//   * 1-CTA only (cta_group::1). No clustering, no use_2cta.
-//   * No mbarrier-based commit: callers wrap the issue in a fence +
-//     __syncthreads. This costs a barrier per K-iter; revisited once
-//     the pipeline plumbing lands an mbarrier slot.
+// Limitations of this mainloop (see `docs/tcgen05_ts_mode_path2.md`
+// for the planned next-gen TS-mode mainloop that lifts these):
+//   * 1-CTA only (`cta_group::1`). No clustering, no 2-CTA mma.
 //   * No accumulator double-buffering -- one TMEM region per CTA.
+//   * Per-K-iter `bar.sync 1, kNumMathThreads` is required to publish
+//     the scatter to the tcgen05.mma issuer. Empirically the bar
+//     itself is cheap (~4 cyc) but the underlying SMEM scatter is
+//     the per-K-iter bottleneck (~2000 cyc).
 
 #include <humming/arith/exp_offset.cuh>
 #include <humming/utils/all.cuh>
@@ -37,20 +39,23 @@
 // Debug switches (set to non-zero to enable):
 //   TCGEN05_DEBUG_CONST_B: bulk-fill smem.b_dequant with bf16(1.0),
 //     bypassing dequant + scatter. Output should be N-independent
-//     = sum_k A[m, k]. Used to isolate MMA+t2r+epilogue from dequant.
+//     = sum_k A[m, k]. Used to isolate MMA + t2r + epilogue from
+//     dequant.
 //   TCGEN05_DEBUG_SKIP_TMEM: skip the t2r and fill scratch with
-//     (lane * 1000 + idx). Output reveals (lane, scratch_idx) ->
+//     (lane * 1000 + idx). Reveals the (lane, scratch_idx) ->
 //     (m, n) layout directly.
-//     (Validated 2026-05-18: SMEM-write + gmem_writer chain is
-//      correct; bf16 precision around 1000 masks individual values.)
-// Both off by default -- only re-enable when investigating regressions.
+//   TCGEN05_DEBUG_SCATTER_SENTINEL / _REGS_B_SENTINEL: write
+//     position-encoded sentinel values from the scatter / dequant
+//     so the gmem output can be inverted to (n, k) coordinates.
+//   TCGEN05_DEBUG_NO_SCATTER / _TMEM_DUMP: variants that turn off
+//     the dequant scatter or surface TMEM raw values respectively.
+// All off by default -- enable only when investigating regressions.
 // #define TCGEN05_DEBUG_CONST_B 1
 // #define TCGEN05_DEBUG_SKIP_TMEM 1
 // #define TCGEN05_DEBUG_SCATTER_SENTINEL 1
 // #define TCGEN05_DEBUG_REGS_B_SENTINEL 1
 // #define TCGEN05_DEBUG_NO_SCATTER 1
 // #define TCGEN05_DEBUG_TMEM_DUMP 1
-// (the regs_qb alignas(16) fix above is the actual production change)
 
 
 // fence_proxy.async.shared::cta -- ensures prior r2s of dequantised B
@@ -78,18 +83,10 @@ public:
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kNumWarpShapeNSplits = WarpShape::N == ElementA::kBits * 2 ? 2 : 1;
 
-  // SMEM descriptor swizzle for A and B.
-  //
-  // KNOWN MISMATCH (workbook §"Phase B.9"): humming's loader_a writes
-  // Swizzle<2,4,3> (col XOR by row & 3) but with a 128-byte row stride.
-  // CUTE's canonical 64B (Swizzle<2,4,3>) layout expects a 64-byte row
-  // stride (4 uint128_t/row), and the canonical 128B (Swizzle<3,4,3>)
-  // expects col-XOR by row & 7. NEITHER matches humming's actual data,
-  // so the tcgen05.mma descriptor reads the WRONG A bytes for half the
-  // rows. The next step is either to fix humming's loader_a swizzle to
-  // match Swizzle<3,4,3>, or to restage A into a tcgen05-private buffer
-  // with the canonical layout. Keeping 128 here as the closest fit
-  // until that restage lands.
+  // SMEM descriptor swizzle for A and B. Both use Swizzle<3,4,3>
+  // (128-byte swizzle, col XOR by row & 7). `loader_a` emits this
+  // layout when `kUseTcgen05` is set (see `loader_a.cuh`); the
+  // scatter in `run()` writes B in the same swizzle below.
   static constexpr uint32_t kSwizzleBytesA = 128;
   static constexpr uint32_t kSwizzleBytesB = 128;
 
@@ -101,9 +98,9 @@ public:
   SharedStorage &smem;
   ArithClass &arith;
 
-  // Phase B.20: `s2r_pipeline.cuh` now skips `loader_a.load` for the
-  // TCGEN05 path (tcgen05.mma reads A from SMEM via descriptor), so
-  // this storage is never written. Keep a single dummy int4 so the
+  // `s2r_pipeline.cuh` skips `loader_a.load` for the TCGEN05 path
+  // (tcgen05.mma reads A from SMEM via the descriptor), so this
+  // storage is never written. Keep a single dummy int4 so the
   // `regs_a_as_ptr()` accessor below has somewhere to point -- the
   // s2r pipe takes the pointer unconditionally even when it doesn't
   // dereference. alignas(16) is defensive.
@@ -137,51 +134,52 @@ public:
     first_issue_ = true;
   }
 
-  // Phase B.18 known-good config space (verified by
-  // tests/test_tcgen05.py):
+  // Supported config space (verified by tests/test_tcgen05.py and
+  // tests/test_tcgen05_dtypes.py):
   //   * BlockShape::M in {64, 128}
   //   * BlockShape::N in {64, 128, 256}
-  //   * BlockShape::K == 64    (one 128B swizzle atom per A-row)
+  //   * BlockShape::K in {64, 128, 256}  (B is section-major-ised
+  //                                       across 64-K-bf16 sections)
   //   * WarpShape::M == BlockShape::M / 4   (4 M-warps, one per TMEM
-  //                                          sub-partition; M=64 atom
-  //                                          has 16 valid M per sub-
-  //                                          part, M=128 atom has 32)
-  //   * WarpShape::N == 64     (loader_b's kIsWarpHalfGroup path
-  //                             unmodelled at WarpN < 64)
+  //                                          sub-partition)
+  //   * WarpShape::N == 64    (smaller WarpN hits loader_b's
+  //                            half-group path, unmodelled here)
+  //   * WarpShape::K == BlockShape::K   (no K-warps; tcgen05.mma
+  //                                      covers full BlockK by
+  //                                      issuing one MMA per 16-K
+  //                                      atom from a single warp)
   //   * kNumStages in {2, 3, 4}
-  //   * has_zero_point in {True, False}
-  //   * has_bias in {True, False}
+  //   * has_zero_point, has_bias both in {True, False}
+  //   * ElementA == BFloat16 only (fp16 A would need a parallel
+  //                                instruction-descriptor + scatter)
   static_assert(BlockShape::M == 64 || BlockShape::M == 128,
-                "TCGEN05 path Phase B.18: BlockM must be 64 or 128");
+                "TCGEN05: BlockM must be 64 or 128");
   static_assert(BlockShape::N == 64 || BlockShape::N == 128
                 || BlockShape::N == 256,
-                "TCGEN05 path Phase B.18: BlockN must be 64, 128, or 256");
+                "TCGEN05: BlockN must be 64, 128, or 256");
   static_assert(WarpShape::N == 64,
-                "TCGEN05 path Phase B.18: WarpN<64 hits loader_b "
-                "half-group path (unmodelled in scatter)");
+                "TCGEN05: WarpN < 64 hits loader_b's half-group path "
+                "(unmodelled in the dequant scatter)");
   static_assert(BlockShape::K == 64 || BlockShape::K == 128
                 || BlockShape::K == 256,
-                "TCGEN05 path Phase B.18: BlockK must be 64, 128, or 256");
+                "TCGEN05: BlockK must be 64, 128, or 256");
   static_assert(WarpShape::M * 4 == BlockShape::M,
-                "TCGEN05 path Phase B.18: must have exactly 4 M-warps "
-                "so each warp owns one TMEM sub-partition's worth of M");
+                "TCGEN05: must have exactly 4 M-warps so each warp "
+                "owns one TMEM sub-partition's worth of M");
   static_assert(WarpShape::K == BlockShape::K,
-                "TCGEN05 path Phase B.18: K-warps not supported -- "
-                "tcgen05.mma covers the full BlockK by issuing one MMA "
-                "per 16-K-bf16 atom from a single warp.");
-  // TCGEN05 currently issues `tcgen05.mma.kind::f16` via the
-  // `tcgen05_mma_ss_bf16` wrapper with `tcgen05_instr_desc_bf16_bf16_f32`
-  // -- both hardcoded to bf16. Wiring up the fp16 A/B path requires
-  // distinct instruction-descriptor builders + the matching scatter
-  // (fp16 SMEM has different exponent semantics than bf16). Without
+                "TCGEN05: K-warps not supported -- tcgen05.mma "
+                "covers the full BlockK by issuing one MMA per "
+                "16-K-bf16 atom from a single warp");
+  // `tcgen05.mma.kind::f16` is issued via `tcgen05_mma_ss_bf16` with
+  // `tcgen05_instr_desc_bf16_bf16_f32` -- both hardcoded to bf16.
+  // fp16 A requires a parallel instruction-descriptor + scatter (the
+  // scatter must match fp16's SMEM-bit semantics, not bf16's). Without
   // that, the bf16-shaped instruction would reinterpret fp16 bit
-  // patterns and produce garbage (error magnitudes ~1e16). Reject at
-  // build time until the fp16 path lands.
+  // patterns and produce garbage (error magnitudes ~1e16).
   static_assert(std::is_same<ElementA, BFloat16>::value,
-                "TCGEN05 path: only bf16 A is wired up today. "
-                "tcgen05.mma + scatter assume bf16 throughout; fp16 A "
-                "would need a parallel instruction-descriptor + "
-                "scatter path.");
+                "TCGEN05: ElementA must be BFloat16. fp16 A requires "
+                "a parallel instruction-descriptor + scatter path "
+                "that is not wired up.");
 
   // Dequant int4 (from regs_qb) -> bf16 (RMEM) -> SMEM b_dequant staging.
   CUDA_INLINE
@@ -300,23 +298,16 @@ public:
       uint32_t k_base = iter_id * kPartMmaShapeK;
       constexpr uint32_t kBf16PerCall = 8;
       constexpr uint32_t kCalls = WarpShape::N / 16u;
-      // Per-warp N-slice base. With BlockN == WarpShape::N (kNWarps==1)
-      // the only warp_id_scatter is 0 and n_base degenerates to 0;
-      // this matches the original working single-N-warp scatter. The
-      // BlockN > WarpShape::N path is gated by the static_assert
-      // above -- the scatter math here is N-fastest (matches loader_b
-      // and arith), but t2r and TMEM tile geometry need additional
-      // work for multi-N-warp configs (workbook: "Phase B.15 - N>64
-      // descriptor + scatter mismatch") and that mode is rejected at
-      // build time until that lands.
+      // Per-warp N-slice base. kNWarps ∈ {1, 2, 4} for BlockN ∈
+      // {64, 128, 256}; warps with the same `n_warp_id_scatter`
+      // write redundantly (the 4 M-warps that share an N-slice all
+      // emit the same bytes). The HW serialises the resulting
+      // 4-way bank conflict cheaper than divergent gating -- a
+      // 1-warp-per-N-slice variant was measured 10% slower.
       constexpr uint32_t kNWarps = MAX(BlockShape::N / WarpShape::N, 1u);
       uint32_t warp_id_local = threadIdx.x / 32u;
       uint32_t n_warp_id_scatter = warp_id_local % kNWarps;
       uint32_t n_base = n_warp_id_scatter * WarpShape::N;
-      // (Phase B.24 experiment: gating the scatter to a single M-warp
-      // per N-group regressed perf slightly -- the HW serialises the
-      // 4-way bank conflict in the duplicate stores better than the
-      // divergent branch overhead. Documented in workbook 'B.24'.)
       // Hardware Swizzle<3,4,3> applies to the absolute byte address:
       // the descriptor encodes (smem_base >> 4) in its start_address,
       // and the HW XOR'ing of bits [4, 7) uses bits [7, 10) of the
@@ -410,12 +401,11 @@ public:
     int4 *a_ptr = &smem.a[stage_id][0]
                   + section_idx * kSectionSizeUint128
                   + iter_in_section * kKChunkUint128;
-    // B is now sectionised the same way A is (since Phase B.19): the
-    // scatter above writes section-major, with each section holding
-    // 64 K-bf16 of all N. So B's descriptor SBO is also fixed at 64
-    // K-bf16, and the iter advance crosses sections via `section_idx
-    // * kBSectionSizeUint128` (where the B section size in uint128
-    // is `BlockN * 8`).
+    // B is sectionised the same way A is: the scatter above writes
+    // section-major, with each section holding 64 K-bf16 of all N.
+    // So B's descriptor SBO is also fixed at 64 K-bf16, and the iter
+    // advance crosses sections via `section_idx * kBSectionSizeUint128`
+    // (where the B section size in uint128 is `BlockN * 8`).
     constexpr uint32_t kBSectionSizeUint128 = BlockShape::N * 8u;
     int4 *b_ptr = &smem.b_dequant[buffer_id][0]
                   + section_idx * kBSectionSizeUint128

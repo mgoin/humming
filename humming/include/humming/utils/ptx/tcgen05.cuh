@@ -371,9 +371,10 @@ CUDA_INLINE void tcgen05_mma_ss_bf16(uint32_t d_tmem,
   //
   // The `{m0..m3}` operand is a 128-bit sparsity/disable mask -- all-zero
   // means "no masking". Without this operand the instruction parses to a
-  // different variant and hangs / never retires. Caused the bulk of
-  // Phase B.6 debug pain; caught via `compute-sanitizer --tool synccheck`
-  // which fingered the trailing `mbarrier_wait` as a "Missing wait".
+  // different variant and hangs / never retires. The failure mode is
+  // surprising: `compute-sanitizer --tool synccheck` fingers the
+  // trailing `mbarrier_wait` as a "Missing wait" rather than blaming
+  // the malformed mma.
   uint32_t mask[4] = {0u, 0u, 0u, 0u};
   asm volatile(
       "{\n\t"

@@ -1,6 +1,5 @@
 """Test that Sm100Heuristics picks TCGEN05 vs mma.sync at the right
-shapes (Phase B.26).
-"""
+shapes."""
 from __future__ import annotations
 
 import pytest
