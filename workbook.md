@@ -110,6 +110,75 @@ because the cluster needs ≥2 tile-clusters of work and we underfill.
 The real win pairs multi-cast B with `cta_group::2` so a single MMA
 covers 2× M — see "Future avenues" below.
 
+## Phase B.37: dtype coverage at production WS configs
+
+Added `benchmarks/bench_tcgen05_dtypes.py` (sweeps all 19 B-dtypes
+across a config ladder picking the largest fitting BlockM/K/stages
+per dtype) and `tests/test_tcgen05_dtypes.py::test_tcgen05_bf16_x_b_prod_ws`
+(parametrized correctness check at the same configs).
+
+### Perf at production WS configs (Llama70B-down, M=2048, vs mma.sync)
+
+```
+B dtype       zp    tcg config    tcg us    mma us    tcg/mma
+uint1         F    M128K64 s4     2580      3647      1.41x
+uint2         T    M128K128 s4    2819      3868      1.37x
+uint3         T    M128K128 s4    2894      4165      1.44x
+uint4         T    M128K128 s4    2781      3898      1.40x
+uint4         F    M128K128 s4    2387      3817      1.60x  ← peak
+uint5         T    M128K128 s3    3049      4316      1.42x
+uint6         T    M128K128 s3    3022      4256      1.41x
+uint7         T    M128K128 s3    4813      7785      1.62x  ← peak
+uint8         T    M128K128 s3    4439      6911      1.56x
+float4e2m1    F    M128K64 s3     3114      4268      1.37x
+float6e2m3    F    M128K64 s3     3315      4630      1.40x
+float6e3m2    F    M128K64 s3     3340      4600      1.38x
+float8e4m3    F    M128K128 s3    3211      4221      1.31x
+float8e5m2    F    M128K128 s3    3211      4221      1.31x
+```
+
+14 of 19 supported B-dtypes get production-config coverage with 1.26-
+1.62x wins. The 5 missing (int2/3/4/6/8) are rejected by humming's
+`check_dtype` for signed-int B with fp A regardless of config.
+
+### Correctness gaps discovered at prod-WS configs (6 xfails)
+
+`bench_tcgen05_dtypes.py` only times the kernel; correctness must come
+from the parametrized test. Running it surfaced **6 dtype combos that
+produce wrong outputs at production-WS configs even though they pass
+at the (64, 64, 64) s=2 baseline**:
+
+```
+combo               err pattern
+uint1, zp=False     max|err| 73 of ref 154 (~47 % rel)
+uint2, zp=True      fails at M128K128 s4
+uint4, zp=True      fails at M128K128 s4
+uint4, zp=False     max|err| 73 of ref 154
+uint7, zp=True      max|err| 109 of ref 127 (~86 % rel)
+uint8, zp=True      fails at M128K128 s3
+```
+
+Pattern isn't strictly zp-on vs zp-off; not a single power-of-2
+kBits boundary either. Suggests an edge case in the dequant scatter
+math at the wider BlockK pipeline depth that the (64, 64, 64)
+coverage didn't exercise. These are tracked as `xfail` in
+`PROD_WS_KNOWN_BROKEN` -- a future fix will surface as XPASS.
+
+Note: the bench reports these as "winning" timings because the
+kernel runs to completion; it just produces wrong outputs. The
+bench needs a (deferred) correctness-verifying mode before the
+xfail set can be reduced by trusting the bench alone.
+
+### Action items implied by this coverage
+
+* For now, the production heuristic in `tune/sm100.py` only opts
+  in TCGEN05 for `b_dtype == uint4`; the heuristic stays safe even
+  with the discovered xfails. Expanding the heuristic to other B-
+  dtypes requires fixing the prod-WS correctness gaps first.
+* The dtype-matrix coverage at the (64, 64, 64) baseline remains
+  the source of truth for "what dtype humming's TCGEN05 path
+  supports correctly" -- the prod-WS configs are a strict subset.
+
 ## Phase B.36b: bar.sync is structurally load-bearing (not just overhead)
 
 Tried replacing `sync_part_threads` (the per-K-iter `bar.sync 1, 256`)

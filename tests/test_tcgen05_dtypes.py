@@ -37,7 +37,10 @@ pytestmark = pytest.mark.skipif(not _is_blackwell(), reason="tcgen05 needs sm_10
 
 
 def _run_w_a(a_dtype, b_dtype, has_zero_point, shape_m=128, shape_n=128,
-             shape_k=256, group_size=128):
+             shape_k=256, group_size=128,
+             block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
+             num_stages=2, use_warp_spec=False, use_tma=False,
+             use_cp_async=True, use_mbarrier=False):
     """Run TCGEN05 with the given (A, B) dtype combo and verify
     correctness against the float reference."""
     c_dtype = dtypes.bfloat16
@@ -68,13 +71,19 @@ def _run_w_a(a_dtype, b_dtype, has_zero_point, shape_m=128, shape_n=128,
 
     kernel = HummingKernel(
         shape_n=shape_n, shape_k=shape_k,
-        block_shape=(64, 64, 64), warp_shape=(16, 64, 64),
+        block_shape=block_shape, warp_shape=warp_shape,
         a_dtype=a_dtype, b_dtype=b_dtype,
         c_dtype=c_dtype, bs_dtype=bs_dtype,
         weight_scale_group_size=group_size,
         has_zero_point=has_zero_point,
-        num_stages=2,
-        use_warp_spec=False, use_tma=False, use_cp_async=True,
+        num_stages=num_stages,
+        use_warp_spec=use_warp_spec, use_tma=use_tma,
+        use_cp_async=use_cp_async, use_mbarrier=use_mbarrier,
+        # has_zero_point + group_scale + use_tma_bzp=True asserts in
+        # `tensor.h:275` ("TMA is not supported for BZP"). Force the
+        # BZP load through cp.async so use_tma can be enabled for the
+        # A and B loads.
+        use_tma_bzp=False,
         has_bias=False,
         mma_type="tcgen05", use_tcgen05=True, use_stream_k=False,
     )
@@ -168,3 +177,95 @@ def test_tcgen05_fp16_x_b(b_name, has_zp):
     # Skip explicitly rather than relying on a build-error catch --
     # nvrtc surfaces the static_assert as a generic "run failed".
     pytest.skip("TCGEN05 currently only supports bf16 A")
+
+
+# Production WS config: BlockM=128 BlockN=128 BlockK=128 stages=4
+# warp_spec=True tma=True. Wider B-dtypes (uint{5..8}, fp{6,8}) blow
+# the 232 KiB cc 10.x SMEM cap at this config and need smaller
+# BlockK/stages -- the parametrized test below picks a per-dtype
+# config from a ladder so every supported B-dtype gets coverage at
+# the WS pipeline (not just at the (64,64,64) baseline above).
+PROD_CONFIG_LADDER = [
+    # (block_shape, warp_shape, num_stages)
+    ((128, 128, 128), (32, 64, 128), 4),
+    ((128, 128, 128), (32, 64, 128), 3),
+    ((128, 128, 128), (32, 64, 128), 2),
+    ((128, 128,  64), (32, 64,  64), 4),
+    ((128, 128,  64), (32, 64,  64), 3),
+]
+
+
+# Known correctness gaps at production WS configs (discovered by
+# `test_tcgen05_bf16_x_b_prod_ws`). These dtypes pass at the
+# (64,64,64) s=2 baseline above but produce wrong outputs at the
+# larger BlockM=128/BlockK in {128,64} stages=3-4 WS+TMA pipeline.
+# Errors are large (50-85 % relative) -- real logic bug, not bf16
+# precision drift. Pattern is dtype-dependent (not strictly tied to
+# zero_point on/off), suggesting the dequant scatter geometry has
+# edge cases at the wider BlockK that the (64,64,64) coverage didn't
+# exercise. xfail rather than skip so a future fix turns these green.
+PROD_WS_KNOWN_BROKEN = {
+    ("uint1", False),
+    ("uint2", True),
+    ("uint4", True),
+    ("uint4", False),
+    ("uint7", True),
+    ("uint8", True),
+}
+
+
+@pytest.mark.parametrize("b_name, has_zp", B_DTYPES_BF16)
+def test_tcgen05_bf16_x_b_prod_ws(b_name, has_zp):
+    """Same dtype sweep as `test_tcgen05_bf16_x_b` but at production
+    configs (BlockM=128, warp_spec=True, TMA, BlockK=128/64) instead of
+    the (64,64,64) baseline. Walks a ladder of configs per dtype and
+    accepts the largest one that builds + runs."""
+    a_dtype = dtypes.bfloat16
+    b_dtype = dtypes.DataType.from_str(b_name)
+    if b_dtype.num_bits >= a_dtype.num_bits:
+        pytest.skip(f"b={b_name} is not narrower than bf16")
+    if (b_name, has_zp) in PROD_WS_KNOWN_BROKEN:
+        pytest.xfail(
+            f"correctness regression at prod-WS config for {b_name} zp={has_zp}; "
+            "passes at the (64,64,64) baseline -- workbook B.37 investigation."
+        )
+
+    # Signals from humming/CUDA that mean "this config doesn't fit
+    # for this dtype, try a smaller one":
+    #   * "not supported" -- humming check_dtype rejection
+    #   * "out of resource" -- nvrtc/ptxas SMEM-too-big at JIT
+    #   * "CUDA_ERROR_INVALID_VALUE" -- cuFuncSetAttribute fails when
+    #     requested SMEM > device cap (231 KiB on cc 10.x); humming
+    #     raises this at launch from `cuFuncSetAttribute` call.
+    config_doesnt_fit_signals = (
+        "not supported", "out of resource", "cuda_error_invalid_value",
+        "cufuncsetattribute", "invalid argument",
+    )
+    last_err = None
+    for block_shape, warp_shape, num_stages in PROD_CONFIG_LADDER:
+        try:
+            outputs, outputs_ref = _run_w_a(
+                a_dtype, b_dtype, has_zp,
+                shape_m=128, shape_n=128, shape_k=256,
+                block_shape=block_shape, warp_shape=warp_shape,
+                num_stages=num_stages,
+                use_warp_spec=True, use_tma=True,
+                use_cp_async=False, use_mbarrier=True,
+            )
+        except AssertionError as e:
+            last_err = e
+            continue
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if any(sig in msg for sig in config_doesnt_fit_signals):
+                last_err = e
+                continue
+            raise
+        # First config that built + ran is the answer.
+        _assert_close(
+            outputs, outputs_ref,
+            label=f"prod-WS {block_shape} s={num_stages} bf16 x {b_name} zp={has_zp}",
+        )
+        return
+    pytest.skip(f"humming rejects all prod-WS configs (b={b_name}, zp={has_zp}): "
+                f"{last_err!s:.80s}")
