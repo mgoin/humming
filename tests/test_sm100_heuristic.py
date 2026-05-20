@@ -70,9 +70,9 @@ def test_heuristic_fat_k_crossover(shape_m, want_tcg):
 
 def test_heuristic_returns_tcgen05_config():
     """Verify the config dict has the right TCGEN05 fields set."""
-    # shape_k=4096 (% 128 == 0) → bk=128 + stages=3 (bigger MMA per
-    # issue, halves the K-iter scatter/sync count; ~5% win at all
-    # M >= 128 vs bk=64).
+    # shape_k=4096 (% 128 == 0) -> bk=128 + stages=4. bk=128 halves
+    # the K-iter scatter/sync count vs bk=64; stages=4 fits at bk=128
+    # since the b_dequant [kNumStages]->[2] resize freed 32KB SMEM.
     meta = _make_meta(14336, 4096)
     cfg = Sm100Heuristics.get_config(meta, shape_m=128)
     assert cfg["mma_type"] == "tcgen05"
@@ -82,12 +82,12 @@ def test_heuristic_returns_tcgen05_config():
     assert cfg["use_tma_bzp"] is False  # asserted False by tensor.h
     assert cfg["block_shape"] == (128, 128, 128)
     assert cfg["warp_shape"] == (32, 64, 128)
-    assert cfg["num_stages"] == 3
+    assert cfg["num_stages"] == 4
 
     # Same shape at M=2048 - same config picked.
     cfg = Sm100Heuristics.get_config(meta, shape_m=2048)
     assert cfg["block_shape"] == (128, 128, 128)
-    assert cfg["num_stages"] == 3
+    assert cfg["num_stages"] == 4
 
 
 def test_heuristic_falls_back_to_blockk_64_for_unusual_k():

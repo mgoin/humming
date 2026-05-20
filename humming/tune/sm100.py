@@ -129,15 +129,18 @@ class Sm100Heuristics(Sm89Heuristics):
                         gemm_type=gemm_type,
                     )
             # BlockK + stages co-tuned by SMEM budget:
-            #   bk=64  -> stages=4 (≈ 192 KiB used)
-            #   bk=128 -> stages=3 (≈ 272 KiB used; we use 227 KiB
-            #             budget so bk=128 + stages=4 doesn't fit).
+            #   bk=64  -> stages=4 (~ 192 KiB used)
+            #   bk=128 -> stages=4 (~ 224 KiB used after the
+            #             b_dequant [kNumStages]->[2] resize; pre-fix
+            #             this was over budget at 272 KiB). Bench
+            #             sweep across realistic Llama-3 shapes shows
+            #             stages=4 is 1-3% faster than stages=3 at
+            #             every (shape_n, shape_k, M) tested.
             if meta.shape_k % 128 == 0:
                 block_k = 128
-                num_stages = 3
             else:
                 block_k = 64
-                num_stages = 4
+            num_stages = 4
             return {
                 "block_shape": (128, block_n, block_k),
                 "warp_shape": (32, 64, block_k),
