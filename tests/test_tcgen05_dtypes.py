@@ -1,10 +1,16 @@
-"""Map the supported (A dtype, B dtype, has_zero_point) matrix for the
-TCGEN05 path. 16-bit A only (tcgen05.mma.kind::f16); B sweeps across
-all narrower types humming exposes (int, uint, sub-byte float).
+"""Dtype-matrix correctness for the TCGEN05 path.
 
-Tests are parametrized loosely; if a combination fails to build (e.g.
-humming's check_dtype rejects it) the test xfails on the build error.
-Correctness checks use the same tolerance as the main test_tcgen05.py.
+`tcgen05.mma.kind::f16` accepts 16-bit A; this sweep parametrises B
+across every narrower type humming exposes (uint{1..8}, int{2..8},
+sub-byte fp, fp8). humming's `check_dtype` rejects many combinations
+at build time via bare `assert` -- those surface here as `pytest.skip`
+("humming rejects ...").
+
+fp16-A is gated by a static_assert in `tcgen05_mma.cuh` (instruction
+descriptor + scatter are hardcoded bf16); the fp16-A test skips
+explicitly since the nvrtc build error reads as a generic
+"RuntimeError: run failed" that the AssertionError catch can't
+disambiguate.
 """
 from __future__ import annotations
 
@@ -33,7 +39,7 @@ pytestmark = pytest.mark.skipif(not _is_blackwell(), reason="tcgen05 needs sm_10
 def _run_w_a(a_dtype, b_dtype, has_zero_point, shape_m=128, shape_n=128,
              shape_k=256, group_size=128):
     """Run TCGEN05 with the given (A, B) dtype combo and verify
-    correctness against the mma.sync reference."""
+    correctness against the float reference."""
     c_dtype = dtypes.bfloat16
     bs_dtype = dtypes.bfloat16
 
@@ -43,10 +49,10 @@ def _run_w_a(a_dtype, b_dtype, has_zero_point, shape_m=128, shape_n=128,
         has_zero_point=has_zero_point,
     )
     _, weight_ref, weight, weight_scale, zero_point, _ = random_weight
-    # CRITICAL: pass zero_point into prepare_humming_weight so the
-    # repacker applies the sign-magnitude preprocessing the kernel
-    # expects. Forgetting this produces wildly wrong outputs that look
-    # like a kernel bug -- it's not.
+    # Pass zero_point into prepare_humming_weight so the repacker
+    # applies the sign-magnitude preprocessing the kernel's dequant
+    # expects; omitting it on a has_zero_point=True kernel yields
+    # silently-wrong outputs that look like a kernel bug.
     weight_prep = prepare_humming_weight(
         weight, b_dtype, a_dtype,
         zero_point=zero_point if has_zero_point else None,
@@ -103,12 +109,8 @@ def _assert_close(outputs, outputs_ref, label=""):
     torch.testing.assert_close(outputs, outputs_ref, rtol=1e-2, atol=0.5)
 
 
-# ---------------------------------------------------------------------------
-# A = bf16 sweep across all narrower B types humming exposes.
-# ---------------------------------------------------------------------------
-
-# (b_dtype_name, has_zero_point) -- has_zero_point matters mostly for
-# integer (asymmetric) quant; symmetric variants set it False.
+# `has_zero_point` matters mostly for integer (asymmetric) quant;
+# symmetric variants set it False.
 B_DTYPES_BF16 = [
     # unsigned int (asymmetric quant; zero_point usually present)
     ("uint1", False),
@@ -136,11 +138,6 @@ B_DTYPES_BF16 = [
     ("float8e5m2", False),
 ]
 
-# bf16-A: every narrower B works after the Phase B.30 epilogue rescale
-# fix (commit 3f48690). No xfails required here; humming check_dtype
-# already skips the combos it rejects at build time.
-HUMMING_LEVEL_BF16_BUGS = set()
-
 
 @pytest.mark.parametrize("b_name, has_zp", B_DTYPES_BF16)
 def test_tcgen05_bf16_x_b(b_name, has_zp):
@@ -148,20 +145,14 @@ def test_tcgen05_bf16_x_b(b_name, has_zp):
     b_dtype = dtypes.DataType.from_str(b_name)
     if b_dtype.num_bits >= a_dtype.num_bits:
         pytest.skip(f"b={b_name} is not narrower than bf16")
-    if (b_name, has_zp) in HUMMING_LEVEL_BF16_BUGS:
-        pytest.xfail(
-            f"humming-level bug: bf16 x {b_name} zp={has_zp} also fails "
-            "in WMMA -- not TCGEN05-specific"
-        )
     try:
         outputs, outputs_ref = _run_w_a(a_dtype, b_dtype, has_zp)
-    except AssertionError as e:
-        # Humming's check_dtype / check_shape / check_scale all use bare
-        # `assert` (no message) for invalid combos -- e.g. signed int B
-        # with fp A, has_zero_point requiring kBits <= mantissa+1, fp B
-        # exponent vs A exponent mismatch, etc. Any AssertionError from
-        # the build path means "humming rejects this combo", which is
-        # a valid skip from the TCGEN05 path's perspective.
+    except AssertionError:
+        # humming's check_dtype / check_shape / check_scale use bare
+        # `assert` (no message) for invalid combos -- e.g. signed int
+        # B with fp A, has_zero_point requiring kBits <= mantissa+1,
+        # fp B exponent vs A exponent mismatch, etc. Any AssertionError
+        # from the build path means "humming rejects this combo".
         pytest.skip(f"humming rejects (b={b_name}, zp={has_zp})")
     except RuntimeError as e:
         if "not supported" in str(e).lower():
@@ -170,31 +161,10 @@ def test_tcgen05_bf16_x_b(b_name, has_zp):
     _assert_close(outputs, outputs_ref, label=f"bf16 x {b_name} zp={has_zp}")
 
 
-# ---------------------------------------------------------------------------
-# Same sweep with A = fp16 (also valid for tcgen05.mma.kind::f16).
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("b_name, has_zp", B_DTYPES_BF16)
 def test_tcgen05_fp16_x_b(b_name, has_zp):
-    a_dtype = dtypes.float16
-    b_dtype = dtypes.DataType.from_str(b_name)
-    if b_dtype.num_bits >= a_dtype.num_bits:
-        pytest.skip(f"b={b_name} is not narrower than fp16")
-    # Phase B.30: TCGEN05 hard-rejects ElementA != BFloat16 via
-    # static_assert in tcgen05_mma.cuh (tcgen05.mma + scatter are
-    # bf16-only today). nvrtc surfaces this as a non-zero compiler
-    # exit, not a Python AssertionError, so skip explicitly rather
-    # than relying on the build-error catch.
-    pytest.skip(
-        f"TCGEN05 currently only supports bf16 A; fp16 A would need a "
-        "parallel instruction-descriptor + scatter path."
-    )
-    try:
-        outputs, outputs_ref = _run_w_a(a_dtype, b_dtype, has_zp)
-    except (AssertionError, RuntimeError) as e:
-        msg = str(e)
-        if "assert" in msg.lower() or "not supported" in msg.lower():
-            pytest.skip(f"humming rejects (a=fp16, b={b_name}, zp={has_zp}): {msg[:80]}")
-        raise
-    _assert_close(outputs, outputs_ref, label=f"fp16 x {b_name} zp={has_zp}")
+    # TCGEN05 hard-rejects ElementA != BFloat16 via static_assert in
+    # tcgen05_mma.cuh (instruction descriptor + scatter are bf16-only).
+    # Skip explicitly rather than relying on a build-error catch --
+    # nvrtc surfaces the static_assert as a generic "run failed".
+    pytest.skip("TCGEN05 currently only supports bf16 A")

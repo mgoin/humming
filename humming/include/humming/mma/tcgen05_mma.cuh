@@ -169,19 +169,19 @@ public:
                 "TCGEN05 path Phase B.18: K-warps not supported -- "
                 "tcgen05.mma covers the full BlockK by issuing one MMA "
                 "per 16-K-bf16 atom from a single warp.");
-  // Phase B.30: TCGEN05 currently issues `tcgen05.mma.kind::f16` via
-  // `tcgen05_mma_ss_bf16` with `tcgen05_instr_desc_bf16_bf16_f32` --
-  // both hardcoded to bf16. Wiring up the fp16 A/B path requires
+  // TCGEN05 currently issues `tcgen05.mma.kind::f16` via the
+  // `tcgen05_mma_ss_bf16` wrapper with `tcgen05_instr_desc_bf16_bf16_f32`
+  // -- both hardcoded to bf16. Wiring up the fp16 A/B path requires
   // distinct instruction-descriptor builders + the matching scatter
-  // (fp16 in SMEM has different exponent semantics than bf16) which
-  // is unimplemented today. Reject ElementA != BFloat16 at build time
-  // until that lands; otherwise the bf16-shaped instruction reads
-  // fp16 bit patterns and produces garbage (error magnitudes 1e16+).
+  // (fp16 SMEM has different exponent semantics than bf16). Without
+  // that, the bf16-shaped instruction would reinterpret fp16 bit
+  // patterns and produce garbage (error magnitudes ~1e16). Reject at
+  // build time until the fp16 path lands.
   static_assert(std::is_same<ElementA, BFloat16>::value,
-                "TCGEN05 path Phase B.30: only bf16 A is wired up "
-                "today. tcgen05.mma + scatter assume bf16 throughout; "
-                "fp16 A would need a parallel instruction-descriptor "
-                "+ scatter path.");
+                "TCGEN05 path: only bf16 A is wired up today. "
+                "tcgen05.mma + scatter assume bf16 throughout; fp16 A "
+                "would need a parallel instruction-descriptor + "
+                "scatter path.");
 
   // Dequant int4 (from regs_qb) -> bf16 (RMEM) -> SMEM b_dequant staging.
   CUDA_INLINE
@@ -576,16 +576,16 @@ public:
             }
             __nv_bfloat162 v = __floats2bfloat162_rn(f0, f1);
             // Epilogue residual exponent rescale (mirrors
-            // `EpilogueArithmetic::may_apply_on_smem_write` ->
-            // `apply_exp_offset()`): for dtype combos that need a
-            // total exp_offset > the mainloop's max_allowed_offset,
+            // `EpilogueArithmetic::may_apply_on_smem_write`'s
+            // `apply_exp_offset()`): when the total dequant
+            // exp_offset exceeds the mainloop's max_allowed_offset,
             // the leftover lives in `kEpilogueExpOffset.x` and must
-            // be applied here before the bf16 lands in smem.reduce.
-            // WMMA/WGMMA pick this up via smem_writer; TCGEN05 bypasses
-            // smem_writer so we replicate the multiply inline.
-            // (`!kIsTensorWeightScale` mirrors the smem_writer guard
-            // -- for tensor_weight_scale the rescale is already folded
-            // into `gs` by `may_process_on_smem_write`.)
+            // be applied here -- WMMA/WGMMA pick it up via the
+            // smem_writer, but TCGEN05 bypasses smem_writer so we
+            // replicate the multiply inline.
+            // `!kIsTensorWeightScale` mirrors the smem_writer guard:
+            // tensor_weight_scale folds the rescale into `gs` via
+            // `may_process_on_smem_write`.
             if constexpr (ArithClass::kEpilogueExpOffset.x
                           && !LayerConfig::kIsTensorWeightScale) {
               __nv_bfloat162 scale =

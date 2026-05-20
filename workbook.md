@@ -88,300 +88,173 @@ Files we added or extended (everything else is unchanged):
 | `tests/bench_w4a16_baseline.py`                 | 3-way perf vs Sablefish + Marlin                           |
 | `tests/baseline_phaseA.tsv`                     | Snapshot of humming's mma.sync perf, pre-tcgen05            |
 
-## Phase B.31: end-of-WS-kernel cluster barrier was the multi-cast B hang (2026-05-19)
+## Phase B.31: end-of-WS-kernel cluster barrier removed (multi-cast B unblocked)
 
-**TL;DR**: The "TMA multi-cast B hangs on Blackwell" bit-rot documented in
-B.29 was caused by an end-of-kernel
-`barrier.cluster.arrive; barrier.cluster.wait;` pair in
-`kernel/humming_ws.cuh`, gated by `kMultiCastSizeA > 0 || kMultiCastSizeB > 0`
--- a gate that's ALWAYS true since both default to 1. For cluster_size==1
-the cluster barrier is a no-op, so the bug was invisible until you tried
-cluster_size>1 (= the multi-cast configurations). Removing the cluster bar
-makes multi-cast B work and produces correct outputs.
+The "TMA multi-cast B hangs on Blackwell" bit-rot from B.29 was caused
+by an end-of-kernel `barrier.cluster.arrive; barrier.cluster.wait;`
+pair in `kernel/humming_ws.cuh`, gated by
+`kMultiCastSizeA > 0 || kMultiCastSizeB > 0` — a gate that's ALWAYS
+true since both default to 1. For cluster_size==1 it was a no-op; for
+cluster_size>1 (= multi-cast configurations) it deadlocked. The non-WS
+`humming.cuh` path has no equivalent end-of-kernel cluster sync and
+runs multi-cast correctly, confirming the barrier wasn't load-bearing.
+Removing it is sufficient to make multi-cast B / mc_a / mc_b work in
+the WS path on Blackwell.
 
-**Bisection** (`humming/include/humming/kernel/humming_ws.cuh:228-246`):
-* remove only `__syncthreads()` -> hang shifts much earlier (kernel body
-  never reaches end)
-* keep `__syncthreads()`, remove the cluster bar -> kernel completes
-  with correct output (rel=5.21e-3 vs ref) on every tested shape
+**Empirical**: multi-cast B alone is NOT a perf win at our shapes.
+Swept Llama70B-down / Llama70B-gate / Llama8B-gate at M ∈ {128, 256,
+512, 1024, 2048}: speedup of mc_b=2 over mc_b=1 is 0.97-0.99×
+(noise — multi-cast B halves B-bandwidth but the kernel isn't
+B-bandwidth-bound). At very small M, mc_b=2 regresses to 0.49-0.51×
+because the cluster needs ≥2 tile-clusters of work and we underfill.
+The real win pairs multi-cast B with `cta_group::2` so a single MMA
+covers 2× M — see "Future avenues" below.
 
-The non-WS path (`humming.cuh`) has no equivalent end-of-kernel cluster
-sync and works correctly under multi-cast, confirming the cluster bar
-isn't load-bearing.
+## Future perf avenues (B.32-B.33 investigations, not landed)
 
-**Multi-cast B alone is not a perf win**:
-After unblocking, swept Llama70B-down / Llama70B-gate / Llama8B-gate at
-M in {128, 256, 512, 1024, 2048}. Speedup of mc_b=2 over mc_b=1 is
-0.97x-0.99x across the board (essentially noise -- multi-cast B halves
-B-bandwidth but our kernel is not B-bandwidth-bound at these shapes).
-At very small M, mc_b=2 *regresses* (0.49x-0.51x) because the cluster
-needs >= 2 tile-clusters of work and we underfill.
+Two perf paths got prototyped and reverted; each has a real blocker
+documented here so the next attempt doesn't rediscover them.
 
-The real perf win from B.27's `cta_group::2` PTX wrappers comes from
-PAIRING cta_group::2 (1 MMA covers 2x M) with multi-cast B. That's the
-next step: see "Wiring cta_group::2 into TCGEN05" below.
+### Avenue 1: `cta_group::2` (cluster-scope MMA) — needs cluster-shared producer/consumer
 
-### Still-broken multi-cast configurations (out of scope for B.31):
-* `mma + (mc_a=2 AND mc_b=2)` simultaneously still hangs. The single
-  multi-cast configs (mc_a alone or mc_b alone) work; the combined
-  config doesn't. Not on the TCGEN05 critical path; needs separate
-  investigation if anyone wants the combined config.
+The B.27 PTX wrappers (`tcgen05_{alloc,dealloc,mma_ss_bf16,commit_to_mbarrier}_2cta`)
+exist but aren't called. Wiring them up means: leader-only alloc/MMA/
+commit, instruction descriptor with `m_dim = 2*BlockM`, peer reads
+the TMEM col from leader. Three PTX gotchas the next attempt should
+expect (each took bisection to find):
 
-### Wiring cta_group::2 into TCGEN05 (next step, not yet done):
-Required edits in `humming/include/humming/mma/tcgen05_mma.cuh` and
-the cluster-init in `humming/include/humming/kernel/humming.cuh` /
-`humming/include/humming/kernel/humming_ws.cuh`:
-
-1. Branch on `kMultiCastSizeB == 2` to use the `_2cta` PTX wrappers
-   (`tcgen05_alloc_2cta`, `tcgen05_mma_ss_bf16_2cta`,
-   `tcgen05_commit_to_mbarrier_2cta`, `tcgen05_dealloc_2cta`).
-2. Only LEADER (cluster_rank=0) issues the tcgen05.mma; the peer must
-   be at a matching cluster barrier when the issue happens. The
-   `_2cta` mma writes the first BlockM rows of output to leader's
-   TMEM and the second BlockM rows to peer's TMEM (cluster-aligned).
-3. The current scheduler partitions m_block_id between leader/peer
-   with `m_block_id * mc_b + cluster_rank`. That's already correct
-   for cta_group::2 -- leader handles m=base, peer handles m=base+1,
-   and tcgen05.mma's 2*BlockM tile naturally covers both.
-4. Each CTA still does its own t2r locally (cta_group::2 only
-   couples the MMA issue, not the per-CTA TMEM read).
-5. Cluster init: switch `tcgen05_alloc<128>` to `tcgen05_alloc_2cta<128>`
-   when cluster_size==2, and gate it on `elect_one_sync()` of the
-   leader so only one CTA issues the cluster-shared alloc.
-
-This is a substantial refactor (~200 LoC of branching in
-`tcgen05_mma.cuh`) but the PTX wrappers are already in place.
-
-### B.31 follow-up attempt (reverted): cta_group::2 needs cluster-level lockstep
-
-Tried wiring `tcgen05.mma.cta_group::2` into the TCGEN05 path:
-1. `init_tmem_alloc()` / `release_tmem()` helpers branching on
-   `kMultiCastSizeB == 2`.
-2. Leader-only `tcgen05_alloc_2cta` / `tcgen05_dealloc_2cta`, peer
-   seeds local `tcgen05_tmem_col = 0` (fresh-TMEM assumption avoids
-   a cluster sync at init).
-3. Per-K-iter: leader-only `tcgen05_mma_ss_bf16_2cta`. Each CTA
-   issues `tcgen05_commit_to_mbarrier_2cta` so each lands an
-   arrival on its OWN local mbar (peer's commit batches an empty
-   set of MMAs and arrives immediately; the cluster-shared MMA
-   that the leader issued completes together).
-4. Instruction descriptor uses **effective** MMA M = 2 * BlockM
-   (HW splits the output between leader's and peer's TMEM).
-
-**PTX gotchas found:**
 * `tcgen05.mma.cta_group::2.kind::f16` does NOT accept the 4-uint32
-  sparsity mask that the cta_group::1 variant requires (ptxas:
-  "Argument vector size mismatch"). The wrapper had to drop the
-  `{m0..m3}` operand.
+  sparsity/disable mask the cta_group::1 variant requires (ptxas:
+  "Argument vector size mismatch"). The 2cta wrapper has no
+  `{m0..m3}` operand — confirmed against CUTLASS
+  `SM100_MMA_F16BF16_SS_2x1SM::fma`.
 * A single kernel function cannot mix `cta_group::1` and
-  `cta_group::2` tcgen05 instructions: alloc/mma/commit/dealloc must
-  all be the same group. Forced the alloc/dealloc to also branch.
+  `cta_group::2` tcgen05 instructions (ptxas hard error): alloc /
+  dealloc / mma / commit must all be the same group.
 * `mbarrier.try_wait.parity.shared::cluster` is rejected by ptxas
-  ("Illegal modifier '::cluster' for instruction 'mbarrier.try_wait.parity'").
-  Reusing `.shared::cta` with a cluster-mapped pointer crashes
-  with `cudaErrorIllegalInstruction`. Worked around by having both
-  CTAs issue the cta_group::2 commit (cluster-shared, each lands an
-  arrival on its own local mbar) and waiting locally with the
-  regular `.shared::cta` form.
+  ("Illegal modifier"). Using `.shared::cta` with a cluster-mapped
+  pointer hits `cudaErrorIllegalInstruction`. Workaround: have both
+  CTAs issue the cta_group::2 commit (each lands an arrival on its
+  own local mbar) and wait locally with `.shared::cta`.
 
-**Hang/correctness state with all of the above:**
-* mc_b=1: still works (rel ~5e-3).
-* mc_b=2 with cta_group::2: kernel runs to completion (no hang), but
-  outputs are wrong (rel ~1.2). The FIRST few output elements of
-  each M-block are correct (`out[0, 0..3] ~= ref[0, 0..3]`) but
-  per-block `max_err ~= ref_max`, so SOME positions are very wrong.
+The **deeper blocker** is the producer/consumer mbar pipeline.
+`tcgen05.mma.cta_group::2` reads A from both CTAs of the cluster via
+cluster-distributed addressing, but humming's `load_mbar` /
+`consumer.wait_stage` are CTA-local — leader and peer can be at
+different pipeline stages when the MMA issues, so the MMA reads
+stale-or-future A from peer and produces noisy output (rel ~1.2 in
+the prototype). Fix: rework producer/consumer mbars to be
+cluster-scope (the pattern CUTLASS's `Sm100UmmaPipeline` uses). That
+touches `g2s_pipeline.cuh`, `s2r_pipeline.cuh`, `barrier.cuh`, and
+`tcgen05_mma.cuh` -- ~400-600 LoC, but it's the right long-term
+answer and unblocks the biggest single perf lever we have.
 
-**Root cause analysis** (why it's wrong):
+### Avenue 2: TMEM double-buffer (Acc0/Acc1) — two blockers
 
-  `tcgen05.mma.cta_group::2` reads A from both CTAs' SMEM via
-  cluster-distributed addressing -- leader contributes A for its
-  m_block, peer contributes A for m_block+1. But the producer-side
-  mbar pipeline (`load_mbar`, math `consumer.wait_stage`) is
-  CTA-LOCAL: each CTA waits independently for its own stage's TMA
-  loads. There is no cluster-level lockstep guaranteeing that when
-  leader's math issues the MMA at K-iter N, peer's A for K-iter N
-  is committed to peer's SMEM (peer's pipeline may be ahead or
-  behind by one stage). The MMA reads stale-or-future A from peer
-  and produces noisy output.
+Plumbing changes work (alloc 256 cols split into Acc0 at base+0 / Acc1
+at base+128, `mbar[2]`, per-buf `first_issue_` / `mbar_phase_` arrays,
+`final_regs_c(buf_id)` separate from `commit_buffer(buf_id)`). The
+pipelining doesn't land because of:
 
-**Fix that's needed** (deferred):
+* **`smem.reduce` is unioned with the K-loop stages.** `storage.cuh`
+  puts the t2r/epilogue output buffer in a `union` with `smem.a/b/
+  b_dequant` to save SMEM. Deferring the drain to iter T+1 means
+  t2r writes `smem.reduce` while producer iter T+2 (unblocked by
+  the early arrive) writes the same SMEM region for tile T+2's
+  stages — corruption. Fix: split `smem.reduce` out of the union;
+  costs ~32KB more SMEM per CTA and may exceed the budget at
+  BlockN=128 + stages=3.
+* **Using TMEM cols 128..255 is ~2.7× slower than cols 0..127.**
+  Even with sequential commit+wait+t2r (no pipelining), just
+  alternating `acc_buf` between {0, 1} regresses Llama70B-down
+  M=2048 (ws=True bm=128 bk=128) from 2848us to 7812us. Bisected:
+  `alloc<256>` alone is fine if the kernel keeps using cols 0..127;
+  the regression is the alternating-cols access pattern. Cause
+  unknown — needs NCU profiling to disambiguate MMA-side vs t2r-side
+  latency. Plausible: high-col `d_tmem` interacts with sub-partition
+  layout or M-coord bits; `tcgen05_alloc<128>`×2 (two separate
+  allocs) might dodge it.
 
-  Either:
-  (a) Add a cluster barrier per K-iter so leader and peer are
-      lockstep. Adds a cluster-sync to every MMA issue -- likely
-      eats the cta_group::2 perf win. CUTLASS's `Sm100UmmaPipeline`
-      does this with a cluster-aware mbar pair, not raw
-      `barrier.cluster.arrive`.
-  (b) Replace the per-CTA `consumer.wait_stage` mbar with a
-      cluster-shared mbar so that "stage ready" means "ready on
-      BOTH CTAs". Requires reworking producer/consumer pipeline
-      mbars to be cluster-scope, and threading the cluster_rank
-      through producer's TMA arrives.
+### Other (smaller) levers we haven't tried
 
-  Both are substantial -- (b) is what CUTLASS does and is the right
-  long-term answer. ~400-600 LoC across `g2s_pipeline.cuh`,
-  `s2r_pipeline.cuh`, `barrier.cuh`, `tcgen05_mma.cuh`.
+* **`stmatrix.x4` for the dequant-B scatter** in `tcgen05_mma.cuh`
+  (replaces the per-K-iter swizzled-uint32 stores). Would need the
+  m16n8 fragment layout to match `stmatrix`'s 8x8 tile layout, but
+  worth checking — current scatter is one of the bigger remaining
+  per-K-iter costs.
+* **`mma + (mc_a=2 AND mc_b=2)`** (both multi-casts simultaneously)
+  still hangs after B.31. Single-multi-cast configs work; combined
+  doesn't. Not on the TCGEN05 critical path, but if someone wants
+  that combined config it needs a separate dive.
 
-**What's committed**: only B.31 (cluster-bar fix) -- unblocks
-multi-cast B and is correct-but-perf-neutral on its own.
+## Phase B.30: dtype-sweep correctness — missing epilogue exp_offset rescale
 
-**What's reverted**: the cta_group::2 wiring attempt
-(`tcgen05_mma.cuh::init_tmem_alloc/release_tmem`, dual-commit, idesc
-M doubling). Worth picking up again when we're ready to take the
-cluster-shared producer/consumer pipeline refactor.
+TCGEN05 produced wrong outputs for any (A, B) combo whose
+`get_epilogue_exp_offset` was non-zero. The mainloop's exp rescale was
+correct, but TCGEN05's `final_regs_c_as_ptr()` writes the t2r'd output
+directly into `smem.reduce` and bypasses `EpilogueSmemWriter`, which is
+where WMMA/WGMMA apply the residual `kExpOffset.x` rescale (via
+`may_apply_on_smem_write` → `apply_exp_offset()`). Result: outputs
+wrong by `2^kEpilogueExpOffset.x` for affected combos — 64× for
+bf16×uint8(no_zp), 4-16× for bf16×{fp4e2m1, fp6e2m3, fp6e3m2}, etc.
 
-## Phase B.33: TMEM double-buffer attempt -- two blockers found, reverted
-
-Goal: alloc 2x TMEM cols (Acc0 at base+0, Acc1 at base+128), alternate
-per tile, defer wait+t2r+epilogue so HW pipelines tile T's MMAs in
-parallel with tile T-1's mbar wait + t2r. CUTLASS's `Acc0/Acc1`
-pattern.
-
-### Blocker 1: `smem.reduce` is unioned with `smem.a/b`
-
-`storage.cuh:154` puts the epilogue staging buffer (`smem.reduce`)
-in a `union` with the K-loop stages (`smem.a`, `smem.b`,
-`smem.b_dequant`, ...) to save SMEM. Once we defer the drain to the
-NEXT iteration:
-
-  iter T: K-loop T (uses smem.a/b for tile T) -> commit T
-  iter T+1: K-loop T+1 (overwrites smem.a/b with tile T+1's data) ->
-            commit T+1 -> drain pending=T (t2r writes smem.reduce,
-            which ALIASES smem.a/b at this point)
-
-The t2r write to smem.reduce now collides with whatever producer
-iter T+2 (started after consumer.arrive(kNumStages) for tile T+1)
-has written to the same SMEM. Output is correct on the FIRST few
-elements (where the writes happen to agree) but wildly wrong on
-the rest (rel ~0.5-1.2 across our shapes).
-
-Fix would require splitting `smem.reduce` out of the union so it
-has its own SMEM, which costs another ~32KB per CTA -- may or may
-not fit at our typical BlockN=128 + stages=3 SMEM budget. Worth
-re-examining when we're ready to do the SharedStorage refactor.
-
-### Blocker 2: alternating TMEM cols 0..127 vs 128..255 is 2.7x slower
-
-Even WITHOUT the deferred-drain pipelining (i.e. just alternating
-`acc_buf` per tile, keeping commit+wait+t2r+epilogue sequential),
-the WS path regresses on Llama70B-down M=2048:
-
-```
-tcgen05 bm=128 bk=128 ws=True (baseline / HEAD):    2848 us
-tcgen05 bm=128 bk=128 ws=True (alloc<256>, no alt): 2853 us  (~no change)
-tcgen05 bm=128 bk=128 ws=True (alloc<256>, alt):    7812 us  (2.7x SLOWER)
-```
-
-Bisection: `alloc<256>` alone does not regress (alloc returns col=0
-and the kernel keeps using cols 0..127). `acc_buf` alternation per
-tile -- using cols 128..255 on alternating tiles -- causes the
-regression. Plausible explanations (none verified):
-* tcgen05.mma at high TMEM col bases hits a different sub-partition
-  layout that the kind::f16 atom doesn't pipeline as well.
-* d_tmem encoding subtlety -- the col index bit-range may interact
-  with M-coord bits when the col exceeds 128.
-* TMEM allocator places the 256-col region in a way that splits
-  the (M=128, N=128) accumulator across two physical regions for
-  acc_buf=1.
-
-Worth instrumenting with NCU's `gpc__cycles_active_per_warp` or
-similar to see whether the slowdown is on the MMA side (HW
-pipelining) or the t2r side (TMEM read latency).
-
-### Status: reverted
-
-Both blockers are real. The plumbing changes (SharedStorage
-`tcgen05_mbar[2]`, `init_tmem_alloc()` / `release_tmem()` helpers,
-per-buf `first_issue_` / `mbar_phase_` arrays, `final_regs_c(buf_id)`
-split from commit) are correct and pass tests/test_tcgen05.py
-unchanged, but they don't deliver a perf win without resolving (1)
-and (2). The whole attempt is reverted.
-
-Next perf step is uncertain -- options:
-* **Investigate blocker 2 with NCU.** If the cause is e.g. col-range
-  bit interactions, we may be able to use `tcgen05_alloc<128>` x2
-  (two separate 128-col allocs) instead of one alloc<256>.
-* **Take the SharedStorage refactor** to split smem.reduce out of
-  the union. If that fits the SMEM budget, blocker 1 dissolves.
-  We can then re-attempt pipelining, IF blocker 2 is also resolved.
-* **Different perf lever**. stmatrix-based scatter (workbook B.30
-  followup), or revisiting the cta_group::2 path now that we've
-  documented its inter-CTA sync requirement.
-
-## Phase B.30: dtype-sweep correctness — missing epilogue exp_offset rescale (2026-05-19)
-
-**TL;DR**: TCGEN05 was wrong for any (A, B) combo whose
-`get_epilogue_exp_offset` was non-zero. The mainloop rescale was correct,
-but TCGEN05's `final_regs_c_as_ptr()` writes directly into `smem.reduce`
-and bypasses `EpilogueSmemWriter`, which is where WMMA/WGMMA pick up the
-residual `kExpOffset.x` rescale (via `may_apply_on_smem_write` →
-`apply_exp_offset()`). Result: wrong by `2^kEpilogueExpOffset.x` for those
-combos. 64x for bf16×uint8(no_zp), 4-16x for bf16×{fp4e2m1, fp6e2m3,
-fp6e3m2}, etc.
-
-**Diagnosis path that worked** (so the next dtype regression doesn't
-re-do this from scratch):
-1. Added a tests/test_tcgen05_dtypes.py sweep across bf16/fp16 A × all
-   narrower B types. 4 bf16-A combos passed in WMMA but failed in
-   TCGEN05 (uint8 no_zp, fp4e2m1, fp6e2m3, fp6e3m2).
-2. Hypothesised dequant-output-layout differences. Confirmed false by
-   printf-dumping `regs_b_tmp` for thread 0 in both paths against a
-   deterministic weight pattern -- bit-identical between WMMA and
-   TCGEN05.
-3. Ran a `weight = const + small_pattern` smoke test: WMMA = expected
-   ref, TCGEN05 = ref / 64 for bf16×uint8 no_zp. The 64x = 2^6, which
-   matched `get_epilogue_exp_offset<bf16, uint8, bf16, false, false>.x`.
-
-**Fix** (commits: see git log):
-* `mainloop_arith.cuh`: expose `static constexpr uint2
-  kEpilogueExpOffset` so the TCGEN05 path can read what the epilogue
-  arith would have computed.
+**Fix**:
+* `mainloop_arith.cuh`: expose `static constexpr uint2 kEpilogueExpOffset`
+  so the TCGEN05 path can read what the epilogue arith would have
+  computed.
 * `tcgen05_mma.cuh::final_regs_c_as_ptr()`: after the f32→bf162 cast,
   multiply by `prepare_exp_scale_factor<bf162, kEpilogueExpOffset.x>()`
-  when non-zero (and `!kIsTensorWeightScale`, mirroring the
-  `may_apply_on_smem_write` guard).
+  when non-zero and `!kIsTensorWeightScale` (mirrors the
+  `may_apply_on_smem_write` guard — for tensor_weight_scale the
+  rescale is folded into `gs`).
 
-**Coverage now**:
-* `tests/test_tcgen05_dtypes.py`: 14 passed / 24 skipped, 0 fails.
-* The earlier "humming-level bug" suspicion for bf16×uint{7,8}+zp was
-  a test bug: `prepare_humming_weight()` MUST receive
-  `zero_point=zero_point` when the kernel runs with has_zero_point.
-  Forgetting it makes the repacker skip the sign-magnitude preprocess
-  the dequant expects → garbage outputs in BOTH WMMA and TCGEN05. The
-  test file (and any /tmp scratch comparing WMMA vs TCGEN05) needs
-  that arg, which the new `test_tcgen05_dtypes.py::_run_w_a` does.
-* The fp16-A failure was real but for a different reason: TCGEN05's
-  instruction descriptor is hardcoded
-  (`tcgen05_instr_desc_bf16_bf16_f32`) and the issue helper is
-  `tcgen05_mma_ss_bf16` -- both bf16-only. Added a static_assert in
-  `tcgen05_mma.cuh` rejecting `ElementA != BFloat16`. The test skips
-  these combos explicitly since nvrtc surfaces the static_assert as a
-  generic `RuntimeError: run failed` rather than a parseable assert.
+**Coverage**: `tests/test_tcgen05_dtypes.py` -- 14 bf16-A combos pass
+(uint{1..8} with/without zp, int{2..8}, fp4e2m1, fp6e{2,3}m{3,2},
+fp8e{4,5}m{3,2}); 24 skipped (humming check_dtype rejects + b_dtype
+not narrower than a_dtype + fp16-A blocked).
 
-**Wiring fp16-A into TCGEN05 (future work, B.31?)**:
-* tcgen05.mma.kind::f16 accepts both bf16 AND fp16, so the PTX side
-  exists. Need parallel `tcgen05_instr_desc_f16_f16_f32` +
-  `tcgen05_mma_ss_f16` helpers, plus a path-select in TCGEN05::run().
-* The scatter assumes nothing dtype-specific (it writes uint32 pairs
-  of generic 16-bit values), so it should be reusable as-is once the
-  SMEM contents are fp16 instead of bf16.
-* `final_regs_c_as_ptr()` casts f32 → bf162; would need a `kIsF16Out`
-  dispatch to cast to f162 instead. ElementC is currently
-  bf16-default; check whether any caller wants fp16-out before paying
-  for this.
+### fp16-A is gated by static_assert
 
-**Still NOT supported in TCGEN05's bypass-smem_writer path**:
-* `kIsChannelInputScale` (would need `may_apply_f32_on_smem_write` on
-  f32 before bf162 cast)
-* `kIsChannelWeightScale` (would need bs[col] multiply on bf162)
-* `kIsTensorWeightScale` (would need `gs * 2^kExpOffset.x` precompute +
-  bf162 multiply)
-* `kIsBlockWeightScale` (untested; should follow channel-weight-scale
-  pattern)
-* `kIsF16Accum` (the apply_exp_offset+bs+gs+bias ordering differs)
-These are not exercised by the current test suite. When the first
-caller asks for one of them, replicate the matching smem_writer branch
-into `final_regs_c_as_ptr()`.
+`tcgen05_mma.cuh`'s instruction descriptor builder
+(`tcgen05_instr_desc_bf16_bf16_f32`) and issue helper
+(`tcgen05_mma_ss_bf16`) are hardcoded to bf16. A static_assert rejects
+`ElementA != BFloat16` at build time. nvrtc surfaces this as a generic
+`RuntimeError: run failed`, so the fp16-A test skips explicitly rather
+than try to catch and disambiguate.
+
+Wiring fp16-A would need: parallel `tcgen05_instr_desc_f16_f16_f32`
+and `tcgen05_mma_ss_f16` helpers, a path-select in TCGEN05::run(),
+and a `kIsF16Out`-aware cast in `final_regs_c_as_ptr()`'s f32→bf162
+step. The dequant-B scatter is dtype-agnostic (uint32 pairs of
+generic 16-bit values), so it carries over.
+
+### Features NOT supported in TCGEN05's bypass-smem_writer path
+
+These features work in the WMMA/WGMMA paths (smem_writer applies them)
+but TCGEN05's `final_regs_c_as_ptr` bypasses smem_writer and doesn't
+replicate them yet. When the first caller wants one of these, port the
+matching smem_writer branch into `final_regs_c_as_ptr`:
+
+* `kIsChannelInputScale` — needs `may_apply_f32_on_smem_write` on
+  f32 before the bf162 cast.
+* `kIsChannelWeightScale` — needs `bs[col]` multiply on bf162.
+* `kIsTensorWeightScale` — needs `gs * 2^kExpOffset.x` precompute +
+  bf162 multiply.
+* `kIsBlockWeightScale` — untested; should follow the channel-weight
+  pattern.
+* `kIsF16Accum` — the apply_exp_offset + bs + gs + bias ordering
+  differs from the f32-accum path.
+
+### Gotcha for future dtype tests + benchmarks
+
+`prepare_humming_weight()` MUST receive `zero_point=zero_point` when
+the kernel runs with `has_zero_point=True`. The repacker gates the
+sign-magnitude preprocessing on this kwarg
+(`should_preprocess_for_int2fp` in `humming/utils/weight.py`).
+Omitting it on a with-zp kernel produces silently-wrong outputs that
+look like a kernel bug. Both `tests/test_tcgen05_dtypes.py` and
+`benchmarks/bench_tcgen05_vs_wmma.py` have inline notes; this earlier
+silently bit the original bench.
 
 ## Current state (Phase B.14 / B.15 partial, 2026-05-19)
 
