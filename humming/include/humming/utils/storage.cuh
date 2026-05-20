@@ -139,9 +139,14 @@ public:
 
   // Staging buffer for the tcgen05 path: dequantised B operand in bf16/fp16
   // staged from registers back to SMEM before the tcgen05.mma reads it.
-  // Sized as one full (BlockN x BlockK) tile per pipeline stage. The
+  // Holds one full (BlockN x BlockK) tile per ping-pong slot. The
   // element type matches ElementA (= MMA operand type) so the descriptor
   // construction in TCGEN05::run() uses the same swizzle as A.
+  // Two slots are sufficient because TCGEN05::run/transform_b index the
+  // buffer by `iter_id % 2` (not stage_id); a slot is reused after the
+  // tcgen05.mma chain it feeds drains, which happens within one K-iter
+  // of pipeline depth.
+  static constexpr uint32_t kNumBDequantBuffers = 2;
   static constexpr uint32_t kSmemStrideBDequant = BlockShape::N * BlockShape::K * ElementA::kBits / 32 / 4;
   static constexpr uint32_t kStageSizeBDequant = kSmemStrideBDequant;
   static constexpr uint32_t kStageBytesBDequant = kStageSizeBDequant * sizeof(int4);
@@ -170,7 +175,7 @@ public:
       // absolute byte address, and a non-128B-aligned base shifts the
       // effective pattern in a way that doesn't match a row-major
       // logical layout.
-      IF_USE_TCGEN05(alignas(128) int4 b_dequant[kNumStages][kStageSizeBDequant];)
+      IF_USE_TCGEN05(alignas(128) int4 b_dequant[kNumBDequantBuffers][kStageSizeBDequant];)
     };
     int4 reduce[MAX(kWarpReduceSize, kBlockOutputSize)];
   };
