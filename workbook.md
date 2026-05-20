@@ -110,7 +110,66 @@ because the cluster needs ≥2 tile-clusters of work and we underfill.
 The real win pairs multi-cast B with `cta_group::2` so a single MMA
 covers 2× M — see "Future avenues" below.
 
-## Phase B.35: stages=4 unlocked by b_dequant SMEM resize (1-3% win)
+## Phase B.36: NCU re-baseline at stages=4
+
+Re-profiled the production WS path with the B.35 heuristic
+(BlockM=128 BlockN=128 BlockK=128 stages=4 ws=True) on Llama70B-down
+M=2048:
+
+```
+Compute (SM) Throughput  :  57.03 %  (was 56.83 % at s=3, ~ unchanged)
+Memory Throughput        :  53.24 %  (was 56.41 % at s=3, -3.2 pp)
+L1/TEX Cache Throughput  :  55.79 %  (was 58.99 % at s=3, -3.2 pp)
+DRAM Throughput          :   2.92 %  (~ unchanged)
+Dynamic SMEM/CTA         : 230.78 KiB  (was 222 KiB; near the 232 KiB
+                                         limit on cc 10.x)
+Achieved Occupancy       :  18.75 %  (still 1 CTA/SM)
+Avg Active Threads/Warp  :  31.34 of 32
+```
+
+Stall breakdown at s=4 (cycles per issued inst, ~5.0 total):
+
+```
+                    s=4    s=3   delta
+long_scoreboard:   1.52   1.59   -0.07 (memory wait slightly down)
+wait (mbar):       0.66   0.63   +0.03
+barrier (bar.sync):0.44   0.41   +0.03
+not_selected:      0.45     -    (was not measured at s=3)
+short_scoreboard:  0.09   0.13   -0.04
+mio_throttle:      0.08   0.08    0.00
+```
+
+Stages=4 widens the producer pipeline; long_scoreboard drops slightly
+as a result. Barrier stall is still ~8.5% of issued inst.
+
+### Implication for the three B.34 candidate fixes:
+
+* **2 CTAs/SM occupancy is now blocked at this config**: SMEM at 230
+  KiB is essentially at the 232 KiB cc 10.x cap. To fit 2 blocks
+  needs <=116 KiB/CTA -- 114 KiB has to come out. Not feasible
+  without dropping BlockM/N/K. A BlockM=64 BlockN=64 BlockK=128
+  stages=3 config penciled out at ~92 KiB/CTA would fit 2/SM, but
+  the heuristic never picks small-block at the M >= 128 shapes where
+  TCGEN05 is selected. Could revisit if we add a small-M tcgen05
+  config.
+
+* **Per-K-iter barrier replacement still has ~8.5% headroom**.
+  Bar.sync is structurally required (all 256 math threads write
+  different parts of b_dequant; tcgen05.mma reads all of it via the
+  async proxy), so the barrier can't be removed -- only made cheaper
+  or amortized.  Bar.arrive + elected-waiter doesn't actually save
+  wall time (wait condition stays the same -- "all 256 arrived").
+  The structural lever is **batching the sync across multiple
+  K-iters** (e.g. iter T+iter T+1 share one sync), which requires
+  reordering the dataflow so both transform_b(T) and transform_b(T+1)
+  complete before the batched scatter. Touches mma.run + the loop
+  structure in humming_ws.cuh.
+
+* **stmatrix.x4 for scatter** still on the table; ALU/LSU at 46/41 %
+  utilization, not pegged, so freeing per-store address math may not
+  translate to wall time. Layout audit (B.30 note) still pending.
+
+
 
 NCU baseline (B.34) showed dynamic SMEM at 222 KiB and 1 CTA/SM. Audit
 revealed `smem.b_dequant[kNumStages][...]` was sized per-stage but
