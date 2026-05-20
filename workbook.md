@@ -110,6 +110,36 @@ because the cluster needs ≥2 tile-clusters of work and we underfill.
 The real win pairs multi-cast B with `cta_group::2` so a single MMA
 covers 2× M — see "Future avenues" below.
 
+## Phase B.36b: bar.sync is structurally load-bearing (not just overhead)
+
+Tried replacing `sync_part_threads` (the per-K-iter `bar.sync 1, 256`)
+with a fence-only (`fence.proxy.async.shared::cta;`) to bound the
+wall-time upside if the barrier were free. Expected: correctness
+broken, but timing should be the lower bound.
+
+Result: **7x slower** (~20 ms vs ~2.8 ms baseline), not faster. The
+bar.sync isn't just a per-instance synchronization cost -- it's the
+HW-level ordering primitive that lets the tcgen05.mma issue pipeline
+stay non-degenerate. Without it, races between scatter and mma-issue
+back up the TMEM commit queue or trigger SMEM-read retries in a way
+that pathologically stalls the kernel.
+
+Takeaway: the NCU "barrier" stall (~8.5% of issued inst) is NOT a
+straight wall-time upside if you eliminate the barrier. To win this
+budget you must KEEP a sync but make it run LESS OFTEN -- i.e. batch
+the per-K-iter sync across two K-iters (different b_dequant
+ping-pong slots, no clobber), which requires reordering transform_b
+so both regs_b_tmp[0] and regs_b_tmp[1] are ready before the batched
+scatter. That's a moderate dataflow refactor in
+`humming_ws.cuh` + `tcgen05_mma.cuh`. Not landed yet.
+
+Also ruled out via sweep at production shape (M=2048):
+* **BlockN=256** at any stage/BlockK combo loses to BlockN=128
+  stages=4 -- larger BlockN reduces N-tile count (32 vs 64 for
+  N=8192) and grid parallelism (the kernel becomes wave-limited).
+  BN=128 BK=128 s=4 stays the winner across all three Llama70B/8B
+  shapes tested.
+
 ## Phase B.36: NCU re-baseline at stages=4
 
 Re-profiled the production WS path with the B.35 heuristic
