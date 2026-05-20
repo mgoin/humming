@@ -104,17 +104,15 @@ TCGEN05_CONFIGS = [
 ]
 
 
-def build_launcher(mma_type, b_name, has_zp, shape_m, shape_n, shape_k,
-                   tcgen05_cfg_idx=0):
-    """Build a launcher for the given (mma_type, b_dtype, shape).
+def build_and_verify(mma_type, b_name, has_zp, shape_m, shape_n, shape_k,
+                     tcgen05_cfg_idx=0):
+    """Build a launcher and verify correctness at a small probe shape.
 
-    For mma_type=="tcgen05" tries the config at TCGEN05_CONFIGS
-    [tcgen05_cfg_idx]; callers loop over the ladder to find the best
-    one that fits.
+    Returns (launch_fn, "ok") if the config builds, runs, and is
+    bit-correct against a float reference; (None, "<reason>") otherwise.
 
-    Returns None if humming rejects the combo at build/JIT time
-    (humming's `check_dtype` / `check_scale` use bare `assert` for
-    invalid combos).
+    Verification uses a fresh small (128, 128, 256) problem so we
+    don't pay the full bench shape just to find broken configs.
     """
     b_dtype = dtypes.DataType.from_str(b_name)
     if mma_type == "tcgen05":
@@ -133,83 +131,103 @@ def build_launcher(mma_type, b_name, has_zp, shape_m, shape_n, shape_k,
         use_cp_async = True
         use_mbarrier = False
 
-    torch.manual_seed(123)
-    try:
-        w = generate_random_weight(
-            n=shape_n, k=shape_k, group_size=GROUP_SIZE,
-            dtype=b_dtype, scale_dtype=BS_DTYPE, has_zero_point=has_zp,
+    def _kernel_factory(n, k, m_probe=None):
+        """Build the kernel + weights + inputs for either the verify
+        probe (small) or the bench shape (large)."""
+        m_to_use = m_probe if m_probe is not None else shape_m
+        torch.manual_seed(123)
+        try:
+            w = generate_random_weight(
+                n=n, k=k, group_size=GROUP_SIZE,
+                dtype=b_dtype, scale_dtype=BS_DTYPE, has_zero_point=has_zp,
+            )
+        except (AssertionError, RuntimeError):
+            return None
+        _, w_ref, weight, weight_scale, zero_point, _ = w
+        try:
+            weight_p = prepare_humming_weight(
+                weight, b_dtype, A_DTYPE,
+                zero_point=zero_point if has_zp else None,
+                use_wgmma=False,
+            )
+            weight_scale_p = prepare_humming_weight_scale(
+                weight_scale, to_apply_on_c=False,
+            )
+            zp_p = (prepare_humming_zero_point(zero_point, dtype=b_dtype)
+                    if has_zp else None)
+        except (AssertionError, RuntimeError):
+            return None
+        _, in_ref, inputs, _ = generate_random_inputs(
+            m=m_to_use, k=k, group_size=0, dtype=A_DTYPE,
         )
-    except (AssertionError, RuntimeError):
-        return None
-    _, _, weight, weight_scale, zero_point, _ = w
-    try:
-        weight_p = prepare_humming_weight(
-            weight, b_dtype, A_DTYPE,
-            zero_point=zero_point if has_zp else None,
-            use_wgmma=False,
+        outputs = torch.empty(
+            (m_to_use, n), dtype=torch.bfloat16, device="cuda",
         )
-        weight_scale_p = prepare_humming_weight_scale(
-            weight_scale, to_apply_on_c=False,
+        try:
+            kernel = HummingKernel(
+                shape_n=n, shape_k=k,
+                block_shape=block_shape, warp_shape=warp_shape,
+                a_dtype=A_DTYPE, b_dtype=b_dtype, c_dtype=C_DTYPE,
+                bs_dtype=BS_DTYPE,
+                weight_scale_group_size=GROUP_SIZE,
+                has_zero_point=has_zp,
+                num_stages=num_stages,
+                use_warp_spec=use_warp_spec,
+                use_tma=use_tma,
+                use_cp_async=use_cp_async,
+                use_mbarrier=use_mbarrier,
+                use_tma_bzp=False,
+                has_bias=False,
+                mma_type=mma_type,
+                use_tcgen05=(mma_type == "tcgen05"),
+                use_stream_k=False,
+            )
+        except (AssertionError, RuntimeError):
+            return None
+        launch_kwargs = dict(
+            configs=[kernel.kernel_id], inputs=inputs, weight=weight_p,
+            outputs=outputs, weight_scale=weight_scale_p,
         )
-        zero_point_p = (
-            prepare_humming_zero_point(zero_point, dtype=b_dtype)
-            if has_zp else None
-        )
-    except (AssertionError, RuntimeError):
-        return None
-    _, _, inputs, _ = generate_random_inputs(
-        m=shape_m, k=shape_k, group_size=0, dtype=A_DTYPE,
-    )
-    outputs = torch.empty(
-        (shape_m, shape_n), dtype=torch.bfloat16, device="cuda",
-    )
-    try:
-        kernel = HummingKernel(
-            shape_n=shape_n, shape_k=shape_k,
-            block_shape=block_shape, warp_shape=warp_shape,
-            a_dtype=A_DTYPE, b_dtype=b_dtype, c_dtype=C_DTYPE,
-            bs_dtype=BS_DTYPE,
-            weight_scale_group_size=GROUP_SIZE,
-            has_zero_point=has_zp,
-            num_stages=num_stages,
-            use_warp_spec=use_warp_spec,
-            use_tma=use_tma,
-            use_cp_async=use_cp_async,
-            use_mbarrier=use_mbarrier,
-            use_tma_bzp=False,
-            has_bias=False,
-            mma_type=mma_type,
-            use_tcgen05=(mma_type == "tcgen05"),
-            use_stream_k=False,
-        )
-    except (AssertionError, RuntimeError):
-        return None
+        if zp_p is not None:
+            launch_kwargs["zero_point"] = zp_p
+        def launch():
+            ops.launch_kernel(**launch_kwargs)
+        return launch, in_ref, w_ref, outputs
 
-    launch_kwargs = dict(
-        configs=[kernel.kernel_id], inputs=inputs, weight=weight_p,
-        outputs=outputs, weight_scale=weight_scale_p,
-    )
-    if zero_point_p is not None:
-        launch_kwargs["zero_point"] = zero_point_p
-
-    def launch():
-        ops.launch_kernel(**launch_kwargs)
-
-    # Run once to surface any runtime "not supported" errors that
-    # the build path didn't catch.
+    # Step 1: build at the verify-probe shape and check correctness.
+    verify = _kernel_factory(128, 256, m_probe=128)
+    if verify is None:
+        return (None, "build")
+    v_launch, v_in_ref, v_w_ref, v_out = verify
     try:
-        launch()
+        v_launch()
         torch.cuda.synchronize()
     except RuntimeError:
-        return None
-    return launch
+        return (None, "launch")
+    v_ref = v_in_ref.matmul(v_w_ref.T).to(torch.bfloat16)
+    # Match the test's tolerance (`torch.testing.assert_close
+    # rtol=1e-2, atol=0.5`): |x - y| <= atol + rtol * |y|. Plain
+    # `> atol` is too strict and rejects bf16-precision drift.
+    abs_err = (v_out.float() - v_ref.float()).abs()
+    threshold = 0.5 + 1e-2 * v_ref.float().abs()
+    if (abs_err > threshold).any():
+        rel = (abs_err.max() / max(v_ref.float().abs().max().item(), 1e-9))
+        return (None, f"WRONG-OUTPUT (rel {rel*100:.0f}%)")
+
+    # Step 2: build at the actual bench shape.
+    bench = _kernel_factory(shape_n, shape_k, m_probe=shape_m)
+    if bench is None:
+        return (None, "bench-build")
+    b_launch, _, _, _ = bench
+    return (b_launch, "ok")
 
 
 def bench_one(b_name, has_zp, shape_m, shape_n, shape_k, mma_type):
     """Bench one (mma_type, dtype, shape).
 
-    For mma_type=="tcgen05" walks the config ladder and returns the
-    fastest config that built and ran. For "mma" uses a single config.
+    For mma_type=="tcgen05" walks the config ladder, **verifies
+    correctness at a small probe shape**, and returns the fastest
+    config that is bit-correct. For "mma" uses a single config.
     """
     sn = round_up(shape_n, 128)
     sk = round_up(shape_k, 128)
@@ -217,7 +235,9 @@ def bench_one(b_name, has_zp, shape_m, shape_n, shape_k, mma_type):
     if mma_type == "tcgen05":
         best = (None, None)
         for cfg_idx in range(len(TCGEN05_CONFIGS)):
-            launch = build_launcher(mma_type, b_name, has_zp, sm, sn, sk, cfg_idx)
+            launch, why = build_and_verify(
+                mma_type, b_name, has_zp, sm, sn, sk, cfg_idx,
+            )
             if launch is None:
                 continue
             try:
@@ -228,7 +248,7 @@ def bench_one(b_name, has_zp, shape_m, shape_n, shape_k, mma_type):
                 best = (us, cfg_idx)
         return best  # (us_or_None, cfg_idx_or_None)
     else:
-        launch = build_launcher(mma_type, b_name, has_zp, sm, sn, sk)
+        launch, _ = build_and_verify(mma_type, b_name, has_zp, sm, sn, sk)
         if launch is None:
             return (None, None)
         try:
@@ -263,7 +283,11 @@ def main():
                 else:
                     ratio = "   --   "
                 if t_tcg is None and t_mma is None:
-                    continue  # both rejected -- skip silently
+                    print(
+                        f"  {label:<13s} {m:>5d} {b_name:<14s} {str(has_zp):>4s}  "
+                        f"  (humming rejects -- no valid tcg or mma config)"
+                    )
+                    continue
                 print(
                     f"  {label:<13s} {m:>5d} {b_name:<14s} {str(has_zp):>4s}  "
                     f"{fmt(t_tcg)} {cfg_label(cfg_idx):>11s} {fmt(t_mma)} {ratio:>10s}"

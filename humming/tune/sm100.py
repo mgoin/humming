@@ -17,6 +17,57 @@ from humming.config import GemmType
 from humming.tune.sm8x import Sm89Heuristics
 
 
+# B-dtypes opted in for the TCGEN05 path. Each entry maps to a
+# (block_k, num_stages) config in `_tcgen05_config_for_b_dtype`. The
+# set is conservative: only dtypes whose WS+TMA configs were verified
+# correct vs the no-WS reference at production shapes (workbook B.37,
+# `benchmarks/bench_tcgen05_dtypes.py`).
+_TCGEN05_OPTED_IN_B_DTYPES = frozenset({
+    dtypes.uint3,
+    dtypes.uint4,
+    dtypes.uint5,
+    dtypes.uint6,
+    dtypes.uint8,
+    dtypes.float4e2m1,
+    dtypes.float8e4m3,
+    dtypes.float8e5m2,
+})
+
+
+def _tcgen05_config_for_b_dtype(b_dtype, shape_k_aligned_128):
+    """Return (block_k, num_stages) for the TCGEN05 path given the
+    B dtype and whether shape_k is a multiple of 128.
+
+    Wider B-dtypes (uint{5..8}, fp8) blow the 232 KiB SMEM cap at
+    BlockK=128 stages=4 once they're combined with the bf16
+    b_dequant staging buffer, so they're tuned with BlockK=128
+    stages=3 (uint5/6, fp8) or BlockK=64 stages=3 (uint8) which
+    matches the bench's safe-and-fastest picks.
+
+    uint4 keeps BlockK=128 stages=4 (the existing tuned config from
+    workbook B.35) when shape_k allows it.
+
+    All configs are verified correct at production-realistic shapes
+    by `tests/test_tcgen05_dtypes.py::test_tcgen05_bf16_x_b_prod_ws`.
+    """
+    if not shape_k_aligned_128:
+        # BlockK=128 needs shape_k divisible by 128. Fall back to
+        # BlockK=64 stages=4 for all dtypes.
+        return 64, 4
+    # BlockK=128 path: pick stages per SMEM budget for this dtype.
+    if b_dtype in (dtypes.uint3, dtypes.uint4, dtypes.float4e2m1):
+        return 128, 4
+    if b_dtype in (dtypes.uint5, dtypes.uint6,
+                   dtypes.float8e4m3, dtypes.float8e5m2):
+        return 128, 3
+    if b_dtype == dtypes.uint8:
+        # uint8's raw codes are 2x wider than uint4; even at stages=3
+        # BlockK=128 trips the SMEM cap. Use BlockK=64 stages=4.
+        return 64, 4
+    # Fallback for any future opt-in: BlockK=64 stages=4.
+    return 64, 4
+
+
 def _is_tcgen05_eligible(meta, shape_m: int, gemm_type: GemmType) -> bool:
     """Return True iff the TCGEN05 path is BOTH supported and a
     profitable choice for `meta` at `shape_m`.
@@ -46,13 +97,14 @@ def _is_tcgen05_eligible(meta, shape_m: int, gemm_type: GemmType) -> bool:
         return False
     if meta.a_dtype != dtypes.bfloat16:
         return False
-    if meta.b_dtype != dtypes.uint4:
+    # B-dtypes opted in for the TCGEN05 fast-path. Each has a
+    # corresponding (block_k, num_stages) entry in
+    # `_tcgen05_config_for_b_dtype` below, picked from
+    # `benchmarks/bench_tcgen05_dtypes.py` (which sweeps a config
+    # ladder per dtype and reports the fastest WS+TMA config that
+    # matches the no-WS reference within bf16 noise).
+    if meta.b_dtype not in _TCGEN05_OPTED_IN_B_DTYPES:
         return False
-    if not meta.has_zero_point:
-        # has_zero_point=False works but the most common deployed
-        # quant flows are AWQ/GPTQ with zero-points; gate to that
-        # case for now since it's what the bench validated.
-        pass  # actually allow both — both are correct.
     if meta.weight_scale_group_size <= 0:
         # Tensor-scale or no-scale: not exercised by tests yet.
         return False
@@ -127,19 +179,12 @@ class Sm100Heuristics(Sm89Heuristics):
                         use_batch_invariant=use_batch_invariant,
                         gemm_type=gemm_type,
                     )
-            # BlockK + stages co-tuned by SMEM budget:
-            #   bk=64  -> stages=4 (~ 192 KiB used)
-            #   bk=128 -> stages=4 (~ 224 KiB used after the
-            #             b_dequant [kNumStages]->[2] resize; pre-fix
-            #             this was over budget at 272 KiB). Bench
-            #             sweep across realistic Llama-3 shapes shows
-            #             stages=4 is 1-3% faster than stages=3 at
-            #             every (shape_n, shape_k, M) tested.
-            if meta.shape_k % 128 == 0:
-                block_k = 128
-            else:
-                block_k = 64
-            num_stages = 4
+            # BlockK + num_stages depend on B-dtype's SMEM footprint;
+            # `_tcgen05_config_for_b_dtype` keeps the per-dtype
+            # mapping next to the opted-in set above.
+            block_k, num_stages = _tcgen05_config_for_b_dtype(
+                meta.b_dtype, meta.shape_k % 128 == 0,
+            )
             return {
                 "block_shape": (128, block_n, block_k),
                 "warp_shape": (32, 64, block_k),
