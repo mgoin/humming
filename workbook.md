@@ -110,6 +110,43 @@ because the cluster needs ≥2 tile-clusters of work and we underfill.
 The real win pairs multi-cast B with `cta_group::2` so a single MMA
 covers 2× M — see "Future avenues" below.
 
+## Phase B.35: stages=4 unlocked by b_dequant SMEM resize (1-3% win)
+
+NCU baseline (B.34) showed dynamic SMEM at 222 KiB and 1 CTA/SM. Audit
+revealed `smem.b_dequant[kNumStages][...]` was sized per-stage but
+indexed only by `iter_id % 2` in all four references in
+`tcgen05_mma.cuh` -- the extra stage slots were dead.
+
+Resizing to `b_dequant[2][...]` drops dynamic SMEM by 32 KiB at the
+production WS config (BlockM=128 BlockN=128 BlockK=128 stages=3),
+freeing budget that previously blocked stages=4 at BlockK=128:
+
+```
+config                                 dyn SMEM   blocks/SM
+BlockK=128 stages=3 (pre-fix, B.34):   222 KiB     1
+BlockK=128 stages=3 (post-fix):        185 KiB     1
+BlockK=128 stages=4 (post-fix):        ~224 KiB    1  (fits inside 228 KiB)
+```
+
+Doesn't cross the 2 CTAs/SM boundary (would need <=114 KiB), but
+enables stages=4. Bench sweep across Llama8B/Llama70B qkv/gate/down at
+M in {256, 1024, 2048}: **stages=4 wins all 18 (shape, M) points by
+1-3%** vs stages=3. E.g.:
+
+```
+Llama70B-down M=2048: 2855 us (s=3) -> 2787 us (s=4)
+Llama70B-gate M=2048: 2896 us (s=3) -> 2831 us (s=4)
+Llama8B-gate  M=2048:  771 us (s=3) ->  753 us (s=4)
+```
+
+Heuristic (`tune/sm100.py`) bumped to stages=4 for both BlockK
+branches; the bk=64 fallback was already at stages=4. Tests
+(`test_sm100_heuristic.py`) updated.
+
+The remaining 4 KiB of headroom isn't enough on its own to flip
+2-CTA/SM occupancy or enable BlockN=192, but together with future
+trimmings it could.
+
 ## Phase B.34: NCU baseline
 
 NCU profile of the production WS path on Llama70B-down M=2048
@@ -422,7 +459,7 @@ silently bit the original bench.
   kNumStages==2 so SMEM A isn't overwritten before the last K-iter's
   tcgen05.mma reads it via the SS descriptor.
 
-### Current perf bar (sm_103a, Phase B.24, BlockM=128 + stages=3 + WS):
+### Current perf bar (sm_103a, Phase B.35, BlockM=128 BlockK=128 stages=4 WS):
 TCGEN05 correctness covers BlockShape ∈ {64, 128} × {64, 128, 256} ×
 {64, 128, 256}, kNumStages ∈ {2, 3, 4}, has_{zp, bias} ∈ {T, F}, TMA
 on/off, warp-spec on/off (44 tests pass / 1 xfail).
