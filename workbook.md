@@ -110,6 +110,80 @@ because the cluster needs ≥2 tile-clusters of work and we underfill.
 The real win pairs multi-cast B with `cta_group::2` so a single MMA
 covers 2× M — see "Future avenues" below.
 
+## Phase B.34: NCU baseline
+
+NCU profile of the production WS path on Llama70B-down M=2048
+(BlockM=128 BlockN=128 BlockK=128 stages=3 ws=True; one launch via
+`/usr/local/cuda/bin/ncu --launch-skip 2 --launch-count 1 --kernel-name
+regex:humming`):
+
+```
+Compute (SM) Throughput :  56.83 %
+Memory Throughput       :  56.41 %      (DRAM throughput just 2.70%
+L1/TEX Cache Throughput :  58.99 %       -- weights live in L2/SMEM)
+L2 Hit Rate             :  71.69 %
+Executed IPC Active     :   2.38 inst/cycle
+Achieved Occupancy      :  18.75 %      (1 block/SM, limited by
+                                          SMEM 222KiB and regs 168/thread)
+Avg Active Threads/Warp :  31.35 of 32  (no divergence)
+```
+
+Stall breakdown (cycles per issued inst, of 5.05 total):
+
+```
+long_scoreboard  : 1.59  (31.5%)    SMEM/L1 wait on loads
+wait             : 0.63  (12.5%)    mbarrier waits (consumer.wait_stage)
+barrier          : 0.41  ( 8.1%)    bar.sync (sync_part_threads per K-iter)
+short_scoreboard : 0.13  ( 2.6%)
+mio_throttle     : 0.08  ( 1.6%)
+```
+
+Per-pipe utilization (% of peak sustained):
+
+```
+ALU pipe : 46.28%   address math, dequant
+LSU pipe : 40.66%   SMEM stores (scatter) dominate
+FMA pipe : 21.17%
+SMEM st  :  7.67% of peak  (scatter is 4-way bank-conflicted by design)
+SMEM ld  :  1.50% of peak  (regs_qb load + arith.bs/bzp reads)
+```
+
+The kernel is already at 57% SoL with **balanced** memory + compute
+saturation -- well above NCU's 60% "latency issues" threshold's other
+side but with several real stall sources. The L1TEX scoreboard
+(SMEM-wait) is the biggest single bug-finding lever but the chunk
+that's load-side and tied to mbar-pipelined TMA arrivals is hard to
+move without structural changes.
+
+Re-tested the **B.25 gated-scatter** experiment (only `kNWarps` of
+the `kMWarps*kNWarps` warps scatter; the others sync immediately):
+3138us vs 2848us baseline -> **+10% regression** (confirms B.25). The
+4-way bank-conflict serialisation the HW gives us is genuinely cheaper
+than the extra warp-divergent path the gating introduces.
+
+### NCU-driven candidate fixes that still look interesting:
+* **Reduce SMEM footprint enough to fit 2 blocks/SM.** Achieved
+  occupancy is 18.75% with 1 block/SM; SMEM (222KiB) is the binding
+  constraint. Doubling SMs in flight could hide much of
+  long_scoreboard, but fitting 2 blocks needs ~114KiB/CTA which means
+  dropping `num_stages` or `BlockK`. Bench already showed those
+  trade-offs lose net at this shape -- but at smaller M (where 18.75%
+  occupancy is more painful relative to fewer-stages-allowed) the
+  trade may flip.
+* **Reduce per-K-iter `sync_part_threads` cost** (the 8% barrier
+  stall). Today every K-iter calls `bar.sync 1, kNumMathThreads` to
+  publish the scatter to tcgen05.mma. Replacing with
+  `fence.proxy.async.shared::cta` + a thread-arrival mbarrier the way
+  CUTLASS does for UMMA SS-mode could shave most of this. Same fence
+  is already used at end of `transform_b`; reusing it requires
+  threading a "scatter-done" mbarrier into `TCGEN05::run()`.
+* **stmatrix.x4 for the scatter** still in the catalog. The
+  4-way-redundant write means SMEM-store BW is 7.67% of peak --
+  stmatrix wouldn't reduce that further, but it _would_ free up
+  ALU/LSU cycles spent on per-store address math, potentially
+  trimming the ALU 46% / LSU 41% utilization figures. Layout-fit
+  audit needed (workbook B.30 note).
+
 ## Future perf avenues (B.32-B.33 investigations, not landed)
 
 Two perf paths got prototyped and reverted; each has a real blocker
