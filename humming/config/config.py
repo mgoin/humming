@@ -164,6 +164,15 @@ class TuningConfig(BaseHummingConfig):
     # mma.sync / wgmma paths are unaffected.
     use_tcgen05: bool | None = None
 
+    # TMEM accumulator multi-staging for the tcgen05 path: rotate between
+    # `tcgen05_acc_stages` accumulator column ranges per output tile so
+    # tile i's epilogue drain overlaps tile i+1's producer loads and MMA
+    # tail. 1 = shipped single-accumulator behaviour. 2 requires
+    # use_tcgen05 + use_warp_spec, BlockN <= 128, dense GEMM, no bias
+    # (enforced by static_asserts in tcgen05_mma.cuh) and moves
+    # `smem.reduce` out of the stage union (+BlockM*BlockN*2 B of SMEM).
+    tcgen05_acc_stages: int = 1
+
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
         "num_threads",
         "num_math_threads",
@@ -187,6 +196,19 @@ class TuningConfig(BaseHummingConfig):
 
         if self.use_tcgen05 is None:
             self.use_tcgen05 = False
+
+        assert self.tcgen05_acc_stages in (1, 2)
+        if self.tcgen05_acc_stages > 1:
+            assert self.use_tcgen05, (
+                "tcgen05_acc_stages > 1 requires use_tcgen05"
+            )
+            assert self.use_warp_spec, (
+                "tcgen05_acc_stages > 1 is only wired into the "
+                "warp-specialized kernel (humming_ws.cuh)"
+            )
+            assert self.block_shape[1] <= 128, (
+                "tcgen05_acc_stages > 1 needs 2 x BlockN <= 256 TMEM cols"
+            )
 
         if self.use_mbarrier is None:
             self.use_mbarrier = self.use_tma or self.use_warp_spec

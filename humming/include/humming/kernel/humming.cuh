@@ -101,13 +101,16 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   // unlike tcgen05.mma/commit which use the elect_one_sync pattern.
   // Confirmed by bisection: with elect_one_sync the alloc spins.
   if constexpr (Ctx::kMmaType == MmaType::TCGEN05) {
+    static_assert(TuningConfig::kTcgen05AccStages == 1,
+                  "TMEM accumulator multi-staging is only wired into "
+                  "the warp-specialized kernel (humming_ws.cuh)");
     if (threadIdx.x < 32) {
       uint32_t smem_addr =
           cast_smem_ptr_to_uint(&smem.tcgen05_tmem_col);
       tcgen05_alloc<128>(smem_addr);
     }
     if (threadIdx.x == 0) {
-      __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
+      __mbarrier_init(&smem.tcgen05_mbar[0], /*expected_count=*/1);
     }
     __syncthreads();
   }

@@ -66,6 +66,10 @@ CUDA_INLINE void fence_proxy_async_shared_cta() {
   asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 }
 
+#ifndef HUMMING_TCGEN05_ACC_STAGES
+#define HUMMING_TCGEN05_ACC_STAGES 1
+#endif
+
 
 template <class Ctx, class ArithClass>
 struct TCGEN05 {
@@ -141,6 +145,44 @@ public:
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < sizeof(regs_c) / 4; i++) p[i] = 0;
     first_issue_ = true;
+  }
+
+  // TMEM accumulator multi-staging (kAccStages == 2): the WS kernel
+  // rotates the active accumulator buffer per output tile so tile i's
+  // drain overlaps tile i+1's producer loads / MMA tail. Buffer b's
+  // accumulator columns start at `tmem_col + b * BlockN` (B.33-repro
+  // measured per-tile column alternation at <= 1.2% cost vs static).
+  static constexpr uint32_t kAccStages = HUMMING_TCGEN05_ACC_STAGES;
+  static_assert(kAccStages == 1 || kAccStages == 2,
+                "TCGEN05: only 1 or 2 TMEM accumulator stages supported");
+  static_assert(kAccStages == 1 || BlockShape::N <= 128,
+                "TCGEN05: 2 accumulator stages need 2 * BlockN <= 256 "
+                "TMEM columns (alloc<256> at kernel entry)");
+  static_assert(kAccStages == 1 || !Ctx::kHasBias,
+                "TCGEN05: deferred drain reads smem.bias, which the "
+                "producer may have already overwritten with the next "
+                "tile's bias -- bias unsupported with kAccStages > 1");
+  // load_channel() refreshes the epilogue's channel-scale registers per
+  // tile, and indexed/grouped gemms refresh smem rd/wr_row_index per
+  // tile -- a deferred drain of tile i would consume tile i+1's values.
+  static_assert(kAccStages == 1 || Ctx::kIsDenseGemm,
+                "TCGEN05: kAccStages > 1 requires dense gemm (deferred "
+                "drain would read the next tile's smem row indices / "
+                "expert state)");
+  static_assert(kAccStages == 1 || !Ctx::kIsChannelWeightScale,
+                "TCGEN05: kAccStages > 1 incompatible with channel "
+                "weight scale (per-tile epilogue registers)");
+  static_assert(kAccStages == 1 || !(Ctx::ElementA::kBits != 16 &&
+                                     Ctx::kInputScaleGroupSize == 0),
+                "TCGEN05: kAccStages > 1 incompatible with channel "
+                "input scale (per-tile epilogue registers)");
+
+  CUDA_INLINE
+  void set_accum_buf(uint32_t buf) {
+    if constexpr (kAccStages > 1) {
+      acc_buf_ = buf;
+      accum_col_off_ = buf * BlockShape::N;
+    }
   }
 
   // Supported config space (verified by tests/test_tcgen05.py and
@@ -444,7 +486,8 @@ public:
     // dealloc which require warp-uniform participation), so this is
     // safe and matches CUTLASS exactly.
     if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
-      tcgen05_mma_ss_bf16(smem.tcgen05_tmem_col, a_desc, b_desc, idesc, scale_d);
+      tcgen05_mma_ss_bf16(smem.tcgen05_tmem_col + accum_col_off_,
+                          a_desc, b_desc, idesc, scale_d);
     }
   }
 
@@ -461,16 +504,43 @@ public:
   // The caller (EpiloguePipeline::call) must skip `smem_writer.write`
   // for TCGEN05 -- the SMEM is already filled by the time we return.
   // We return `nullptr` as a sentinel so the dispatcher can assert.
-  template <class T = uint32_t>
-  CUDA_INLINE T *final_regs_c_as_ptr() {
-    // ---- 1. Drain MMAs via commit + mbarrier wait ----
+  // Close the current accumulator buffer's MMA batch: all prior
+  // tcgen05.mma issues from this CTA arrive on mbar[acc_buf_] when they
+  // retire. Elect-one; safe to call right after the last K-iter.
+  CUDA_INLINE void commit_accum() {
     if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
-      uint32_t mbar_addr = cast_smem_ptr_to_uint(&smem.tcgen05_mbar);
+      uint32_t mbar_addr =
+          cast_smem_ptr_to_uint(&smem.tcgen05_mbar[acc_buf_]);
       tcgen05_commit_to_mbarrier(mbar_addr);
     }
-    mbarrier_wait(&smem.tcgen05_mbar, mbar_phase_);
-    mbar_phase_ ^= 1u;
+  }
+
+  template <class T = uint32_t>
+  CUDA_INLINE T *final_regs_c_as_ptr() {
+    commit_accum();
+    wait_accum();
+    return drain_accum<T>();
+  }
+
+  // Wait for the accumulator buffer's committed MMA batch to retire.
+  // Every math thread must call this. In the multi-stage flow this runs
+  // at the END of the tile that issued the MMAs -- it is what makes
+  // releasing the producer safe (in-flight tcgen05.mma still reads the
+  // stage SMEM through the async proxy until the batch retires; the
+  // producer's next-tile loads would corrupt the last K-iters
+  // otherwise -- observed as K-dependent scattered output errors).
+  CUDA_INLINE void wait_accum() {
+    mbarrier_wait(&smem.tcgen05_mbar[acc_buf_], mbar_phase_[acc_buf_]);
+    mbar_phase_[acc_buf_] ^= 1u;
     tcgen05_fence_view_async_tmem_store();
+  }
+
+  // t2r the accumulator buffer and write bf16 into `smem.reduce` in
+  // gmem_writer layout. Caller must have already commit_accum() +
+  // wait_accum() the SAME buffer (set_accum_buf first in the deferred
+  // flow). With kAccStages > 1 the WS kernel defers this by one tile.
+  template <class T = uint32_t>
+  CUDA_INLINE T *drain_accum() {
 
     // ---- 2. tcgen05.ld -> per-thread scratch (row-per-thread) ----
     //
@@ -505,7 +575,8 @@ public:
 
     // Per-warp implicit sub-partition base (lane->DP binding is HW-fixed).
     // The taddr's DP field is warp-local: DP=0 = the warp's first DP.
-    uint32_t base_addr = smem.tcgen05_tmem_col + (n_warp_id * WarpShape::N);
+    uint32_t base_addr =
+        smem.tcgen05_tmem_col + accum_col_off_ + (n_warp_id * WarpShape::N);
 
     // ---- 3. Per-warp t2r + pack + SMEM write ----
     // Compile-time swizzle base -- must match gmem_writer's
@@ -659,8 +730,12 @@ public:
 private:
   // True until the first tcgen05.mma issue lands, used to drive scale_d.
   bool first_issue_ = true;
-  // mbarrier phase parity bit. Flips after each tile's commit/wait pair.
-  uint32_t mbar_phase_ = 0;
+  // Per-accumulator-buffer mbarrier phase parity bits. Each flips after
+  // that buffer's commit/wait pair.
+  uint32_t mbar_phase_[kAccStages] = {};
+  // Active accumulator buffer and its TMEM column offset (buf * BlockN).
+  uint32_t acc_buf_ = 0;
+  uint32_t accum_col_off_ = 0;
 };
 
 

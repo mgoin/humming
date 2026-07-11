@@ -51,3 +51,39 @@ Tile-count arithmetic for Part-1 shape selection (BM=BN=128, 148-160 SMs):
   Included in the baseline to demonstrate that limit honestly; the
   "epilogue-exposed regime" that Part-1 can help is small-K multi-wave,
   not single-wave.
+
+## Milestone 2: Part-1 archaeology (session 2, 2026-07-11)
+
+Predecessor died mid-flight with uncommitted edits. Triage decisions:
+
+* config.py / storage.cuh / humming.cuh / tcgen05_mma.cuh / humming_ws.cuh
+  diff = coherent Part-1 implementation (per-tile TMEM accumulator
+  rotation, `tcgen05_acc_stages` config, dedicated `smem.reduce` when
+  staged, per-buffer commit mbarriers). KEPT and committed.
+* humming_ws.cuh carries a hard-coded `#define TCGEN05_ACC2_NO_DEFER 1`
+  bisection switch: shipped drain ordering but all the new
+  storage/alloc/rotation plumbing. KEPT for now (see hang below), to be
+  flipped to the deferred path once NO_DEFER is proven correct.
+* Found predecessor's `/tmp/test_acc2_order.py` HUNG for 5h on GPU 4
+  (M=128 N=128 K=4096, acc_stages 2 vs 1, s3). Killed it. This is
+  presumably why the bisection flag exists: some earlier revision of the
+  acc2 path hangs, likely in the loop-exit pending drain (M=128 N=128 is
+  a single tile => the only drain IS the loop-exit one) -- or in
+  `tcgen05_alloc<256>`. Unknown which .cuh revision that process had
+  compiled; needs re-testing against the current tree.
+* benchmarks/exp_b33_alt.py (untracked): docstring referenced a
+  `TCGEN05_EXP_ALT_MODE` macro that no longer exists in the diff.
+  REWRITTEN to drive `tcgen05_acc_stages` {1,2} through HummingKernel,
+  with correctness checks (incl. M=2112 tail for the odd-tile pending
+  drain) + both regimes' perf shapes.
+* Hazard audit of the deferred path (for when NO_DEFER is dropped):
+  `load_channel` copies channel input scale / channel weight scale /
+  bias into epilogue regs PER TILE, so a deferred drain of tile i would
+  use tile i+1's values. Bias is already static_asserted out; channel
+  scales and indexed/grouped gemm (smem rd/wr_row_index refilled by the
+  producer) still need guards. To add: static_asserts on
+  `Ctx::kIsDenseGemm`, `!kIsChannelWeightScale`,
+  `!(kHasInputScale && kInputScaleGroupSize == 0)` for kAccStages > 1.
+* GPU 4 is NOT exclusive right now: root runs a 128 GB
+  `vLLM-Omni::DiffusionWorker-0` on it. Perf numbers this session may be
+  noisier than Milestone 1's.

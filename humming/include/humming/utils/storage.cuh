@@ -88,6 +88,20 @@
 #define IF_USE_TCGEN05(x)
 #endif
 
+#ifndef HUMMING_TCGEN05_ACC_STAGES
+#define HUMMING_TCGEN05_ACC_STAGES 1
+#endif
+
+// With TMEM accumulator multi-staging, tile i's epilogue drain (which
+// writes `smem.reduce`) overlaps the producer's stage loads for tile
+// i+1, so `reduce` must NOT alias the stage union any more. Costs
+// BlockM * BlockN * 2 bytes of SMEM.
+#if HUMMING_USE_TCGEN05 && HUMMING_TCGEN05_ACC_STAGES > 1
+#define HUMMING_TCGEN05_DEDICATED_REDUCE 1
+#else
+#define HUMMING_TCGEN05_DEDICATED_REDUCE 0
+#endif
+
 // Untested combination: with reduce_overlap_last_stage_only the `reduce`
 // buffer overlays the last stage AND everything after it, including the
 // tcgen05 b_dequant staging buffer. The tcgen05 t2r epilogue writes
@@ -204,12 +218,20 @@ public:
       // logical layout.
       IF_USE_TCGEN05(alignas(128) int4 b_dequant[kNumBDequantBuffers][kStageSizeBDequant];)
     };
+#if !HUMMING_TCGEN05_DEDICATED_REDUCE
     struct {
       IF_REDUCE_LAST_STAGE_ONLY(IF_HAS_CHANNEL_ZERO_POINT(alignas(128) int4 reduce_skip_bzp_c[kChannelSizeBZP];))
       IF_REDUCE_LAST_STAGE_ONLY(StageStorage reduce_skip[kNumStages - 1];)
       alignas(128) int4 reduce[MAX(kWarpReduceSize, kBlockOutputSize)];
     };
+#endif
   };
+
+#if HUMMING_TCGEN05_DEDICATED_REDUCE
+  // Dedicated epilogue staging: the deferred drain of tile i writes here
+  // while the producer refills the stage union for tile i+1.
+  alignas(1024) int4 reduce[MAX(kWarpReduceSize, kBlockOutputSize)];
+#endif
 
   IF_IS_INDEXED_GEMM(uint32_t rd_row_index[BlockShape::M];)
   IF_IS_INDEXED_GEMM(uint32_t wr_row_index[BlockShape::M];)
@@ -226,5 +248,6 @@ public:
   // thread writes this; all warps in the CTA read it after the alloc
   // sync.  Only present when use_tcgen05 is set.
   IF_USE_TCGEN05(alignas(16) uint32_t tcgen05_tmem_col;)
-  IF_USE_TCGEN05(alignas(8) uint64_t tcgen05_mbar;)
+  // One commit/drain mbarrier per TMEM accumulator stage.
+  IF_USE_TCGEN05(alignas(8) uint64_t tcgen05_mbar[HUMMING_TCGEN05_ACC_STAGES];)
 };

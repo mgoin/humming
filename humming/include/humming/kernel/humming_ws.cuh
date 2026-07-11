@@ -130,30 +130,49 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     auto s2r_pipe = S2RMemoryPipeline(ctx, mma, epilogue);
 
     consumer.init_mbarrier();
-    // TCGEN05 init (mirrors humming.cuh): the math side performs
-    // `tcgen05.alloc<128>` from warp 0 and initialises the mbar for
-    // tcgen05.commit. Both must complete before the first MMA issues;
-    // the mbarrier_init_sync below publishes them (for cluster_size==1
-    // it is a plain __syncthreads).
+    // TCGEN05 init (mirrors humming.cuh): the math side performs the
+    // TMEM alloc from warp 0 and initialises the commit mbarrier(s).
+    // Both must complete before the first MMA issues; the
+    // mbarrier_init_sync below publishes them (for cluster_size==1 it
+    // is a plain __syncthreads). With accumulator multi-staging the
+    // alloc doubles to 256 cols (2 x BlockN <= 128 buffers).
+    constexpr uint32_t kTcgen05AccStages = TuningConfig::kTcgen05AccStages;
+    constexpr uint32_t kTcgen05TmemCols = kTcgen05AccStages > 1 ? 256 : 128;
     if constexpr (Ctx::kMmaType == MmaType::TCGEN05) {
       if (threadIdx.x < 32) {
         uint32_t smem_addr =
             cast_smem_ptr_to_uint(&smem.tcgen05_tmem_col);
-        tcgen05_alloc<128>(smem_addr);
+        tcgen05_alloc<kTcgen05TmemCols>(smem_addr);
       }
       if (threadIdx.x == 0) {
-        __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
+        PRAGMA_UNROLL
+        for (uint32_t i = 0; i < kTcgen05AccStages; i++) {
+          __mbarrier_init(&smem.tcgen05_mbar[i], /*expected_count=*/1);
+        }
       }
     }
     mbarrier_init_sync<((TuningConfig::kMultiCastSizeA * TuningConfig::kMultiCastSizeB) > 1)>();
     consumer.arrive(kNumStages);
 
+    // Deferred-epilogue state (TCGEN05 accumulator multi-staging only).
+    // The pending tile's gmem coords + stream-k state are snapshotted at
+    // commit time and replayed into `epilogue.seek` at drain time.
+    uint32_t acc_buf = 0;
+    bool pending = false;
+    uint32_t pending_buf = 0;
+    uint32_t p_expert = 0, p_m_blk = 0, p_n_blk = 0;
+    uint32_t p_shape_m = 0, p_m_off = 0;
+    uint32_t p_scount = 1, p_sid = 0, p_lockoff = 0;
+
     while (scheduler.get_next_block()) {
+      if constexpr (kTcgen05AccStages > 1) mma.set_accum_buf(acc_buf);
       mma.zero_accum();
 
       uint32_t &slice_iters = scheduler.slice_iters;
-      epilogue.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.current_shape_m, scheduler.m_offset);
-      epilogue.set_streamk_state(scheduler.slice_count, scheduler.slice_id, scheduler.locks_offset);
+      if constexpr (kTcgen05AccStages == 1) {
+        epilogue.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.current_shape_m, scheduler.m_offset);
+        epilogue.set_streamk_state(scheduler.slice_count, scheduler.slice_id, scheduler.locks_offset);
+      }
 
       consumer.wait_stage<true>(kNumStages);
       s2r_pipe.load_stage_iter<true>(0, 0);
@@ -184,10 +203,77 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       consumer.wait_channel();
       s2r_pipe.load_channel(scheduler.slice_id);
 
-      if constexpr (kReduceOverlapLastStageOnly) consumer.arrive(kNumStages);
-      epilogue.call(mma.final_regs_c_as_ptr());
-      if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
-      if constexpr (!kReduceOverlapLastStageOnly) consumer.arrive(kNumStages);
+      if constexpr (kTcgen05AccStages > 1) {
+        // Commit + wait this tile's MMA batch (the wait must precede
+        // the producer release: in-flight tcgen05.mma reads stage SMEM
+        // through the async proxy until it retires). Then release the
+        // producer (safe: `smem.reduce` is a dedicated buffer, not
+        // unioned with the stages) and drain the PREVIOUS tile's
+        // accumulator -- the producer's TMA loads for the next tile
+        // overlap the t2r + gmem write below.
+        mma.commit_accum();
+        mma.wait_accum();
+#define TCGEN05_ACC2_NO_DEFER 1
+#ifdef TCGEN05_ACC2_NO_DEFER
+        // Bisection mode: shipped ordering (drain this tile now, arrive
+        // after), keeping the new storage/alloc/rotation plumbing.
+        epilogue.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.current_shape_m, scheduler.m_offset);
+        epilogue.set_streamk_state(scheduler.slice_count, scheduler.slice_id, scheduler.locks_offset);
+        epilogue.call(mma.drain_accum());
+        if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
+        consumer.arrive(kNumStages);
+        acc_buf ^= 1u;
+#else
+        consumer.arrive(kNumStages);
+
+        if (pending) {
+          mma.set_accum_buf(pending_buf);
+          epilogue.seek(p_expert, p_m_blk, p_n_blk, p_shape_m, p_m_off);
+          epilogue.set_streamk_state(p_scount, p_sid, p_lockoff);
+          epilogue.call(mma.drain_accum());
+          if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
+          pending = false;
+        }
+        if (scheduler.slice_count > 1) {
+          // Stream-k tiles participate in cross-CTA lock chains;
+          // deferring their drain can create lock-wait cycles between
+          // CTAs whose pending drains block on each other. Drain
+          // immediately instead (stream-k tiles are scheduled last, so
+          // the deferral win is spent by then anyway).
+          mma.set_accum_buf(acc_buf);
+          epilogue.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.current_shape_m, scheduler.m_offset);
+          epilogue.set_streamk_state(scheduler.slice_count, scheduler.slice_id, scheduler.locks_offset);
+          epilogue.call(mma.drain_accum());
+          if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
+        } else {
+          pending = true;
+          pending_buf = acc_buf;
+          p_expert = scheduler.expert_id;
+          p_m_blk = scheduler.m_block_id;
+          p_n_blk = scheduler.n_block_id;
+          p_shape_m = scheduler.current_shape_m;
+          p_m_off = scheduler.m_offset;
+          p_scount = scheduler.slice_count;
+          p_sid = scheduler.slice_id;
+          p_lockoff = scheduler.locks_offset;
+          acc_buf ^= 1u;
+        }
+#endif
+      } else {
+        if constexpr (kReduceOverlapLastStageOnly) consumer.arrive(kNumStages);
+        epilogue.call(mma.final_regs_c_as_ptr());
+        if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
+        if constexpr (!kReduceOverlapLastStageOnly) consumer.arrive(kNumStages);
+      }
+    }
+    if constexpr (kTcgen05AccStages > 1) {
+      if (pending) {
+        mma.set_accum_buf(pending_buf);
+        epilogue.seek(p_expert, p_m_blk, p_n_blk, p_shape_m, p_m_off);
+        epilogue.set_streamk_state(p_scount, p_sid, p_lockoff);
+        epilogue.call(mma.drain_accum());
+        if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
+      }
     }
     // Release TMEM (mirrors humming.cuh). All 32 threads of warp 0 must
     // execute together since tcgen05.{dealloc, relinquish_alloc_permit}
@@ -200,7 +286,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       ctx.sync_math_threads();
       if (threadIdx.x < 32) {
         tcgen05_relinquish_alloc_permit();
-        tcgen05_dealloc<128>(smem.tcgen05_tmem_col);
+        tcgen05_dealloc<kTcgen05TmemCols>(smem.tcgen05_tmem_col);
       }
     }
   }
