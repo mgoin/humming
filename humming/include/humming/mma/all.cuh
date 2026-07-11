@@ -1,5 +1,6 @@
 #pragma once
 
+#include <humming/mma/tcgen05_mma.cuh>
 #include <humming/mma/wgmma.cuh>
 #include <humming/mma/wmma.cuh>
 
@@ -15,6 +16,11 @@ struct MmaSelector<MmaType::MMA, Ctx, ArithClass> {
 template <class Ctx, class ArithClass>
 struct MmaSelector<MmaType::WGMMA, Ctx, ArithClass> {
   using Type = WGMMA<Ctx, ArithClass>;
+};
+
+template <class Ctx, class ArithClass>
+struct MmaSelector<MmaType::TCGEN05, Ctx, ArithClass> {
+  using Type = TCGEN05<Ctx, ArithClass>;
 };
 
 template <class Ctx, class ArithClass>

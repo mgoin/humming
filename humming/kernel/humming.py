@@ -208,9 +208,17 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         else:
             mma_cd_dtype = dtypes.float32
 
-        mma_shape_m = self.warp_shape[0] if self.mma_type == MmaType.WGMMA else 16
-        mma_shape_n = 64 if self.mma_type == MmaType.WGMMA else 8
-        mma_shape_k = 256 // self.a_dtype.num_bits
+        if self.mma_type == MmaType.TCGEN05:
+            # tcgen05.mma.kind::f16 covers the FULL block tile in one issue,
+            # so MmaShape == BlockShape (M, N) and K=16 (the kind::f16
+            # K-step).
+            mma_shape_m = self.block_shape[0]
+            mma_shape_n = self.block_shape[1]
+            mma_shape_k = 16
+        else:
+            mma_shape_m = self.warp_shape[0] if self.mma_type == MmaType.WGMMA else 16
+            mma_shape_n = 64 if self.mma_type == MmaType.WGMMA else 8
+            mma_shape_k = 256 // self.a_dtype.num_bits
         if self.sm_version == 75 and self.a_dtype == dtypes.int8:
             mma_shape_m = 8
 
@@ -223,6 +231,11 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.mma_type == MmaType.WGMMA:
             assert self.warp_shape[0] % mma_shape_m == 0
             assert self.warp_shape[1] % (mma_shape_n // 4) == 0
+        elif self.mma_type == MmaType.TCGEN05:
+            # tcgen05.mma covers the entire BlockMxBlockN tile per issue,
+            # so no per-warp subdivision applies in M/N; only the K-step
+            # divisibility below applies.
+            pass
         else:
             assert self.warp_shape[0] % mma_shape_m == 0
             assert self.warp_shape[1] % mma_shape_n == 0
@@ -236,6 +249,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             self.a_dtype,
             self.a_dtype,
             mma_cd_dtype,
+            warp_shape=self.warp_shape,
         )
 
     def check_shape(self):

@@ -2,6 +2,7 @@
 
 #include <humming/scheduler.cuh>
 #include <humming/utils/all.cuh>
+#include <humming/utils/ptx/tcgen05.cuh>
 
 #include <humming/arith/epilogue_arith.cuh>
 #include <humming/arith/mainloop_arith.cuh>
@@ -129,6 +130,21 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     auto s2r_pipe = S2RMemoryPipeline(ctx, mma, epilogue);
 
     consumer.init_mbarrier();
+    // TCGEN05 init (mirrors humming.cuh): the math side performs
+    // `tcgen05.alloc<128>` from warp 0 and initialises the mbar for
+    // tcgen05.commit. Both must complete before the first MMA issues;
+    // the mbarrier_init_sync below publishes them (for cluster_size==1
+    // it is a plain __syncthreads).
+    if constexpr (Ctx::kMmaType == MmaType::TCGEN05) {
+      if (threadIdx.x < 32) {
+        uint32_t smem_addr =
+            cast_smem_ptr_to_uint(&smem.tcgen05_tmem_col);
+        tcgen05_alloc<128>(smem_addr);
+      }
+      if (threadIdx.x == 0) {
+        __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
+      }
+    }
     mbarrier_init_sync<((TuningConfig::kMultiCastSizeA * TuningConfig::kMultiCastSizeB) > 1)>();
     consumer.arrive(kNumStages);
 
@@ -172,6 +188,20 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       epilogue.call(mma.final_regs_c_as_ptr());
       if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
       if constexpr (!kReduceOverlapLastStageOnly) consumer.arrive(kNumStages);
+    }
+    // Release TMEM (mirrors humming.cuh). All 32 threads of warp 0 must
+    // execute together since tcgen05.{dealloc, relinquish_alloc_permit}
+    // are .sync.aligned. Sync only the math threads (barrier 1) so all
+    // t2r reads retire before the dealloc. A plain __syncthreads here
+    // would pair with the load threads' joint __syncthreads below and
+    // shift the bar-0 pairing: the math threads' own joint sync would
+    // then deadlock against load threads parked in the cluster barrier.
+    if constexpr (Ctx::kMmaType == MmaType::TCGEN05) {
+      ctx.sync_math_threads();
+      if (threadIdx.x < 32) {
+        tcgen05_relinquish_alloc_permit();
+        tcgen05_dealloc<128>(smem.tcgen05_tmem_col);
+      }
     }
   }
 

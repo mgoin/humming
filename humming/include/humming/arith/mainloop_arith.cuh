@@ -46,6 +46,21 @@ private:
       ElementA, ElementB, ElementBS, kHasZeroPoint,
       kIsF16Accum, kIsGroupInputScale, kIsGroupOrBlockWeightScale>();
 
+public:
+  // Epilogue-side residual exponent offset. The mainloop applies
+  // `kExpOffset.x` to bring dequant output into the normal-bf16 range,
+  // but the full conversion exponent (`get_total_exp_offset`) may be
+  // larger than what max_allowed_offset permits in a single mainloop
+  // multiply. The leftover lives here and must be applied during the
+  // epilogue write to SMEM. The WMMA / WGMMA paths read this through
+  // `EpilogueArithmetic::kExpOffset.x` via `smem_writer`, but the
+  // TCGEN05 path bypasses smem_writer and reads this directly from
+  // ArithClass when building its final SMEM-write payload.
+  static constexpr uint2 kEpilogueExpOffset = get_epilogue_exp_offset<
+      ElementA, ElementB, ElementC, ElementBS, kHasZeroPoint,
+      kIsF16Accum, kIsGroupInputScale, kIsGroupOrBlockWeightScale>();
+private:
+
   static constexpr uint32_t kDequantBSBits = (ElementA::kBits < 16 && !kIsF16Accum) ? 32 : 16;
   static constexpr uint32_t kNumSubBlocksM = CEIL_DIV(WarpShape::M, 16);
   static constexpr uint32_t kNumSubBlocksN = WarpShape::N / 16;
@@ -55,11 +70,14 @@ private:
   static constexpr uint32_t kNumBSPerGroup = kNumSubBlocksN * kNumBSPerSubBlock;
 
 public:
-  uint32_t as[2][kNumASPerGroup];
-  uint32_t q_as[kNumASPerGroup];
-  uint32_t bs[2][MAX(kNumBSPerGroup, 8) * ElementBS::kBits / 32];
-  uint32_t dq_bs[MAX(kNumBSPerGroup, 8) * kDequantBSBits / 32];
-  uint32_t zp[2][kIsFpZeroPoint ? 4 : CEIL_DIV(ElementB::kBits, 4)];
+  // alignas(16) on storage that may be loaded with vectorized int4
+  // stores -- without it the compiler can spill to local memory at
+  // unaligned offsets, silently dropping bytes.
+  alignas(16) uint32_t as[2][kNumASPerGroup];
+  alignas(16) uint32_t q_as[kNumASPerGroup];
+  alignas(16) uint32_t bs[2][MAX(kNumBSPerGroup, 8) * ElementBS::kBits / 32];
+  alignas(16) uint32_t dq_bs[MAX(kNumBSPerGroup, 8) * kDequantBSBits / 32];
+  alignas(16) uint32_t zp[2][kIsFpZeroPoint ? 4 : CEIL_DIV(ElementB::kBits, 4)];
 
   uint32_t _dummy;
 

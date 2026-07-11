@@ -17,6 +17,9 @@ private:
   using ElementA = typename Ctx::ElementA;
 
   static constexpr bool kUseWgmma = Ctx::kUseWgmma;
+  // tcgen05.mma reads A directly from SMEM via the SS descriptor, so the
+  // s2r loader_a into RMEM is dead work for it.
+  static constexpr bool kUseTcgen05 = Ctx::kMmaType == MmaType::TCGEN05;
   static constexpr uint32_t kPartMmaShapeK = Ctx::kPartMmaShapeK;
   static constexpr uint32_t kNumStages = Ctx::TuningConfig::kNumStages;
 
@@ -64,7 +67,7 @@ public:
     auto &smem = ctx.smem;
 
     loader_b.load(smem.stages[stage_id].b, mma.regs_qb_as_ptr(buffer_id), iter_id);
-    if constexpr (!kUseWgmma)
+    if constexpr (!kUseWgmma && !kUseTcgen05)
       loader_a.load(smem.stages[stage_id].a, mma.regs_a_as_ptr(buffer_id), iter_id, stage_id);
     if constexpr (kIsGroupInputScale)
       loader_as.load(smem.stages[stage_id].as, mma.arith.regs_as_as_ptr(buffer_id), iter_id);

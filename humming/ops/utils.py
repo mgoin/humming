@@ -50,10 +50,27 @@ def _shield_lazy_modules():
         sys.modules.update(saved)
 
 
-def get_humming_launcher_build_dir(use_torch_stable_api: bool):
+def _humming_dirname() -> str:
+    """Directory of the humming package, robust to namespace resolution.
+
+    `humming.__file__` can be None when the package is resolved as a
+    namespace package -- this happens if Python's cwd contains a
+    `humming/` directory (e.g. running from the repo root with the
+    editable install shadowed). Fall back to `__path__[0]`, walking into
+    the `humming` subpackage if `__path__` pointed at the repo root.
+    """
     import humming
 
-    dirname = os.path.dirname(humming.__file__)
+    if humming.__file__ is not None:
+        return os.path.dirname(humming.__file__)
+    dirname = list(humming.__path__)[0]
+    if not os.path.exists(os.path.join(dirname, "csrc")):
+        dirname = os.path.join(dirname, "humming")
+    return dirname
+
+
+def get_humming_launcher_build_dir(use_torch_stable_api: bool):
+    dirname = _humming_dirname()
     launcher_code_hash = jit_utils.hash_path_content(
         path=os.path.join(dirname, "csrc/launcher/"),
         releative=True,
@@ -102,14 +119,12 @@ def init_humming_launcher():
     USE_TORCH_STABLE_API = _resolve_use_torch_stable_api()
     lock_filename = jit_utils.get_humming_lock_filename("launcher")
     with FileLock(lock_filename):
-        import humming
-
         build_dir = get_humming_launcher_build_dir(USE_TORCH_STABLE_API)
         torch_lock_file = os.path.join(build_dir, "lock")
         if os.path.exists(torch_lock_file):
             os.unlink(torch_lock_file)
 
-        dirname = os.path.dirname(humming.__file__)
+        dirname = _humming_dirname()
         filename = os.path.join(dirname, "csrc/launcher/launcher.cpp")
 
         cuda_env = filter_cuda_paths(

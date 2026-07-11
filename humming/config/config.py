@@ -159,6 +159,11 @@ class TuningConfig(BaseHummingConfig):
 
     raster_group_m: int = 1
 
+    # Blackwell tcgen05.mma (UMMA) path: TMEM-backed accumulators and
+    # SMEM-resident bf16 operands. Default False -- the existing
+    # mma.sync / wgmma paths are unaffected.
+    use_tcgen05: bool | None = None
+
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
         "num_threads",
         "num_math_threads",
@@ -170,6 +175,7 @@ class TuningConfig(BaseHummingConfig):
         "use_tma_as": "kUseTmaAS",
         "use_tma_bs": "kUseTmaBS",
         "use_tma_bzp": "kUseTmaBZP",
+        "use_tcgen05": "kUseTcgen05",
     }
 
     def __post_init__(self):
@@ -178,6 +184,9 @@ class TuningConfig(BaseHummingConfig):
 
         if self.use_tma is None:
             self.use_tma = False
+
+        if self.use_tcgen05 is None:
+            self.use_tcgen05 = False
 
         if self.use_mbarrier is None:
             self.use_mbarrier = self.use_tma or self.use_warp_spec

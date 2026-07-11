@@ -82,6 +82,20 @@
 #define IF_REDUCE_LAST_STAGE_ONLY(x)
 #endif
 
+#if HUMMING_USE_TCGEN05
+#define IF_USE_TCGEN05(x) x
+#else
+#define IF_USE_TCGEN05(x)
+#endif
+
+// Untested combination: with reduce_overlap_last_stage_only the `reduce`
+// buffer overlays the last stage AND everything after it, including the
+// tcgen05 b_dequant staging buffer. The tcgen05 t2r epilogue writes
+// `reduce` while producers may already be refilling stages.
+#if HUMMING_USE_TCGEN05 && HUMMING_REDUCE_OVERLAP_LAST_STAGE_ONLY
+#error "use_tcgen05 is not supported with reduce_overlap_last_stage_only"
+#endif
+
 
 template <
     class MmaOpClass,
@@ -143,6 +157,20 @@ public:
   static constexpr uint32_t kChannelBytesBS = kChannelSizeBS * sizeof(int4);
   static constexpr uint32_t kBiasBytes = kBiasSize * sizeof(int4);
 
+  // Staging buffer for the tcgen05 path: dequantised B operand in bf16/fp16
+  // staged from registers back to SMEM before the tcgen05.mma reads it.
+  // Holds one full (BlockN x BlockK) tile per ping-pong slot. The
+  // element type matches ElementA (= MMA operand type) so the descriptor
+  // construction in TCGEN05::run() uses the same swizzle as A.
+  // Two slots are sufficient because TCGEN05::run/transform_b index the
+  // buffer by `iter_id % 2` (not stage_id); a slot is reused after the
+  // tcgen05.mma chain it feeds drains, which happens within one K-iter
+  // of pipeline depth.
+  static constexpr uint32_t kNumBDequantBuffers = 2;
+  static constexpr uint32_t kSmemStrideBDequant = BlockShape::N * BlockShape::K * ElementA::kBits / 32 / 4;
+  static constexpr uint32_t kStageSizeBDequant = kSmemStrideBDequant;
+  static constexpr uint32_t kStageBytesBDequant = kStageSizeBDequant * sizeof(int4);
+
   static constexpr bool kUseWarpSpec = TuningConfig::kUseWarpSpec;
   static constexpr bool kUseMBarrier = TuningConfig::kUseMBarrier;
   static constexpr bool kIsIndexedGemm = ComputeConfig::kGemmType == GemmType::INDEXED;
@@ -163,6 +191,18 @@ public:
       IF_HAS_CHANNEL_WEIGHT_SCALE(alignas(128) int4 bs_c[kChannelSizeBS];)
       IF_HAS_BIAS(alignas(128) int4 bias[kBiasSize];)
       IF_HAS_CHANNEL_INPUT_SCALE(alignas(128) int4 as_c[kChannelSizeAS];)
+      // Dequantised bf16 B staging for the tcgen05 path. Only emitted
+      // when `use_tcgen05` is set in the TuningConfig; otherwise the
+      // mma.sync / wgmma paths dequant directly into RMEM and need no
+      // SMEM here. Indexed by `iter_id % 2` (NOT stage_id), so it lives
+      // outside StageStorage but inside this union so its footprint
+      // overlaps `reduce` in the SMEM budget.
+      // alignas(128) is REQUIRED for the Swizzle<3,4,3> the tcgen05.mma
+      // descriptor applies -- the swizzle XORs bits [4,7) of the
+      // absolute byte address, and a non-128B-aligned base shifts the
+      // effective pattern in a way that doesn't match a row-major
+      // logical layout.
+      IF_USE_TCGEN05(alignas(128) int4 b_dequant[kNumBDequantBuffers][kStageSizeBDequant];)
     };
     struct {
       IF_REDUCE_LAST_STAGE_ONLY(IF_HAS_CHANNEL_ZERO_POINT(alignas(128) int4 reduce_skip_bzp_c[kChannelSizeBZP];))
@@ -181,4 +221,10 @@ public:
 
   IF_USE_MBARRIER(alignas(128) uint64_t load_mbar[kNumStages + 2];)
   IF_USE_WARP_SPEC(uint64_t math_mbar[kNumStages + 1];)
+
+  // Per-CTA TMEM column index returned by `tcgen05.alloc`. The issuing
+  // thread writes this; all warps in the CTA read it after the alloc
+  // sync.  Only present when use_tcgen05 is set.
+  IF_USE_TCGEN05(alignas(16) uint32_t tcgen05_tmem_col;)
+  IF_USE_TCGEN05(alignas(8) uint64_t tcgen05_mbar;)
 };

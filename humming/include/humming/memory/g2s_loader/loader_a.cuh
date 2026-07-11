@@ -16,6 +16,7 @@ private:
   static constexpr bool kUseTma = Ctx::kUseTmaA;
   static constexpr bool kUseCpAsync = Ctx::kUseCpAsync;
   static constexpr bool kIsIndexedGemm = Ctx::kIsIndexedGemm;
+  static constexpr bool kUseTcgen05 = Ctx::kMmaType == MmaType::TCGEN05;
 
   static constexpr uint32_t kNumLoadThreads = Ctx::kNumLoadThreads;
   static constexpr uint32_t kMultiCastSizeA = Ctx::kMultiCastSizeA;
@@ -68,7 +69,7 @@ public:
       const uint32_t col_offset2 = col_offset + (1024 / ElementA::kBits) * block_idx;
       if constexpr (kMultiCastSizeA == 1) {
         tma_load_2d(tensor_map_ptr, smem_ptr + smem_offset, mbar_ptr, col_offset2, row_offset);
-      } else if (ctx.cluster_rank == 0) {
+      } else if (blockIdx.x % kMultiCastSizeA == 0) {
         tma_load_2d<kMultiCastSizeA>(tensor_map_ptr, smem_ptr + smem_offset, mbar_ptr, col_offset2, row_offset);
       }
     }
@@ -96,7 +97,17 @@ public:
       uint32_t smem_offset = i * kNumLoadThreads + thread_id;
       uint32_t smem_row = smem_offset / 8;
       uint32_t smem_col = smem_offset % 8;
-      uint32_t smem_swizzled_offset = smem_row * 8 + smem_swizzled_col;
+      uint32_t smem_swizzled_offset;
+      if constexpr (kUseTcgen05) {
+        // tcgen05.mma's K-major SS descriptor with 128B swizzle expects the
+        // canonical Swizzle<3,4,3> (`row & 7`), not humming's per-thread
+        // Swizzle<2,4,3>. smem_base is already the 128B-line phase
+        // (/ 128 % 8), so add it directly.
+        uint32_t row_xor = (smem_row + smem_base) & 7u;
+        smem_swizzled_offset = smem_row * 8 + (smem_col ^ row_xor);
+      } else {
+        smem_swizzled_offset = smem_row * 8 + smem_swizzled_col;
+      }
 
       uint32_t gmem_col = smem_row / BlockShape::M * 8 + smem_col;
       uint32_t gmem_row = kIsIndexedGemm ? load_row_index[i] : (smem_row % BlockShape::M);
