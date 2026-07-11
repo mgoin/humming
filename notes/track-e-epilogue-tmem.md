@@ -195,3 +195,19 @@ L70B-down M=4096   5543.5 us   5680.4 us   5756.9 us
 * REMAINING HOPE for rotation: the TS kernel (BK64 s4, ~81KB SMEM),
   where +32KB dedicated reduce still fits (~113KB < 116KB 2-CTA
   bound) and the epilogue is the top headroom (track B's notes).
+
+## Cross-track audit of prototype/b-ts-staging (git-only, pre-merge)
+
+* B's TS drain (tcgen05_ts_mma.cuh:243) DOES call tcgen05_wait_ld()
+  -- their TS path is safe from latent bug 1.
+* B's SS drain (their tcgen05_mma.cuh:529) does NOT wait::ld -- same
+  latent bug we fixed here; will be resolved by the merge taking our
+  version.
+* B's TS drain layout confirmed: per-lane n (weight row), tmp[i] =
+  C[n, m=chunk*32+i]; scatters 2-byte stores into smem.reduce
+  ("Scalar 2-byte stores -- correctness first, track e-epilogue-tmem
+  owns the real one"). This is the Part-2 replacement target: needs a
+  register transpose (stmatrix.m8n8.trans candidate after bf16
+  conversion) or a different tcgen05.ld shape, then int4 stores.
+* Latent bugs 2 and 3 (proxy fence, store-group commit) apply to B's
+  branch too through the shared gmem_writer -- merge takes ours.
