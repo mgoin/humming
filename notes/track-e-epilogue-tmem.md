@@ -211,3 +211,51 @@ L70B-down M=4096   5543.5 us   5680.4 us   5756.9 us
   conversion) or a different tcgen05.ld shape, then int4 stores.
 * Latent bugs 2 and 3 (proxy fence, store-group commit) apply to B's
   branch too through the shared gmem_writer -- merge takes ours.
+
+## Milestone 6: tcgen05.ld shape study (Part 2 step 1, GPU 4)
+
+`.scratch/humming-v2/tmem_ld_bench.py`, 148 CTAs x 32 threads,
+aggregate GB/s (relative numbers are what matter):
+
+```
+shape             GB/s      Tinstr/s   B/instr
+.32x32b.x1       67261        0.53        128
+.32x32b.x8      538510        0.53       1024
+.32x32b.x16     973556        0.48       2048
+.32x32b.x32    1638241        0.40       4096   <- best overall
+.16x64b.x8      487643        0.48       1024
+.16x64b.x32    1240704        0.30       4096
+.16x128b.x16   1240465        0.30       4096
+.16x256b.x8     837517        0.20       4096
+```
+
+* Issue rate saturates at ~0.53 T instr/s for payloads <= 512-1024 B;
+  beyond that, bigger-payload instructions win.
+* At EQUAL bytes/instr the 32-lane shape strictly beats the 16-lane
+  shapes once past ~1KB/instr (1638 vs 1241 vs 838 at 4KB) -- the
+  16-lane wide-bit shapes are NOT a shortcut.
+* CONCLUSION: keep `.32x32b.x32` for the t2r (humming already uses
+  it). Part 2's headroom is NOT the TMEM load shape; it is the
+  transposed SMEM scatter in B's TS drain (2-byte bank-conflicted
+  stores). Plan: bf16-convert in registers, transpose via
+  `stmatrix.m8n8.trans` (or shuffle-based 8x8 transpose), then int4
+  stores matching the gmem_writer swizzle.
+
+## Session-2 status / handoff
+
+DONE: predecessor state recovered + committed; 4x acc1 regression
+found+fixed (local-memory demotion); deferred drain enabled and made
+CORRECT via 3 latent-bug fixes (wait::ld, proxy fence, store-group
+commit) -- all validated: test_tcgen05 + dtypes + epilogue = 77
+passed / 24 skipped / 1 xfail; Part-1 SS verdict = honest negative
+(numbers in Milestone 5); ld shape study done; b-ts-staging pre-merge
+audit done.
+
+NEXT (in order): (1) build the vectorized transposed drain as a
+standalone-tested unit (stmatrix.trans approach); (2) git merge
+prototype/b-ts-staging (conflicts expected in tcgen05_mma.cuh +
+tcgen05.cuh -- keep OUR gmem_writer/ptx fixes, THEIR ts_mma), swap
+the drain into the TS epilogue, target beating 2400us at
+Llama70B-down M=2048 and re-test their M=16 crossover claim;
+(3) compose acc rotation on the TS kernel (SMEM ~113KB < 116KB 2-CTA
+bound -- verify occupancy actually stays 2); TMEM 2x256 = 512 fits.
