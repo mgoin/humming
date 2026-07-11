@@ -198,13 +198,17 @@ public:
                 "supported (untested interaction with the b_dequant "
                 "staging buffer in the reduce union).");
 
-  // Dequant a subset of the kCalls dequant calls: i = i_first + ig *
+  // Dequant a subset of the kCalls dequant calls: i = kIFirst + ig *
   // kIStepT for ig in [0, kNumCallsT). The classic path uses
-  // <kCalls, 1> with i_first = 0; the WS pipeline hands each warp a
-  // strided subset so the block-wide dequant work is partitioned
-  // instead of replicated.
-  template <uint32_t kNumCallsT, uint32_t kIStepT>
-  CUDA_INLINE void dequant_impl(uint32_t buffer_id, uint32_t i_first) {
+  // <kCalls, 1, 0>; the WS pipeline hands each warp a strided subset
+  // so the block-wide dequant work is partitioned instead of
+  // replicated. kIFirst MUST be a template parameter: a runtime
+  // i_first makes `i` runtime, which turns every regs_b_tmp / regs_qb
+  // / regs_zp / regs_bs access into a runtime-indexed register-array
+  // access -> local-memory spill (measured 2.2x whole-kernel
+  // slowdown before this was templated).
+  template <uint32_t kNumCallsT, uint32_t kIStepT, uint32_t kIFirst>
+  CUDA_INLINE void dequant_impl(uint32_t buffer_id) {
     // For dtypes where ElementA == ElementB we'd skip dequant; tcgen05
     // bf16xbf16 isn't our target so just emit the int4 path inline.
     static_assert(!std::is_same<ElementA, ElementB>::value,
@@ -217,7 +221,7 @@ public:
     // the base pointer and overwriting on every call).
     PRAGMA_UNROLL
     for (uint32_t ig = 0; ig < kNumCallsT; ig++) {
-      uint32_t i = i_first + ig * kIStepT;
+      uint32_t i = kIFirst + ig * kIStepT;
       uint32_t *regs_b_ptr = &regs_b_tmp[buffer_id][i * 4u];
       uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, i);
       uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
@@ -230,7 +234,7 @@ public:
   // Dequant int4 (from regs_qb) -> bf16 (RMEM) -> SMEM b_dequant staging.
   CUDA_INLINE
   void transform_b(uint32_t buffer_id) {
-    dequant_impl<WarpShape::N / 16, 1>(buffer_id, 0);
+    dequant_impl<WarpShape::N / 16, 1, 0>(buffer_id);
 #ifdef TCGEN05_DEBUG_REGS_B_SENTINEL
     // Overwrite regs_b_tmp with a per-(reg_index)-derived sentinel so
     // the scatter writes bf16(my_n+1) at (my_n, my_k). If the (n,k)
@@ -262,14 +266,15 @@ public:
     fence_proxy_async_shared_cta();
   }
 
-  // Scatter dequantised bf16 pairs of i-calls {i_first + ig * kIStepT}
+  // Scatter dequantised bf16 pairs of i-calls {kIFirst + ig * kIStepT}
   // from regs_b_tmp[buffer_id] into smem.b_dequant[slot], K-chunk
-  // `iter_id`. The classic path uses <kCalls, 1> with slot ==
+  // `iter_id`. The classic path uses <kCalls, 1, 0> with slot ==
   // buffer_id; the WS pipeline scatters a per-warp subset into a
-  // per-k-block slot.
-  template <uint32_t kNumCallsT, uint32_t kIStepT>
+  // per-k-block slot. kIFirst is a template parameter for the same
+  // register-spill reason as dequant_impl.
+  template <uint32_t kNumCallsT, uint32_t kIStepT, uint32_t kIFirst>
   CUDA_INLINE void scatter_impl(uint32_t slot, uint32_t iter_id,
-                                uint32_t buffer_id, uint32_t i_first) {
+                                uint32_t buffer_id) {
     // ---- r2s of the just-dequantised B tile to swizzled SMEM ----
     //
     // Per PTX ISA 7.0 Table 32 (mma.m16n8k16.f16, B-matrix layout),
@@ -342,7 +347,7 @@ public:
       static_assert(kNumCallsT <= kCalls, "scatter_impl: too many calls");
       PRAGMA_UNROLL
       for (uint32_t ig = 0; ig < kNumCallsT; ig++) {
-        uint32_t i = i_first + ig * kIStepT;
+        uint32_t i = kIFirst + ig * kIStepT;
         PRAGMA_UNROLL
         for (uint32_t frag_id = 0; frag_id < 2u; frag_id++) {
           uint32_t n = n_base + i * 16u + 8u * frag_id + (t / 4u);
@@ -405,7 +410,7 @@ public:
       }
     }
 #else
-    scatter_impl<WarpShape::N / 16u, 1>(buffer_id, iter_id, buffer_id, 0);
+    scatter_impl<WarpShape::N / 16u, 1, 0>(buffer_id, iter_id, buffer_id);
 #endif
     // The scatter above uses regular SMEM stores (non-async), so the
     // implicit __threadfence_block from the bar.sync/__syncthreads is
@@ -503,16 +508,45 @@ public:
     return (ctx.warp_id() / kNWarpsWs) % kIStepWs;
   }
 
-  // Dequant this warp's i-subset of K-chunk codes in regs_qb[buffer_id].
-  CUDA_INLINE void transform_ws(uint32_t buffer_id) {
-    dequant_impl<kCallsPerWarpWs, kIStepWs>(buffer_id, ws_i_first());
+  // Transform + scatter one FULL k-block (all kWarpIters K-chunks of
+  // this warp's i-subset) into b_dequant[slot]. kIFirst is a template
+  // parameter so every register-array index inside dequant/arith/
+  // scatter is compile-time (a runtime i_first spilled regs to local
+  // memory: 471M+780M local sectors, 2.2x whole-kernel cost). The
+  // dispatch over the warp-uniform i_first happens ONCE PER K-BLOCK
+  // out here -- dispatching per K-iter put 4 guarded copies of
+  // dequant+scatter inside the unrolled iter loop, which bloated the
+  // loop body ~4x and re-broke unrolling (measured: 1 i-call cost
+  // MORE than the classic path's 4).
+  template <uint32_t kIFirst, class S2RPipe>
+  CUDA_INLINE void transform_kblock_ws(S2RPipe &s2r_pipe, uint32_t stage_id,
+                                       uint32_t slot) {
+    PRAGMA_UNROLL
+    for (uint32_t iter_id = 0; iter_id < Ctx::kWarpIters; iter_id++) {
+      // Within-stage s2r prefetch only; the caller does the
+      // cross-stage prefetch after the pipeline arrivals.
+      if (iter_id < Ctx::kWarpIters - 1) {
+        s2r_pipe.load_stage_iter(stage_id, iter_id + 1);
+      }
+      dequant_impl<kCallsPerWarpWs, kIStepWs, kIFirst>(iter_id % 2);
+      scatter_impl<kCallsPerWarpWs, kIStepWs, kIFirst>(slot, iter_id,
+                                                       iter_id % 2);
+    }
   }
 
-  // Scatter this warp's i-subset into the per-k-block slot.
-  CUDA_INLINE void scatter_ws(uint32_t slot, uint32_t iter_id,
-                              uint32_t buffer_id) {
-    scatter_impl<kCallsPerWarpWs, kIStepWs>(slot, iter_id, buffer_id,
-                                            ws_i_first());
+  template <class S2RPipe, uint32_t kIFirst = 0>
+  CUDA_INLINE void transform_kblock_ws_dispatch(S2RPipe &s2r_pipe,
+                                                uint32_t stage_id,
+                                                uint32_t slot,
+                                                uint32_t i_first) {
+    if (i_first == kIFirst) {
+      transform_kblock_ws<kIFirst>(s2r_pipe, stage_id, slot);
+      return;
+    }
+    if constexpr (kIFirst + 1 < kIStepWs) {
+      transform_kblock_ws_dispatch<S2RPipe, kIFirst + 1>(
+          s2r_pipe, stage_id, slot, i_first);
+    }
   }
 
   // Run the t2r and write the result directly into `smem.reduce` in

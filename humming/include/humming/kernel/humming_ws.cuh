@@ -200,7 +200,12 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         uint32_t ws_prev_stage = 0;
         bool ws_has_prev = false;
         while (slice_iters) {
-          PRAGMA_UNROLL
+          // NOT unrolled: unrolling multiplied the (already 4x
+          // dispatch-instantiated) k-block body by kNumStages and the
+          // top stall became no_instruction (I-fetch starvation,
+          // 6.2 cyc/inst). The WS path gains nothing from a
+          // compile-time stage_id.
+          PRAGMA_UNROLL_COUNT(1)
           for (uint32_t stage_id = 0; stage_id < kNumStages; stage_id++) {
             uint32_t slot = ws_slot_ctr & 1u;
             // WAR on the staging slot: the MMAs that read it (k-block
@@ -210,18 +215,14 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
                             ws_empty_phase[slot]);
               ws_empty_phase[slot] ^= 1u;
             }
-            PRAGMA_UNROLL
-            for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
-              // Within-stage s2r prefetch only; the cross-stage
-              // prefetch happens after the arrivals below (waiting on
-              // the next stage's G2S before arriving would deadlock
-              // the producer handshake at kNumStages == 2).
-              if (warp_iter_id < Ctx::kWarpIters - 1) {
-                s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
-              }
-              mma.transform_ws(warp_iter_id % 2);
-              mma.scatter_ws(slot, warp_iter_id, warp_iter_id % 2);
-            }
+            // Dequant + scatter this warp's i-subset of the whole
+            // k-block (incl. within-stage s2r prefetch). The i_first
+            // dispatch is per-k-block; the cross-stage prefetch
+            // happens after the arrivals below (waiting on the next
+            // stage's G2S before arriving would deadlock the producer
+            // handshake at kNumStages == 2).
+            mma.transform_kblock_ws_dispatch(s2r_pipe, stage_id, slot,
+                                             mma.ws_i_first());
             // Publish the generic-proxy stores to the async proxy the
             // MMA reads through, then signal slot readiness.
             fence_proxy_async_shared_cta();
