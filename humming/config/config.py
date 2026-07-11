@@ -216,10 +216,6 @@ class TuningConfig(BaseHummingConfig):
                 "use_ws_pipeline requires num_stages >= 3 (warp 0's "
                 "deferred G2S release deadlocks at 2 stages)"
             )
-            assert not self.use_tcgen05_ts, (
-                "use_ws_pipeline currently targets the SS-mode TCGEN05 "
-                "mainloop; the TS-mode composition is not implemented yet"
-            )
 
         if self.use_mbarrier is None:
             self.use_mbarrier = self.use_tma or self.use_warp_spec

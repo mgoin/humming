@@ -180,7 +180,17 @@ public:
     // skeleton was missing.
     ctx.sync_math_threads();
     tcgen05_fence_after_thread_sync();
+    issue_mma_ws(stage_id, iter_id);
+    note_slot_committed(iter_id);
+  }
 
+  // ---- split consumer side (shared by run() and the WS pipeline) ----
+  // Descriptor build + MMA issue + batch-commit to the slot's mbar.
+  // Caller provides the st->mma ordering: run() via the bar.sync +
+  // fence pair above; the WS-pipeline mainloop via a t2m_full
+  // mbarrier wait + fence::after_thread_sync on warp 0 only.
+  CUDA_INLINE
+  void issue_mma_ws(uint32_t stage_id, uint32_t iter_id) {
     uint32_t slot = iter_id % 2u;
     // Activation descriptor: same canonical Swizzle<3,4,3> K-major
     // layout + 16-K-per-issue advance the SS kernel uses for A.
@@ -203,7 +213,15 @@ public:
       tcgen05_commit_to_mbarrier(
           cast_smem_ptr_to_uint(&smem.tcgen05_ts_mbar[slot]));
     }
-    arrivals_[slot]++;
+  }
+
+  // Per-slot WAR bookkeeping. EVERY math warp must call this once per
+  // K-iter (the counters are per-thread copies that stay consistent
+  // because all threads pass the same logical points), even though
+  // only warp 0 issues the commit in WS-pipeline mode.
+  CUDA_INLINE
+  void note_slot_committed(uint32_t iter_id) {
+    arrivals_[iter_id % 2u]++;
   }
 
   // Drain TMEM D (transposed: lane = weight row n, col = activation m)

@@ -43,6 +43,7 @@ def _run_ts(
     has_bias=False,
     group_size=128,
     use_warp_spec=False,
+    use_ws_pipeline=False,
 ):
     a_dtype = dtypes.bfloat16
     b_dtype = dtypes.uint4
@@ -93,6 +94,7 @@ def _run_ts(
         mma_type="tcgen05",
         use_tcgen05=True,
         use_tcgen05_ts=True,
+        use_ws_pipeline=use_ws_pipeline,
         use_stream_k=False,
     )
 
@@ -191,3 +193,39 @@ def test_ts_prod_shape():
         block_shape=(128, 128, 64), num_stages=4,
     )
     _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# Composed: TS mainloop wrapped in the track-a WS Transform->MMA
+# pipeline (use_ws_pipeline + use_tcgen05_ts). The per-K-iter
+# 128-thread bar.sync on the issue path is replaced by t2m_full
+# mbarriers (only warp 0 waits); requires warp-spec + stages >= 3.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_stages", [3, 4])
+def test_ts_ws_pipeline(num_stages):
+    outputs, outputs_ref = _run_ts(
+        shape_m=256, shape_n=512, shape_k=2048,
+        block_shape=(128, 128, 64), num_stages=num_stages,
+        use_warp_spec=True, use_ws_pipeline=True,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_ws_pipeline_bitexact_vs_ts():
+    """The pipeline reorders scheduling, not math: same tcgen05.mma
+    sequence over the same TMEM-staged values, so outputs must be
+    bit-identical to the plain TS path. Large K guards the deferred
+    G2S release (stage reuse under a backlogged MMA queue)."""
+    kwargs = dict(
+        shape_m=512, shape_n=1024, shape_k=8192,
+        block_shape=(128, 128, 64), num_stages=4, use_warp_spec=True,
+    )
+    out_ts, ref = _run_ts(use_ws_pipeline=False, **kwargs)
+    out_ws, ref2 = _run_ts(use_ws_pipeline=True, **kwargs)
+    assert torch.equal(ref, ref2), "problem generation not deterministic"
+    assert torch.equal(out_ts, out_ws), (
+        "TS ws-pipeline diverged from the plain TS path "
+        f"(max|diff|={(out_ts.float() - out_ws.float()).abs().max().item()})"
+    )
