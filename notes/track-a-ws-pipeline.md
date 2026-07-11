@@ -228,3 +228,23 @@ no_instruction (I-fetch) surfaced at 6.18 after v4's bloat, killed by
 v5. Code size is a first-class constraint in this kernel: 4 dispatch
 instantiations x unrolled stages was enough to starve instruction
 fetch.
+
+```
+v6 bitmask mbar phases (arrays spilled at 185M
+   local-ld sectors once the stage loop stopped
+   unrolling):                                       2389 us   1.16x classic
+```
+
+### Remaining levers (not yet tried, ordered by expected value)
+
+1. Stage-front batched code loads (Swordfish "regs first" pattern):
+   the loads-only skeleton was 1033us, so s2r latency is no longer
+   the wall, but batching the 8x4B per-warp code words would shorten
+   the transform critical path further (uint4 fast path: i-call i
+   reads exactly regs_qb word i).
+2. Early consumer release for transform warps (arrive math_mbar at
+   the last current-stage s2r read instead of post-loop).
+3. 3 T2M slots at BlockK=64 configs (SMEM allows) to decouple the
+   empty-wait chain.
+4. Dedicated MMA warp (warp 0 not transforming) -- likely a wash now
+   that transform is cheap, but untested.
