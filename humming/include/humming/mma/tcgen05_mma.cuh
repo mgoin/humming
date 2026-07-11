@@ -179,10 +179,20 @@ public:
 
   CUDA_INLINE
   void set_accum_buf(uint32_t buf) {
-    if constexpr (kAccStages > 1) {
-      acc_buf_ = buf;
-      accum_col_off_ = buf * BlockShape::N;
-    }
+    if constexpr (kAccStages > 1) acc_buf_ = buf;
+  }
+
+  // Compile-time-zero accessors for the single-stage build. Keeping
+  // every member access scalar (NO runtime-indexed member arrays --
+  // see mbar_phase_bits_) is what keeps the whole TCGEN05 object
+  // SSA-promotable; a dynamically indexed member array demotes the
+  // object to a local-memory stack frame (measured: STACK 16 -> 1104 B
+  // and a 4x kernel slowdown, 2781 -> 11210 us Llama70B-down M=2048).
+  CUDA_INLINE uint32_t accum_buf() const {
+    return kAccStages > 1 ? acc_buf_ : 0u;
+  }
+  CUDA_INLINE uint32_t accum_col_off() const {
+    return kAccStages > 1 ? acc_buf_ * BlockShape::N : 0u;
   }
 
   // Supported config space (verified by tests/test_tcgen05.py and
@@ -486,7 +496,7 @@ public:
     // dealloc which require warp-uniform participation), so this is
     // safe and matches CUTLASS exactly.
     if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
-      tcgen05_mma_ss_bf16(smem.tcgen05_tmem_col + accum_col_off_,
+      tcgen05_mma_ss_bf16(smem.tcgen05_tmem_col + accum_col_off(),
                           a_desc, b_desc, idesc, scale_d);
     }
   }
@@ -510,7 +520,7 @@ public:
   CUDA_INLINE void commit_accum() {
     if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
       uint32_t mbar_addr =
-          cast_smem_ptr_to_uint(&smem.tcgen05_mbar[acc_buf_]);
+          cast_smem_ptr_to_uint(&smem.tcgen05_mbar[accum_buf()]);
       tcgen05_commit_to_mbarrier(mbar_addr);
     }
   }
@@ -530,8 +540,9 @@ public:
   // producer's next-tile loads would corrupt the last K-iters
   // otherwise -- observed as K-dependent scattered output errors).
   CUDA_INLINE void wait_accum() {
-    mbarrier_wait(&smem.tcgen05_mbar[acc_buf_], mbar_phase_[acc_buf_]);
-    mbar_phase_[acc_buf_] ^= 1u;
+    mbarrier_wait(&smem.tcgen05_mbar[accum_buf()],
+                  (mbar_phase_bits_ >> accum_buf()) & 1u);
+    mbar_phase_bits_ ^= 1u << accum_buf();
     tcgen05_fence_view_async_tmem_store();
   }
 
@@ -576,7 +587,7 @@ public:
     // Per-warp implicit sub-partition base (lane->DP binding is HW-fixed).
     // The taddr's DP field is warp-local: DP=0 = the warp's first DP.
     uint32_t base_addr =
-        smem.tcgen05_tmem_col + accum_col_off_ + (n_warp_id * WarpShape::N);
+        smem.tcgen05_tmem_col + accum_col_off() + (n_warp_id * WarpShape::N);
 
     // ---- 3. Per-warp t2r + pack + SMEM write ----
     // Compile-time swizzle base -- must match gmem_writer's
@@ -730,12 +741,13 @@ public:
 private:
   // True until the first tcgen05.mma issue lands, used to drive scale_d.
   bool first_issue_ = true;
-  // Per-accumulator-buffer mbarrier phase parity bits. Each flips after
-  // that buffer's commit/wait pair.
-  uint32_t mbar_phase_[kAccStages] = {};
-  // Active accumulator buffer and its TMEM column offset (buf * BlockN).
+  // Per-accumulator-buffer mbarrier phase parity BITS (bit b = buffer
+  // b), flipped by that buffer's commit/wait pair. A scalar bitfield,
+  // deliberately NOT an array: dynamic indexing of a member array
+  // demotes the object to local memory (see comment on accum_buf()).
+  uint32_t mbar_phase_bits_ = 0;
+  // Active accumulator buffer (only meaningful for kAccStages > 1).
   uint32_t acc_buf_ = 0;
-  uint32_t accum_col_off_ = 0;
 };
 
 
