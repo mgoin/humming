@@ -157,3 +157,86 @@ atol -- strictly tighter check.
 * The mbar counter handshake (design note above) needed no tile-
   boundary special cases; phases stayed consistent across scheduler
   blocks including the stream-k-style trailing transform.
+
+## Milestone 5: TS-mode perf vs same-GPU baselines (GPU 1, 50 iters)
+
+`benchmarks/bench_ts_vs_ss.py`. SS column = the M1 baseline config
+(BM128 BK128 s4 WS, humming's prod heuristic). TS column = best of
+stages {4,6} x ws {on,off} (s=4+ws won every point; s=6 never helped).
+
+```
+shape               M    mma us     SS us         TS cfg     TS us   SS/TS  mma/TS
+Llama70B-gate      16     160.1     229.9    M64K64s4+ws     166.2   1.38x   0.96x
+Llama70B-gate     128     317.7     231.8   M128K64s4+ws     203.3   1.14x   1.56x
+Llama70B-gate     512    1024.2     788.3   M128K64s4+ws     697.4   1.13x   1.47x
+Llama70B-gate    2048    3852.2    2836.6   M128K64s4+ws    2486.3   1.14x   1.55x
+Llama70B-down      16     266.6     393.2    M64K64s4+ws     281.2   1.40x   0.95x
+Llama70B-down     128     266.9     397.8   M128K64s4+ws     347.8   1.14x   0.77x
+Llama70B-down     512    1057.2     797.8   M128K64s4+ws     690.4   1.16x   1.53x
+Llama70B-down    2048    3687.1    2780.6   M128K64s4+ws    2399.5   1.16x   1.54x
+```
+
+* TS beats the SHIPPED SS config (which gets BlockK=128!) by
+  1.13-1.16x at M >= 512 on both shapes, and by 1.14x at gate M=128.
+* At M=16 TS narrows the tcgen05-vs-mma.sync gap from 0.71-0.72x (SS)
+  to 0.95-0.96x -- the crossover point drops substantially.
+* mma.sync still wins Llama70B-down M=128 (0.77x) -- same window SS
+  loses (0.71x); small-M work belongs to the decode-path track.
+* The prototype TS kernel with a scalar-store epilogue and a per-K-iter
+  commit+mbar handshake ALREADY beats a heavily-tuned SS kernel. The
+  epilogue (track e) and cta_group::2 headroom are on top of this.
+
+## Milestone 6: r2t-vs-r2s IN SITU (identical geometry)
+
+`benchmarks/bench_ts_m6_insitu.py`: both kernels at BM=128 BN=128
+BK=64 s=4 WS+TMA; the ONLY difference is the staging path
+(r2s scatter + bar.sync 256 vs r2t + bar.sync 128 + fences + per-iter
+commit/mbar WAR gate):
+
+```
+shape               M  SS-K64 us  TS-K64 us SS-K64/TS
+Llama70B-gate     128      247.3      203.2     1.22x
+Llama70B-gate     512      842.4      697.6     1.21x
+Llama70B-gate    2048     3031.3     2485.6     1.22x
+Llama70B-down     128      426.6      347.4     1.23x
+Llama70B-down     512      851.6      690.6     1.23x
+Llama70B-down    2048     2968.1     2399.3     1.24x
+```
+
+ANSWER to the M6 question: of the 50x primitive-cost gap (43 vs 2052
+cyc in the microbench), what survives in the full kernel is a uniform
+**1.21-1.24x wall-time win**. The Swordfish reading was right: the
+kernel partially hides the scatter (57% compute SoL), so you get ~20%
+not 50x -- but it's a REAL 20%+ that also frees 32-64KB SMEM/CTA and
+removes the 256-thread barrier. Note TS-K64 also beats SS at SS's own
+best K128 config (M5 table), so the win is not an artifact of pinning
+SS to K64.
+
+### SMEM footprints (from kernel.cu SMEM_SIZE, BM128 BN128 BK64 s4 WS)
+
+TS drops smem.b_dequant entirely; the stage budget is ~81KB/CTA vs
+~114KB (SS K64) / ~224KB (SS K128 prod). 2 CTAs/SM (needs <= ~116KB)
+is now in reach for the first time -- future work with TMEM col
+budgeting (2x (16 + BlockM) <= 512 holds for BM128: 2x144=288 OK... but
+tcgen05.alloc pow2 -> 2x256 = 512, exactly fits).
+
+## Open items / known limitations of the prototype (honest list)
+
+* Config space pinned: BlockN==128, WarpN==32, BlockK==64, M_WARPS==1,
+  K_WARPS==1, uint4 + group scale (gs >= BlockK), bf16 A. Widening
+  BlockK needs section-major TMEM staging; BlockN=256 needs
+  kNumMmaMTiles=2 (Jinzhen's tile geometry salvage covers the math).
+* Per-K-iter tcgen05.commit + mbar wait is the crude version of
+  CUTLASS's Transform2Mma pipeline; batching the commit every 2 iters
+  (or an ld/st-scoreboard scheme) is untried perf headroom.
+* Epilogue drain uses 2-byte scalar smem stores (heavily
+  bank-conflicted); track e-epilogue-tmem owns the real one. Perf
+  above INCLUDES this handicap.
+* The consumer.arrive(stage) at kWarpIters-2 releases the activation
+  stage while the last 1-2 TS MMAs of the stage may still read its
+  SMEM through the descriptor (same latent exposure the SS kernel
+  ships with; tests pass, but a producer that refills faster could
+  expose it -- inherited, not introduced).
+* Weights must be packed by tests/ts_contract_pack.py (throwaway);
+  swap in track d-packing's production packer behind the same
+  CONTRACT.
