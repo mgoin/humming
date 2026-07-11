@@ -1,0 +1,130 @@
+# Track a-ws-pipeline: warp-specialized Transform→MMA pipeline (SS mode)
+
+Findings log, workbook style. Branch `prototype/a-ws-pipeline` off
+`sm100-tcgen05-v2`. Goal: take the dequant scatter off the MMA critical
+path via a producer/consumer mbarrier pipeline between transform warps
+and an MMA-issuing warp, keeping SS mode (r2s scatter + smem.b_dequant).
+
+## M1: SS-mode baseline on THIS GPU (B300 SXM6 GPU0, cc 10.3, 2026-07-11)
+
+`benchmarks/bench_ws_pipeline_baseline.py` — mma.sync (heuristic wmma
+config) vs tcgen05 prod config (BlockM=128@M>=128 / 64@M<128, BlockN=128,
+BlockK=128, stages=4, WS+TMA), bf16 x uint4 gs=128 zp=True:
+
+```
+shape                M  mma.sync us  tcg-prod us    ratio
+Llama70B gate       16       165.98       230.05    0.72x
+Llama70B gate      128       329.82       231.70    1.42x
+Llama70B gate      512      1061.78       795.39    1.33x
+Llama70B gate     2048      3998.38      2834.37    1.41x
+Llama70B down       16       280.57       393.47    0.71x
+Llama70B down      128       281.13       397.79    0.71x
+Llama70B down      512      1133.32       796.45    1.42x
+Llama70B down     2048      3883.65      2779.80    1.40x
+```
+
+Matches workbook B.35/B.36 (2787us at down M=2048 then, 2780 now).
+Correctness baseline: `test_tcgen05.py + test_tcgen05_dtypes.py` =
+67 passed / 24 skipped / 1 xfailed.
+
+## M2: design — WS Transform→MMA pipeline
+
+### What we replace
+
+Today every math warp per K-iter (16 K-bf16): dequant (4 i-calls,
+4-way redundant across M-warps) → scatter 2 KB to
+`smem.b_dequant[iter%2]` → `bar.sync 1,256` → warp-0 lane issues
+`tcgen05.mma`. The barrier makes the MMA issue wait for the SLOWEST
+warp's scatter every iter; warps can never run ahead. Swordfish
+evidence (swordfish-notes.md §0, §7.1): hiding the scatter behind a
+producer/consumer pipeline is the structural fix, TS-mode not required.
+
+### Pipeline granularity: one full G2S stage (BlockK), not one K-iter
+
+`smem.b_dequant[2]` slots already hold a full BlockN x BlockK tile
+(32 KB at 128x128); today they ping-pong per K-iter with half-wasted
+slots. New: slot = k_block % 2 (one slot per G2S stage), transform
+warps fill ALL kWarpIters (=8) 16-K chunks of a k-block into one slot,
+MMA warp drains 8 tcgen05.mma issues per slot. This amortizes the
+handshake 8x and exactly matches Swordfish's kT2MStages=2 32 KB
+compute-buffer ping-pong. Zero SMEM growth.
+
+### Warp roles (cooperative — all math warps transform, warp 0 also issues)
+
+kMathWarps = 8 at prod config. Warp w keeps its existing loader_b /
+loader_bs n-slice (n = (w % kNWarps) * WarpN) and takes the i-call
+subset i ≡ (w / kNWarps) mod min(kMathWarps/kNWarps, kCalls) of the
+kCalls = WarpN/16 dequant calls. At prod config: 8 warps x 1 i-call
+each = 8x less scatter per warp than today (2 KB → 512 B per warp per
+K-iter), zero redundancy. (B.25's negative result gated warps *inside
+the bar.sync structure*, where the idle warps still waited per-iter;
+here there is no per-iter barrier at all, so the tradeoff changes.)
+Warp 0 additionally issues the MMAs; dedicated-idle-MMA-warp variants
+can be tried later.
+
+### mbarriers (new, in SharedStorage under IF_USE_TCGEN05)
+
+* `t2m_full[2]`  — expected count = kMathWarps (lane-0 arrive per warp
+  after scatter + `fence.proxy.async.shared::cta`). Waiter: warp 0
+  before issuing the slot's 8 MMAs. Replaces the per-iter bar.sync.
+* `t2m_empty[2]` — expected count = 1, arrived by
+  `tcgen05.commit.mbarrier::arrive` issued by warp 0 right after the
+  slot's 8 MMAs (the PipelineUmmaConsumerAsync consumer_release
+  pattern). Waiters: transform warps before REWRITING the slot
+  (k_block T+2 waits the commit from T); warp 0 instead waits it
+  immediately after its own commit (see below), so each warp waits
+  exactly once per slot use and phase parity stays consistent.
+
+### G2S stage release (math_mbar, count = kMathWarps unchanged)
+
+* Transform warps arrive after their last s2r read of the stage
+  (post-transform-loop). The wait for stage+1 is placed before the
+  final s2r prefetch (which reads next stage's codes) — same ordering
+  contract as today's kWarpIters-2 placement.
+* Warp 0 arrives only after `mbarrier_wait(t2m_empty[slot])` — i.e.,
+  after its 8 MMAs RETIRED, so the producer can never overwrite
+  smem.a under an in-flight MMA. This is strictly safer than today's
+  arrive-at-kWarpIters-2 (which releases with 2 MMAs not yet issued);
+  the retire-wait overlaps the other warps' transform of the next
+  slot, so it should be off the critical path (transform ~2k cyc >
+  8-issue MMA chain exec).
+
+### Per-tile flow (all math warps; roles branch inside)
+
+```
+zero_accum; seek; wait_stage<first>; prime s2r(0,0)
+while slice_iters: for stage_id in 0..kNumStages-1:
+  slot = slot_ctr & 1
+  if warp != 0 and slot_ctr >= 2: wait t2m_empty[slot] (phase^)
+  for it in 0..kWarpIters-1:
+    if it == kWarpIters-1 and slice_iters > 1: wait_stage(stage+1)
+    s2r load (stage, it+1)              # regs_qb/scales double-buffer
+    dequant my i-subset (buf = it % 2)
+    scatter my i-subset -> b_dequant[slot] @ k_base = it*16
+  fence.proxy.async.shared::cta; lane0: arrive t2m_full[slot]
+  if warp == 0:
+    wait t2m_full[slot] (phase^)
+    for it in 0..kWarpIters-1: issue tcgen05.mma(stage, slot, it)
+    elect1: tcgen05.commit -> t2m_empty[slot]
+    wait t2m_empty[slot] (phase^)
+  lane0: arrive math_mbar[stage]; slot_ctr++
+epilogue: unchanged (final commit -> tcgen05_mbar, all-warp t2r)
+```
+
+`slot_ctr`, phase parities persist across tiles; the tile-end drain
+(commit to tcgen05_mbar) is ordered after all per-slot commits, so no
+cross-tile hazards. Pre-dealloc `ctx.sync_math_threads()` + cluster
+barrier pairing preserved.
+
+### Staging depth
+
+2 slots (existing) to start. 3+ slots would need +32 KB and we are at
+~224/232 KiB — not available at BlockK=128 stages=4. If the empty-wait
+shows up as a stall, trade G2S stages for T2M slots later (measure).
+
+### Gating
+
+New `TuningConfig.use_ws_pipeline` (default False) → `kUseWsPipeline`;
+new mainloop branch in humming_ws.cuh under
+`kMmaType == TCGEN05 && kUseWsPipeline`. Old SS path untouched so the
+existing test matrix keeps passing unchanged.
