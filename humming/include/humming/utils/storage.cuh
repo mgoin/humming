@@ -88,6 +88,12 @@
 #define IF_USE_TCGEN05(x)
 #endif
 
+#if HUMMING_USE_TCGEN05_CG2
+#define IF_USE_TCGEN05_CG2(x) x
+#else
+#define IF_USE_TCGEN05_CG2(x)
+#endif
+
 // Untested combination: with reduce_overlap_last_stage_only the `reduce`
 // buffer overlays the last stage AND everything after it, including the
 // tcgen05 b_dequant staging buffer. The tcgen05 t2r epilogue writes
@@ -167,7 +173,15 @@ public:
   // tcgen05.mma chain it feeds drains, which happens within one K-iter
   // of pipeline depth.
   static constexpr uint32_t kNumBDequantBuffers = 2;
-  static constexpr uint32_t kSmemStrideBDequant = BlockShape::N * BlockShape::K * ElementA::kBits / 32 / 4;
+  // cta_group::2 (2x1SM) SS mode: the 2SM atom N-splits B across the
+  // CTA pair, so each CTA stages only its own BlockN/2-row half of the
+  // dequantised weight tile (compacted at row 0).
+#if HUMMING_USE_TCGEN05_CG2
+  static constexpr uint32_t kBDequantRows = BlockShape::N / 2;
+#else
+  static constexpr uint32_t kBDequantRows = BlockShape::N;
+#endif
+  static constexpr uint32_t kSmemStrideBDequant = kBDequantRows * BlockShape::K * ElementA::kBits / 32 / 4;
   static constexpr uint32_t kStageSizeBDequant = kSmemStrideBDequant;
   static constexpr uint32_t kStageBytesBDequant = kStageSizeBDequant * sizeof(int4);
 
@@ -227,4 +241,7 @@ public:
   // sync.  Only present when use_tcgen05 is set.
   IF_USE_TCGEN05(alignas(16) uint32_t tcgen05_tmem_col;)
   IF_USE_TCGEN05(alignas(8) uint64_t tcgen05_mbar;)
+  // cg2 per-K-iter pair rendezvous mbar (expected count 2: one local
+  // arrival + one remote arrival from the peer CTA's elected thread).
+  IF_USE_TCGEN05_CG2(alignas(8) uint64_t tcgen05_pair_mbar;)
 };

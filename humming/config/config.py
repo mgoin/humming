@@ -164,6 +164,15 @@ class TuningConfig(BaseHummingConfig):
     # mma.sync / wgmma paths are unaffected.
     use_tcgen05: bool | None = None
 
+    # cta_group::2 (2x1SM) on the tcgen05 SS path: a cluster pair of
+    # CTAs (adjacent M-tiles, same N-tile -- the multi_cast_size_b=2
+    # pairing, which this flag forces) runs one leader-issued
+    # tcgen05.mma with idesc.M = 2*BlockM; each CTA dequants only its
+    # own BlockN/2 half of the shared weight tile. Requires
+    # use_tcgen05 + use_warp_spec; BlockM/BlockN limits are enforced
+    # by static_asserts in mma/tcgen05_mma.cuh.
+    use_tcgen05_cg2: bool | None = None
+
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
         "num_threads",
         "num_math_threads",
@@ -187,6 +196,21 @@ class TuningConfig(BaseHummingConfig):
 
         if self.use_tcgen05 is None:
             self.use_tcgen05 = False
+
+        if self.use_tcgen05_cg2 is None:
+            self.use_tcgen05_cg2 = False
+
+        if self.use_tcgen05_cg2:
+            assert self.use_tcgen05, "use_tcgen05_cg2 requires use_tcgen05"
+            assert self.use_warp_spec, "use_tcgen05_cg2 requires use_warp_spec"
+            assert self.multi_cast_size_a == 1, (
+                "use_tcgen05_cg2 is incompatible with multi_cast_size_a > 1"
+            )
+            assert self.multi_cast_size_b in (1, 2)
+            # The cg2 cluster pairing (adjacent M-tiles at the same
+            # N-tile + multicast weight-code loads) IS the mc_b=2
+            # scheduling; force it on.
+            self.multi_cast_size_b = 2
 
         if self.use_mbarrier is None:
             self.use_mbarrier = self.use_tma or self.use_warp_spec

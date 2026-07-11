@@ -389,27 +389,32 @@ CUDA_INLINE void tcgen05_mma_ss_bf16(uint32_t d_tmem,
       : "memory");
 }
 
-// cta_group::2 variant: issued by leader CTA in a 2x cluster. The
-// effective MMA shape is (2 * BlockM, BlockN); the leader writes
-// M=0..BlockM-1 to its TMEM, the peer CTA gets M=BlockM..2*BlockM-1
-// in its own TMEM (cluster-aligned). The peer MUST be at a cluster
-// barrier when this issues -- it does not call this PTX itself.
+// cta_group::2 variant: issued by ONE elected thread of the LEADER
+// CTA (even cluster rank) only. idesc.M is the TOTAL M across the
+// pair; each CTA supplies its own M-half of A and N-half of B from
+// its own SMEM (read at the same descriptor-encoded addresses), and
+// receives its own (M/2 x full-N) accumulator slice in its own TMEM
+// (per CUTLASS SM100_MMA_F16BF16_2x1SM_SS A/B/CLayouts).
+//
+// NOTE (workbook B.32, confirmed vs CUTLASS
+// SM100_MMA_F16BF16_2x1SM_SS::fma): unlike the cta_group::1 form,
+// the cg2 kind::f16 variant does NOT accept the {m0..m3}
+// sparsity/disable mask -- ptxas rejects it with "Argument vector
+// size mismatch".
 CUDA_INLINE void tcgen05_mma_ss_bf16_2cta(uint32_t d_tmem,
                                           uint64_t a_desc,
                                           uint64_t b_desc,
                                           uint32_t idesc,
                                           bool scale_d) {
-  uint32_t mask[4] = {0u, 0u, 0u, 0u};
   asm volatile(
       "{\n\t"
       "  .reg .pred p;\n\t"
       "  setp.ne.b32 p, %4, 0;\n\t"
       "  tcgen05.mma.cta_group::2.kind::f16 "
-      "    [%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t"
+      "    [%0], %1, %2, %3, p;\n\t"
       "}\n"
       :: "r"(d_tmem), "l"(a_desc), "l"(b_desc), "r"(idesc),
-         "r"((uint32_t)scale_d),
-         "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
+         "r"((uint32_t)scale_d)
       : "memory");
 }
 
@@ -452,6 +457,23 @@ CUDA_INLINE void tcgen05_commit_to_mbarrier_2cta(uint32_t mbar_smem_addr) {
   asm volatile(
       "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.b64 [%0];\n"
       :: "r"(mbar_smem_addr) : "memory");
+}
+
+// Multicast cg2 commit: ONE commit issued from the leader CTA lands
+// one arrival on EACH cluster CTA's mbarrier selected by `cta_mask`
+// (bit i = cluster rank i; 0x3 for a 2-CTA pair). The mbar operand is
+// the CTA-LOCAL address of the mbarrier -- the same SMEM offset is
+// targeted in every selected CTA. Mirrors CUTLASS
+// `cutlass/arch/barrier.h::umma_arrive_multicast_2x1SM`. This is the
+// correct drain signal for cg2: a peer-side `tcgen05.commit` would
+// track an EMPTY batch (the peer issued no MMAs) and arrive
+// immediately, racing the epilogue's TMEM reads.
+CUDA_INLINE void tcgen05_commit_to_mbarrier_2cta_multicast(
+    uint32_t mbar_smem_addr, uint16_t cta_mask) {
+  asm volatile(
+      "tcgen05.commit.cta_group::2.mbarrier::arrive::one"
+      ".shared::cluster.multicast::cluster.b64 [%0], %1;\n"
+      :: "r"(mbar_smem_addr), "h"(cta_mask) : "memory");
 }
 
 CUDA_INLINE void tcgen05_fence_view_async_tmem_store() {

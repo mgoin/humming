@@ -139,11 +139,30 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       if (threadIdx.x < 32) {
         uint32_t smem_addr =
             cast_smem_ptr_to_uint(&smem.tcgen05_tmem_col);
-        tcgen05_alloc<128>(smem_addr);
+        // cg2: BOTH CTAs of the pair participate in the cta_group::2
+        // alloc (each receives the shared column index in its own
+        // SMEM slot). A kernel cannot mix cta_group::1 and ::2
+        // tcgen05 ops, so alloc/dealloc/mma/commit all switch
+        // together on kUseTcgen05Cg2.
+        if constexpr (Ctx::kUseTcgen05Cg2) {
+          tcgen05_alloc_2cta<128>(smem_addr);
+        } else {
+          tcgen05_alloc<128>(smem_addr);
+        }
       }
       if (threadIdx.x == 0) {
         __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
       }
+      IF_USE_TCGEN05_CG2(
+        if (threadIdx.x == 0) {
+          // Pair rendezvous mbar: one local + one remote arrival per
+          // K-iter. The cluster-scope publication of this init is
+          // handled by mbarrier_init_sync below (kMultiCastSize == 2
+          // under cg2 selects the fence.mbarrier_init + cluster
+          // barrier path).
+          __mbarrier_init(&smem.tcgen05_pair_mbar, /*expected_count=*/2);
+        }
+      )
     }
     mbarrier_init_sync<((TuningConfig::kMultiCastSizeA * TuningConfig::kMultiCastSizeB) > 1)>();
     consumer.arrive(kNumStages);
@@ -198,9 +217,20 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     // then deadlock against load threads parked in the cluster barrier.
     if constexpr (Ctx::kMmaType == MmaType::TCGEN05) {
       ctx.sync_math_threads();
-      if (threadIdx.x < 32) {
-        tcgen05_relinquish_alloc_permit();
-        tcgen05_dealloc<128>(smem.tcgen05_tmem_col);
+      if constexpr (Ctx::kUseTcgen05Cg2) {
+        // Pair rendezvous before dealloc: the cg2 dealloc operates on
+        // the PAIR's TMEM, so neither CTA may dealloc while the peer
+        // is still draining its epilogue t2r.
+        mma.cg2_rendezvous();
+        if (threadIdx.x < 32) {
+          tcgen05_relinquish_alloc_permit_2cta();
+          tcgen05_dealloc_2cta<128>(smem.tcgen05_tmem_col);
+        }
+      } else {
+        if (threadIdx.x < 32) {
+          tcgen05_relinquish_alloc_permit();
+          tcgen05_dealloc<128>(smem.tcgen05_tmem_col);
+        }
       }
     }
   }

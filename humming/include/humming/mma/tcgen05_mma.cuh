@@ -52,6 +52,7 @@
 //     the dequant scatter or surface TMEM raw values respectively.
 // All off by default -- enable only when investigating regressions.
 // #define TCGEN05_DEBUG_CONST_B 1
+// #define TCGEN05_CG2_DEBUG_DRAIN 1
 // #define TCGEN05_DEBUG_SKIP_TMEM 1
 // #define TCGEN05_DEBUG_SCATTER_SENTINEL 1
 // #define TCGEN05_DEBUG_REGS_B_SENTINEL 1
@@ -87,6 +88,17 @@ public:
   static constexpr bool kHasZeroPoint = Ctx::kHasZeroPoint;
   static constexpr bool kIsFpZeroPoint = Ctx::kIsFpZeroPoint;
   static constexpr bool kUseFusedE8m0Scale = Ctx::kUseFusedE8m0Scale;
+
+  // cta_group::2 (2x1SM) mode: the CTA pair (cluster of 2, paired by
+  // the multi_cast_size_b=2 scheduler as adjacent M-tiles at the same
+  // N-tile) runs ONE tcgen05.mma per K-chunk with idesc.M = 2*BlockM.
+  // Each CTA supplies its own A M-half (its own activation tile,
+  // unchanged loader) and its own B N-half (rows
+  // [rank*BlockN/2, ...+BlockN/2) of the shared weight tile, scattered
+  // COMPACTED at row 0 of the half-height b_dequant buffer). Each CTA
+  // receives its own (BlockM x BlockN) accumulator in its own TMEM --
+  // t2r/epilogue are unchanged.
+  static constexpr bool kUseTcgen05Cg2 = Ctx::kUseTcgen05Cg2;
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kNumWarpShapeNSplits = WarpShape::N == ElementA::kBits * 2 ? 2 : 1;
@@ -130,6 +142,40 @@ public:
   CUDA_INLINE
   TCGEN05(Ctx &ctx_, ArithClass &arith_)
       : ctx(ctx_), smem(ctx_.smem), arith(arith_) {}
+
+  // ---- cg2 helpers ----------------------------------------------------
+  // Rank of this CTA within its cluster pair (0 = leader = even CTA).
+  CUDA_INLINE static uint32_t cg2_rank() { return blockIdx.x & 1u; }
+
+  // Whether this warp's N-slice belongs to this CTA's half of the
+  // weight tile. The 2SM atom assigns B cols [rank*BlockN/2, +BlockN/2)
+  // to CTA `rank`; with WarpN == 64 == BlockN/2 that is exactly the
+  // N-slice of warps with (warp_id % kNWarpsN) == rank.
+  CUDA_INLINE static bool cg2_warp_owns_half() {
+    constexpr uint32_t kNWarpsN = MAX(BlockShape::N / WarpShape::N, 1u);
+    return ((threadIdx.x / 32u) % kNWarpsN) == cg2_rank();
+  }
+
+  // Per-K-iter pair rendezvous. Caller must have executed
+  // `ctx.sync_math_threads()` after the scatter stores. One elected
+  // math thread per CTA arrives on BOTH CTAs' pair mbar (local +
+  // remote via the cluster-mapped address); ALL math threads then
+  // wait on the LOCAL mbar (expected count 2, parity per rendezvous).
+  // Never try_wait a cluster-mapped mbar (ptxas/HW reject it,
+  // workbook B.32) -- all waits are local.
+  CUDA_INLINE void cg2_rendezvous() {
+    if constexpr (kUseTcgen05Cg2) {
+      if (threadIdx.x == 0) {
+        uint32_t peer_rank = cg2_rank() ^ 1u;
+        void *peer_mbar =
+            __cluster_map_shared_rank(&smem.tcgen05_pair_mbar, peer_rank);
+        mbarrier_arrive<true>(peer_mbar);
+        mbarrier_arrive(&smem.tcgen05_pair_mbar);
+      }
+      mbarrier_wait(&smem.tcgen05_pair_mbar, pair_phase_);
+      pair_phase_ ^= 1u;
+    }
+  }
 
   CUDA_INLINE
   void zero_accum() {
@@ -197,6 +243,26 @@ public:
                 "TCGEN05: reduce_overlap_last_stage_only is not "
                 "supported (untested interaction with the b_dequant "
                 "staging buffer in the reduce union).");
+  // cg2 v1 restrictions:
+  //  * BlockM == 128 so the per-CTA TMEM accumulator slice (M_tot/2 =
+  //    128 rows x BlockN) uses the SAME layout as the proven cg1
+  //    M=128 atom (BlockM=64 would need the 2SM M=128 half-lane TMEM
+  //    layout re-derived in the t2r).
+  //  * warp-spec only (the non-WS kernel's alloc/dealloc are cg1 and
+  //    a single kernel cannot mix cta_group::1 and ::2 tcgen05 ops).
+  //  * multi_cast_size_b == 2 provides the cluster pairing (enforced
+  //    on the Python side; kMultiCastSize == 2 checked here).
+  static_assert(!kUseTcgen05Cg2 || BlockShape::M == 128,
+                "TCGEN05 cg2: BlockM must be 128 (per-CTA TMEM slice "
+                "layout must match the cg1 M=128 atom)");
+  static_assert(!kUseTcgen05Cg2 || Ctx::kUseWarpSpec,
+                "TCGEN05 cg2: warp-spec path only");
+  static_assert(!kUseTcgen05Cg2 || Ctx::kMultiCastSize == 2,
+                "TCGEN05 cg2: requires multi_cast_size_b == 2 (cluster "
+                "pairing of adjacent M-tiles at the same N-tile)");
+  static_assert(!kUseTcgen05Cg2 || BlockShape::N == 128,
+                "TCGEN05 cg2: BlockN must be 128 (v1; per-CTA B half = "
+                "one 64-row WarpN slice)");
 
   // Dequant int4 (from regs_qb) -> bf16 (RMEM) -> SMEM b_dequant staging.
   CUDA_INLINE
@@ -211,14 +277,22 @@ public:
     // pair in regs_b_tmp, so advance the destination by 4 uint32 per
     // iter (same pattern as wmma.cuh:60 -- previously this was reusing
     // the base pointer and overwriting on every call).
-    PRAGMA_UNROLL
-    for (uint32_t i = 0; i < WarpShape::N / 16; i++) {
-      uint32_t *regs_b_ptr = &regs_b_tmp[buffer_id][i * 4u];
-      uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, i);
-      uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
-      dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(
-          regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
-      arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
+    //
+    // cg2: each CTA only stages its own BlockN/2 half of the weight
+    // tile, so warps whose N-slice belongs to the peer CTA skip the
+    // dequant entirely (warp-uniform branch, no intra-warp
+    // divergence). This is the cg2 perf lever: per-CTA transform work
+    // halves.
+    if (!kUseTcgen05Cg2 || cg2_warp_owns_half()) {
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < WarpShape::N / 16; i++) {
+        uint32_t *regs_b_ptr = &regs_b_tmp[buffer_id][i * 4u];
+        uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, i);
+        uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
+        dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(
+            regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
+        arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
+      }
     }
 #ifdef TCGEN05_DEBUG_REGS_B_SENTINEL
     // Overwrite regs_b_tmp with a per-(reg_index)-derived sentinel so
@@ -268,7 +342,7 @@ public:
       uint32_t *smem_b_u32 = reinterpret_cast<uint32_t *>(
           &smem.b_dequant[buffer_id][0]);
       constexpr uint32_t kTotalU32 =
-          BlockShape::N * BlockShape::K / 2;  // bf16 elems / 2 per uint32
+          SharedStorage::kBDequantRows * BlockShape::K / 2;  // bf16/2 per u32
       uint32_t t = threadIdx.x;
       PRAGMA_UNROLL
       for (uint32_t i = t; i < kTotalU32; i += blockDim.x) {
@@ -310,7 +384,9 @@ public:
       constexpr uint32_t kKPerSectionB =
           BlockShape::K < 64u ? BlockShape::K : 64u;
       constexpr uint32_t kRowBytes = kKPerSectionB * sizeof(__nv_bfloat16);
-      constexpr uint32_t kBSectionSizeBytes = BlockShape::N * kRowBytes;
+      // cg2: b_dequant holds only this CTA's BlockN/2-row half.
+      constexpr uint32_t kBSectionSizeBytes =
+          SharedStorage::kBDequantRows * kRowBytes;
       uint32_t t = threadIdx.x % 32u;
       uint32_t k_base = iter_id * kPartMmaShapeK;
       constexpr uint32_t kBf16PerCall = 8;
@@ -321,10 +397,17 @@ public:
       // emit the same bytes). The HW serialises the resulting
       // 4-way bank conflict cheaper than divergent gating -- a
       // 1-warp-per-N-slice variant was measured 10% slower.
+      //
+      // cg2: only the warps whose N-slice belongs to this CTA's half
+      // scatter (warp-uniform gate), and the half is COMPACTED at
+      // row 0 (n_base = 0) so the 2SM atom's per-CTA (N/2, K) B
+      // fragment starts at the descriptor address.
       constexpr uint32_t kNWarps = MAX(BlockShape::N / WarpShape::N, 1u);
       uint32_t warp_id_local = threadIdx.x / 32u;
       uint32_t n_warp_id_scatter = warp_id_local % kNWarps;
-      uint32_t n_base = n_warp_id_scatter * WarpShape::N;
+      uint32_t n_base = kUseTcgen05Cg2 ? 0u
+                                       : n_warp_id_scatter * WarpShape::N;
+      bool scatter_active = !kUseTcgen05Cg2 || cg2_warp_owns_half();
       // Hardware Swizzle<3,4,3> applies to the absolute byte address:
       // the descriptor encodes (smem_base >> 4) in its start_address,
       // and the HW XOR'ing of bits [4, 7) uses bits [7, 10) of the
@@ -345,6 +428,7 @@ public:
           reinterpret_cast<uint32_t *>(regs_b_tmp[buffer_id]);
       uint32_t *smem_b_u32 =
           reinterpret_cast<uint32_t *>(&smem.b_dequant[buffer_id][0]);
+      if (scatter_active) {
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kCalls; i++) {
         PRAGMA_UNROLL
@@ -381,6 +465,7 @@ public:
           }
         }
       }
+      }  // scatter_active
     }
 #endif
     // The scatter above uses regular SMEM stores (non-async), so the
@@ -392,7 +477,17 @@ public:
     //   * bar.sync 1, kNumMathThreads under warp-spec (producer
     //     threads must NOT be awaited here -- they're busy doing
     //     gmem->smem loads).
+    //
+    // cg2: the pair MMA (issued on the LEADER) reads this CTA's
+    // scatter through the async proxy ACROSS the cluster, so publish
+    // the generic stores to the async proxy explicitly, then
+    // rendezvous with the peer (the cluster-scope mbarrier arrive
+    // provides the cross-CTA release; the leader's wait the acquire)
+    // before the leader issues. This is the CUTLASS mixed-input-2SM
+    // transform->MMA publication pattern.
+    if constexpr (kUseTcgen05Cg2) fence_proxy_async_shared_cta();
     ctx.sync_math_threads();
+    cg2_rendezvous();
 
     // ---- now build descriptors + issue tcgen05.mma ----
     // A descriptor reads from smem.stages[stage_id].a; advance the pointer by
@@ -418,11 +513,12 @@ public:
                   + section_idx * kSectionSizeUint128
                   + iter_in_section * kKChunkUint128;
     // B is sectionised the same way A is: the scatter above writes
-    // section-major, with each section holding 64 K-bf16 of all N.
+    // section-major, with each section holding 64 K-bf16 of all N
+    // rows this CTA stages (BlockN, or BlockN/2 under cg2).
     // So B's descriptor SBO is also fixed at 64 K-bf16, and the iter
-    // advance crosses sections via `section_idx * kBSectionSizeUint128`
-    // (where the B section size in uint128 is `BlockN * 8`).
-    constexpr uint32_t kBSectionSizeUint128 = BlockShape::N * 8u;
+    // advance crosses sections via `section_idx * kBSectionSizeUint128`.
+    constexpr uint32_t kBSectionSizeUint128 =
+        SharedStorage::kBDequantRows * 8u;
     int4 *b_ptr = &smem.b_dequant[buffer_id][0]
                   + section_idx * kBSectionSizeUint128
                   + iter_in_section * kKChunkUint128;
@@ -430,8 +526,13 @@ public:
     uint64_t a_desc = tcgen05_smem_desc<kSwizzleBytesA, kKPerSection>(a_ptr);
     uint64_t b_desc = tcgen05_smem_desc<kSwizzleBytesB, kKPerSection>(b_ptr);
 
+    // cg2: idesc.M is the TOTAL M across the CTA pair (2*BlockM); the
+    // descriptors are broadcast and each CTA's SMEM supplies its own
+    // A M-half / B N-half at the same addresses.
+    constexpr uint32_t kIdescM =
+        kUseTcgen05Cg2 ? 2u * BlockShape::M : BlockShape::M;
     uint32_t idesc =
-        tcgen05_instr_desc_bf16_bf16_f32(BlockShape::M, BlockShape::N);
+        tcgen05_instr_desc_bf16_bf16_f32(kIdescM, BlockShape::N);
 
     // First issue of a tile: overwrite D (scale_d=false).
     // Subsequent K-iters: accumulate (scale_d=true).
@@ -443,8 +544,30 @@ public:
     // reconvergence. tcgen05.mma is NOT .sync.aligned (unlike alloc/
     // dealloc which require warp-uniform participation), so this is
     // safe and matches CUTLASS exactly.
-    if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
-      tcgen05_mma_ss_bf16(smem.tcgen05_tmem_col, a_desc, b_desc, idesc, scale_d);
+    // cg2: ONLY the leader CTA (even cluster rank) issues; the peer's
+    // operands and accumulator are addressed by the hardware.
+    if constexpr (kUseTcgen05Cg2) {
+      if (cg2_rank() == 0 && threadIdx.x < 32 && tcgen05_elect_one_sync()) {
+        tcgen05_mma_ss_bf16_2cta(smem.tcgen05_tmem_col, a_desc, b_desc,
+                                 idesc, scale_d);
+      }
+#ifdef TCGEN05_CG2_DEBUG_DRAIN
+      // Debug: fully drain the pair MMA after every issue. If sparse
+      // corruption disappears with this on, the bug is an intra-K-loop
+      // WAR race (b_dequant slot or A-stage reuse vs the in-flight
+      // remote-operand MMA); if it persists, look at layout/visibility.
+      if (cg2_rank() == 0 && threadIdx.x < 32 && tcgen05_elect_one_sync()) {
+        uint32_t mbar_addr = cast_smem_ptr_to_uint(&smem.tcgen05_mbar);
+        tcgen05_commit_to_mbarrier_2cta_multicast(mbar_addr, 0x3);
+      }
+      mbarrier_wait(&smem.tcgen05_mbar, mbar_phase_);
+      mbar_phase_ ^= 1u;
+#endif
+    } else {
+      if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
+        tcgen05_mma_ss_bf16(smem.tcgen05_tmem_col, a_desc, b_desc, idesc,
+                            scale_d);
+      }
     }
   }
 
@@ -464,9 +587,21 @@ public:
   template <class T = uint32_t>
   CUDA_INLINE T *final_regs_c_as_ptr() {
     // ---- 1. Drain MMAs via commit + mbarrier wait ----
-    if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
-      uint32_t mbar_addr = cast_smem_ptr_to_uint(&smem.tcgen05_mbar);
-      tcgen05_commit_to_mbarrier(mbar_addr);
+    // cg2: ONE multicast commit from the LEADER lands an arrival on
+    // BOTH CTAs' local tcgen05_mbar when the pair MMAs retire; each
+    // CTA then waits locally and reads its own TMEM half. (The peer
+    // must NOT commit: it issued no MMAs, so its commit would track
+    // an empty batch and arrive immediately.)
+    if constexpr (kUseTcgen05Cg2) {
+      if (cg2_rank() == 0 && threadIdx.x < 32 && tcgen05_elect_one_sync()) {
+        uint32_t mbar_addr = cast_smem_ptr_to_uint(&smem.tcgen05_mbar);
+        tcgen05_commit_to_mbarrier_2cta_multicast(mbar_addr, /*cta_mask=*/0x3);
+      }
+    } else {
+      if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
+        uint32_t mbar_addr = cast_smem_ptr_to_uint(&smem.tcgen05_mbar);
+        tcgen05_commit_to_mbarrier(mbar_addr);
+      }
     }
     mbarrier_wait(&smem.tcgen05_mbar, mbar_phase_);
     mbar_phase_ ^= 1u;
@@ -661,6 +796,9 @@ private:
   bool first_issue_ = true;
   // mbarrier phase parity bit. Flips after each tile's commit/wait pair.
   uint32_t mbar_phase_ = 0;
+  // cg2 pair-rendezvous mbar phase parity. Flips once per rendezvous
+  // (per K-iter, plus one final pre-dealloc rendezvous).
+  uint32_t pair_phase_ = 0;
 };
 
 

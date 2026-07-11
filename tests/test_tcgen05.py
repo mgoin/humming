@@ -88,6 +88,7 @@ def _run_tcgen05(
     group_size=128,
     use_tma=False,
     use_warp_spec=False,
+    use_tcgen05_cg2=False,
 ):
     """Construct a TCGEN05 kernel, run it on a random problem, and
     return (outputs, outputs_ref). Reference is computed BEFORE the
@@ -129,6 +130,7 @@ def _run_tcgen05(
         mma_type="tcgen05",
         use_tcgen05=True,
         use_stream_k=False,
+        use_tcgen05_cg2=use_tcgen05_cg2,
     )
 
     outputs_ref = inputs_ref.matmul(weight_ref.T)
@@ -429,3 +431,60 @@ def test_tcgen05_zp_bias(has_zero_point, has_bias):
         has_bias=has_bias,
     )
     _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# cta_group::2 (2x1SM) on the SS-mode WS kernel. A cluster pair of CTAs
+# (adjacent M-tiles, same N-tile) runs one leader-issued tcgen05.mma with
+# idesc.M = 2*BlockM; each CTA dequants only its own BlockN/2 half of the
+# shared weight tile. Requires warp-spec + BlockM=128 + BlockN=128 and
+# shape_m a multiple of 2*BlockM (the cluster pairs M-tiles).
+# ---------------------------------------------------------------------------
+
+
+def _run_cg2_pair(shape_m, shape_n, shape_k, num_stages, block_k,
+                  has_zero_point=True, has_bias=False):
+    common = dict(
+        shape_m=shape_m, shape_n=shape_n, shape_k=shape_k,
+        block_shape=(128, 128, block_k), warp_shape=(32, 64, block_k),
+        num_stages=num_stages,
+        has_zero_point=has_zero_point, has_bias=has_bias,
+        use_tma=True, use_warp_spec=True,
+    )
+    # _build_w4a16_problem draws fresh random data per call; seed so
+    # both kernels see the identical problem.
+    torch.manual_seed(1234)
+    out_cg1, ref = _run_tcgen05(use_tcgen05_cg2=False, **common)
+    torch.manual_seed(1234)
+    out_cg2, _ = _run_tcgen05(use_tcgen05_cg2=True, **common)
+    return out_cg1, out_cg2, ref
+
+
+@pytest.mark.parametrize("block_k, num_stages", [(64, 4), (128, 4), (128, 2)])
+def test_tcgen05_cg2_bitwise_matches_cg1(block_k, num_stages):
+    """The strongest cg2 invariant: identical fp32 TMEM accumulation
+    order means the cg2 output must be BIT-IDENTICAL to the shipped
+    cg1 SS kernel at the same config -- any cross-CTA race or operand
+    mapping error breaks equality."""
+    out_cg1, out_cg2, _ = _run_cg2_pair(
+        shape_m=512, shape_n=512, shape_k=1024,
+        num_stages=num_stages, block_k=block_k,
+    )
+    assert torch.equal(out_cg1, out_cg2)
+
+
+@pytest.mark.parametrize(
+    "has_zero_point, has_bias",
+    [(True, False), (False, False), (True, True)],
+)
+def test_tcgen05_cg2_w4a16(has_zero_point, has_bias):
+    """cg2 vs the dequant reference at a shape where the cg1 SS path
+    is within tolerance (larger shapes hit the known pre-existing
+    WS+TMA+BlockM=128 small-probe deviation, workbook B.38, in cg1
+    and cg2 identically)."""
+    _, out_cg2, ref = _run_cg2_pair(
+        shape_m=512, shape_n=512, shape_k=1024,
+        num_stages=4, block_k=128,
+        has_zero_point=has_zero_point, has_bias=has_bias,
+    )
+    _assert_close(out_cg2, ref)
