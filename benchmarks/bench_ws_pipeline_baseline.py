@@ -22,14 +22,31 @@ MS = [16, 128, 512, 2048]
 
 
 def main():
+    three_way = len(sys.argv) > 1 and sys.argv[1] == "--three-way"
     extra = {}
     if len(sys.argv) > 1 and sys.argv[1] == "--ws-pipeline":
         extra["use_ws_pipeline"] = True
-    print(f"{'shape':<16s} {'M':>5s} {'mma.sync us':>12s} {'tcg-prod us':>12s} {'ratio':>8s}")
+    if three_way:
+        print(f"{'shape':<16s} {'M':>5s} {'mma.sync':>10s} {'tcg-clas':>10s} "
+              f"{'tcg-wsp':>10s} {'wsp/clas':>9s} {'wsp/mma':>9s}")
+    else:
+        print(f"{'shape':<16s} {'M':>5s} {'mma.sync us':>12s} {'tcg-prod us':>12s} {'ratio':>8s}")
     for label, n, k in SHAPES:
         for m in MS:
             t_wmma = bench_one(m, n, k, "mma")
             bm = 128 if m >= 128 else 64
+            if three_way:
+                t_c = bench_one(m, n, k, "tcgen05", block_m=bm, block_k=128,
+                                num_stages=4, use_warp_spec=True)
+                t_w = bench_one(m, n, k, "tcgen05", block_m=bm, block_k=128,
+                                num_stages=4, use_warp_spec=True,
+                                use_ws_pipeline=True)
+                ok = all(isinstance(t, float) for t in (t_wmma, t_c, t_w))
+                r1 = f"{t_c / t_w:>8.2f}x" if ok else "  --  "
+                r2 = f"{t_wmma / t_w:>8.2f}x" if ok else "  --  "
+                print(f"{label:<16s} {m:>5d} {fmt(t_wmma):>10s} {fmt(t_c):>10s} "
+                      f"{fmt(t_w):>10s} {r1:>9s} {r2:>9s}", flush=True)
+                continue
             t_tcg = bench_one(
                 m, n, k, "tcgen05", block_m=bm, block_k=128,
                 num_stages=4, use_warp_spec=True, **extra)
