@@ -240,3 +240,10 @@ tcgen05.alloc pow2 -> 2x256 = 512, exactly fits).
 * Weights must be packed by tests/ts_contract_pack.py (throwaway);
   swap in track d-packing's production packer behind the same
   CONTRACT.
+
+## Sanitizer check
+
+`compute-sanitizer --tool synccheck` over test_tcgen05_ts.py::test_ts_stages
+(stages 2/3/4, the deepest handshake coverage): 3 passed, ERROR SUMMARY:
+0 errors. The Transform2Mma mbar handshake and the st->sync->mma fence
+chain are clean under the tool that catches "Missing wait" mbar bugs.
