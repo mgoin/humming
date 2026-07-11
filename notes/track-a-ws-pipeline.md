@@ -284,3 +284,69 @@ warp-spec tcgen05 family, NOT a pipeline regression. Track B's clean
 synccheck run was over their TS suite whose barrier is also named but
 apparently tolerated at their config; our correctness bar stays the
 suite + the bit-exact-vs-classic test.
+
+## M8: COMPOSITION (headline question) -- NEGATIVE RESULT, quantified
+
+Merged prototype/b-ts-staging (merge 27a4146; combined suite 94 pass)
+and implemented the composed kernel (use_ws_pipeline + use_tcgen05_ts,
+commit c0d21f8): track B's TS core (dequant -> tcgen05.st -> swapped
+MMA + per-slot WAR commit/mbar) with the per-K-iter 128-thread
+bar.sync on the issue path replaced by the track-A t2m_full mbarrier
+handshake (only warp 0 waits + fences + issues) and the deferred G2S
+release (stage T-1 released at (T, iter1), where transform_b(iter1)'s
+WAR wait transitively proves commit(T-1, last) completed). CORRECT:
+bit-exact vs plain TS at M=512 N=1024 K=8192; 97-test suite green.
+
+`benchmarks/bench_compose.py`, all five kernels at IDENTICAL geometry
+(BlockM=128@M>=128 else 64, BN=128, BK=64, s4, WS+TMA), GPU0:
+
+```
+shape             M       mma        ss    ss-wsp        ts    ts-wsp  ts/tswsp
+Llama70B-gate    16     166.2     246.4     244.8     165.6     215.7     0.77x
+Llama70B-gate   128     309.9     246.8     249.5     203.5     256.8     0.79x
+Llama70B-gate   512    1070.5     851.2     856.8     698.2     883.5     0.79x
+Llama70B-gate  2048    3823.8    3028.7    3063.4    2489.0    3152.7     0.79x
+Llama70B-down    16     280.9     421.8     420.3     281.3     371.2     0.76x
+Llama70B-down   128     532.3     426.8     424.3     347.1     441.0     0.79x
+Llama70B-down   512    1060.6     851.5     855.3     689.8     877.3     0.79x
+Llama70B-down  2048    3701.2    2965.4    2980.5    2399.1    3057.5     0.78x
+```
+
+(ts-wsp shown with the stage loop fully unrolled -- the PRAGMA_
+UNROLL_COUNT(1) first cut was 0.71x; the SS path's I-fetch-starvation
+rationale does not transfer to the tiny TS transform.)
+
+VERDICT: the composition LOSES to plain TS by 0.76-0.79x everywhere;
+B's TS stays the fastest humming config. Two structural reasons:
+
+1. There is nothing left to hide. The TS transform (8 lop3/hsub/hmul
+   + one tcgen05.st) is ~free next to the SS scatter, so the per-iter
+   bar.sync among 4 symmetric warps costs almost nothing -- replacing
+   it with 4 mbar arrivals + a warp-0 mbar spin-wait + fence per iter
+   ADDS latency to the MMA-issue path instead of removing any.
+   Corroborated in-table: at this BK=64 geometry even ss-wsp is a
+   WASH vs ss (2980 vs 2965 at down-2048) -- the pipeline's 1.14-1.16x
+   win is specific to BK=128 (8 iters/stage, 2 KB/warp/iter scatter);
+   at BK=64 nothing is barrier-bound.
+2. Run-ahead is capped at 2 K-iters by the 2 TMEM staging slots
+   (8 cols each), so the pipeline cannot buy the multi-stage
+   decoupling that made it win on SS. Deeper TMEM staging (112 free
+   cols at BlockM=128 -> up to 14 slots) would lift the cap, but with
+   the transform ~free there is nothing to decouple.
+
+B's "batch commit every 2 iters" lever was NOT tried on the composed
+kernel (task gates it on composition winning). It remains plausible
+headroom for the PLAIN TS path where the commit is also per-iter.
+
+The composed path stays in-tree (correct, tested, one if-constexpr
+branch) as the recorded experiment; the config default keeps it off.
+
+### Track-A levers that DO transfer to TS (follow-ups for next owner)
+
+* Deferred G2S release: B's own notes flag the consumer.arrive at
+  kWarpIters-2 racing the stage's last TS MMAs (same latent hazard the
+  SS pipeline hit as REAL wrong cells at K=4096). The composed branch
+  carries the fix; porting just the deferral into the plain TS
+  mainloop is cheap insurance.
+* TS integration with track D's production packer is still pending
+  (tests/test_ts_packing_cross_track.py pins the layout divergence).

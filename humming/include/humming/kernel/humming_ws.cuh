@@ -216,7 +216,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         bool ws_has_prev = false;
         mma.transform_b(0);
         while (slice_iters) {
-          PRAGMA_UNROLL_COUNT(1)
+          // Fully unrolled like the classic TS mainloop: the TS
+          // transform is tiny (no dispatch instantiations), so the
+          // SS-path I-fetch-starvation concern doesn't apply and the
+          // compile-time stage_id keeps s2r/descriptor indexing free.
+          PRAGMA_UNROLL
           for (uint32_t stage_id = 0; stage_id < kNumStages; stage_id++) {
             PRAGMA_UNROLL
             for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
