@@ -178,3 +178,36 @@ existing test matrix keeps passing unchanged.
   8+ min -> our runs appeared hung with GPU util 0%, main thread in
   nanosleep). Fix: export HUMMING_TMP_DIR=$PWD/.humming-tmp (kernel
   cache stays shared via the default HUMMING_CACHE_DIR).
+
+## M5: perf debugging
+
+* v2 (retire-wait removed) still 0.62x vs mma.sync (6240us at gate
+  M=2048 vs classic tcgen05's 2834us). NCU at down M=2048:
+  Compute SM 16.5% (classic 57%), warp cyc/inst 16.4 (classic 5.05),
+  81.8% no-eligible, long_scoreboard 12.95 cyc/inst (classic 1.52),
+  wait 1.65, barrier 0.00 (bar.sync is really gone).
+* **Root cause: register-array spills from the runtime i_first.**
+  l1tex local traffic: 471M ld + 780M st sectors (classic ~0). The
+  WS i-call subset made `i` runtime, so regs_b_tmp[i*4], regs_qb
+  selection inside dequant<>, and arith regs_zp/regs_bs indexing all
+  became runtime register-array indexes -> ptxas demoted them to
+  local memory. Classic path's fully-unrolled `i` never hits this.
+* Fix: kIFirst as a template parameter + recursive warp-uniform
+  dispatch (i_first in [0, kIStepWs), depth <= 4).
+
+### Ablation bisection at down M=2048 (prod config, all bit-times on GPU0)
+
+```
+loads-only (s2r + skeleton + full-mbar + G2S flow):   1033 us
++ dequant(1 i-call) + scatter(4 stores) per iter:     3531 us  (+2498!)
++ MMA issue/commit + empty waits (full v3):           4887 us  (+1356)
+classic tcgen05 (does 4 i-calls + 16 stores + bar):   2780 us
+```
+
+One i-call in the WS path cost MORE than classic's four -> the
+per-K-iter i_first dispatch put 4 guarded copies of dequant+scatter
+inside the (nominally unrolled) iter loop; the bloat breaks unrolling
+so iter%2 buffer ids go runtime -> regs_qb/regs_b_tmp local spills
+return (residual 8.3M local sectors even after templating kIFirst).
+Fix: hoist the dispatch to once per k-block with the whole iter loop
+inside the instantiation (transform_kblock_ws).
