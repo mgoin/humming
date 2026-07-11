@@ -282,3 +282,77 @@ SMEM stage traffic for A halves (BlockM/2 rows), and the pair
 fetches each activation tile from L2/DRAM once instead of twice --
 at large M activations dominate bandwidth, which is where cg1 TS is
 strongest. Weight-side work is untouched (already the TS win).
+
+### Milestone 5 validation (this session)
+
+* tests/test_tcgen05.py -k cg2: 6/6 passed (incl. bitwise-vs-cg1).
+* NEW grid-edge tests test_tcgen05_cg2_odd_tile_grid_edge[320|384|640]:
+  odd M-tile counts, rank-1 tail CTA partially/fully past shape_m --
+  all bitwise-match cg1, no deadlock (scheduler launches full pairs;
+  tail CTA runs on TMA-zero-filled data, predicated stores). The old
+  "shape_m must be a multiple of 2*BlockM" comment was wrong; fixed.
+* Full suites: 76 passed / 24 skipped / 1 xfailed (was 73/24/1).
+* compute-sanitizer, cg2 BM128/BN128/BK128 s4 m512 n512 k1024:
+  - synccheck: 0 errors.
+  - racecheck: 4 hazards -- but the cg1 SS baseline shows the
+    IDENTICAL 4 write->read hazard-pair structure (512 instances
+    each), i.e. pre-existing mbarrier-blind false positives on the WS
+    producer-store vs consumer-read pipeline (racecheck does not model
+    mbarrier arrive/wait). Not cg2-introduced. Logs:
+    /tmp/racecheck_cg{1,2}_full.log (this box).
+
+## Milestone 6: PERF VERDICT — cg2-on-SS is a NEGATIVE RESULT
+
+bench_cg2_ss.py --cg2, GPU 2, 50 iters / 10 warmup, µs. cg1 numbers
+reproduce milestone 1 within noise.
+
+```
+shape            M      mma.sync   tcg-ss cg1   tcg-ss cg2   cg2/cg1
+Llama70B gate    512      1021.3        788.8       1115.0     1.41x
+Llama70B gate    2048     3853.1       2835.8       4006.2     1.41x
+Llama70B gate    4096     7626.7       5566.9       7847.0     1.41x
+Llama70B down    512      1057.5        798.3       1113.3     1.39x
+Llama70B down    2048     3690.2       2782.4       3882.5     1.40x
+Llama70B down    4096     7375.2       5557.0       7757.8     1.40x
+```
+
+cg2 is uniformly ~1.40x SLOWER than cg1 at every large-M point on both
+Llama70B shapes — worse than mma.sync at some points. The large-M
+tensor-core-utilization hypothesis is REFUTED for the SS kernel.
+
+### Attribution (timing-only experiment, correctness knowingly broken)
+
+Re-ran M=2048 with TCGEN05_CG2_DEBUG_NO_RENDEZVOUS +
+TCGEN05_CG2_DEBUG_NO_FENCE (skip the per-K-iter pair handshake +
+async-proxy fence entirely; reverted after the run):
+
+```
+                 cg1     cg2      cg2-no-rdv   handshake cost
+gate  M=2048    2834.4  4006.2      3110.8        ~895 µs
+down  M=2048    2780.9  3882.5      3470.5        ~412 µs
+```
+
+* The per-K-iter cluster rendezvous accounts for 40-75% of the gap
+  depending on shape, i.e. hundreds of µs — the two-CTA lockstep
+  (cluster-mapped mbarrier arrive + local wait every K-iter) is
+  fundamentally expensive on this mainloop, which has a K-iter every
+  ~2000 cycles (the scatter).
+* Even with the handshake FREE (broken-correctness bound), cg2 is
+  still 1.10-1.25x SLOWER than cg1. With the warp-redundancy dequant
+  (milestone 5) each CTA does the same transform work as cg1, so
+  there is NO work saving left; the residual loss is plausibly the
+  leader-only single MMA issue stream + lockstep scheduling rigidity
+  vs two independent CTAs. Milestone 2 already showed cg1 issue rate
+  saturates the tensor cores — cg2 had nothing to add.
+
+### Conclusion for the track
+
+cg2-on-SS: CORRECT (bit-identical to cg1, suites green, synccheck
+clean, grid-edge tested) but a clean perf negative. Keep the code
+behind use_tcgen05_cg2 (off by default) as the validated cta_group::2
+substrate — alloc/dealloc, pair rendezvous, multicast commit, mask-free
+cg2 PTX, scheduler pairing are all proven, and the TS composition
+(design note above) reuses ALL of that machinery with a DIFFERENT perf
+lever (activation-half SMEM traffic + single fetch of each activation
+tile via the 2SM TMA), so the negative SS result does not condemn
+TS+cg2. Do not enable cg2 in any SS heuristic.
