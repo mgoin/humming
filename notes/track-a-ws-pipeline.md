@@ -160,3 +160,21 @@ existing test matrix keeps passing unchanged.
 * Also: the next-stage G2S wait must come AFTER the current stage's
   arrivals (classic interleaves them at kWarpIters-2); the cross-stage
   s2r prefetch moved after the arrive/wait pair accordingly.
+
+## M4: correctness evidence
+
+* **WS-pipeline output is BIT-EXACT vs the classic tcgen05 path**
+  (M=512 N=1024 K=4096, prod config, torch.equal) -- the pipeline
+  reorders scheduling, not math (same tcgen05.mma sequence over the
+  same dequantised values). This is the sharpest correctness criterion
+  and is now pinned by `test_tcgen05_ws_pipeline_bitexact_vs_classic`.
+* Important tolerance gotcha: at K=4096 BOTH paths show ~0.7% of
+  cells beyond atol=0.5 vs the fp32-reference GEMM (max|err|=2.0,
+  identical cells) -- pure bf16 accumulation drift, matching the
+  dtype-test suite's atol=2.0 at that K. Do NOT chase atol=0.5
+  "failures" at K>=4096.
+* Infra gotcha: the shared ~/.humming/tmp/lock/launcher.lock is
+  contended across concurrent tracks (a track-E process held it for
+  8+ min -> our runs appeared hung with GPU util 0%, main thread in
+  nanosleep). Fix: export HUMMING_TMP_DIR=$PWD/.humming-tmp (kernel
+  cache stays shared via the default HUMMING_CACHE_DIR).
