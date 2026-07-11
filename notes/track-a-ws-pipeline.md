@@ -211,3 +211,20 @@ so iter%2 buffer ids go runtime -> regs_qb/regs_b_tmp local spills
 return (residual 8.3M local sectors even after templating kIFirst).
 Fix: hoist the dispatch to once per k-block with the whole iter loop
 inside the instantiation (transform_kblock_ws).
+
+### Perf fix ladder (down M=2048, prod config, bit-exact at every step)
+
+```
+v1 retire-wait + per-iter dispatch (runtime i):     6341 us   0.44x classic
+v2 no retire-wait (still runtime i_first):          6269 us
+v3 kIFirst templated (per-iter dispatch):           4887 us
+v4 dispatch hoisted to per-k-block:                 4058 us
+v5 ws stage loop unroll(1):                         2726 us   1.02x classic  <- crossover
+classic tcgen05 SS (bar.sync per iter):             2780 us
+```
+
+Stall progression (cyc/inst): long_scoreboard 12.95 -> 4.36,
+no_instruction (I-fetch) surfaced at 6.18 after v4's bloat, killed by
+v5. Code size is a first-class constraint in this kernel: 4 dispatch
+instantiations x unrolled stages was enough to starve instruction
+fetch.

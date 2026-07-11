@@ -162,9 +162,13 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
     // WS Transform->MMA pipeline state (kUseWsPipeline only; persists
     // across tiles so slot parity / mbar phases stay consistent).
+    // Phases are BITMASKS, not arrays: the ws stage loop is not
+    // unrolled, so array indexing by the runtime slot/stage spills to
+    // local memory (measured 185M local-load sectors with arrays).
     [[maybe_unused]] uint32_t ws_slot_ctr = 0;
-    [[maybe_unused]] uint32_t ws_full_phase[2] = {0, 0};
-    [[maybe_unused]] uint32_t ws_empty_phase[2] = {0, 0};
+    [[maybe_unused]] uint32_t ws_full_phase_mask = 0;
+    [[maybe_unused]] uint32_t ws_empty_phase_mask = 0;
+    [[maybe_unused]] uint32_t ws_g2s_phase_mask = 0;
 
     while (scheduler.get_next_block()) {
       mma.zero_accum();
@@ -212,8 +216,8 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
             // ws_slot_ctr - 2) must have retired before rewriting.
             if (ws_slot_ctr >= 2) {
               mbarrier_wait(&smem.tcgen05_t2m_empty_mbar[slot],
-                            ws_empty_phase[slot]);
-              ws_empty_phase[slot] ^= 1u;
+                            (ws_empty_phase_mask >> slot) & 1u);
+              ws_empty_phase_mask ^= 1u << slot;
             }
             // Dequant + scatter this warp's i-subset of the whole
             // k-block (incl. within-stage s2r prefetch). The i_first
@@ -231,8 +235,8 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
             }
             if (is_mma_warp) {
               mbarrier_wait(&smem.tcgen05_t2m_full_mbar[slot],
-                            ws_full_phase[slot]);
-              ws_full_phase[slot] ^= 1u;
+                            (ws_full_phase_mask >> slot) & 1u);
+              ws_full_phase_mask ^= 1u << slot;
               if (ws_has_prev) consumer.arrive(ws_prev_stage);
               PRAGMA_UNROLL
               for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
@@ -257,8 +261,16 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
             slice_iters--;
             if (!slice_iters) break;
             // Cross-stage prefetch of the next stage's first K-chunk
-            // (into regs_qb[0]) once its G2S landed.
-            consumer.wait_stage((stage_id + 1) % kNumStages);
+            // (into regs_qb[0]) once its G2S landed. Inline mbar wait
+            // with a bitmask phase (consumer.wait_stage's phases[]
+            // array would be runtime-indexed here and spill; its ring
+            // entries stay untouched in the WS path -- only the
+            // first-stage entry [kNumStages] is used, via the
+            // compile-time-indexed wait_stage<true> above).
+            uint32_t next_stage = (stage_id + 1) % kNumStages;
+            mbarrier_wait(&smem.load_mbar[next_stage],
+                          (ws_g2s_phase_mask >> next_stage) & 1u);
+            ws_g2s_phase_mask ^= 1u << next_stage;
             s2r_pipe.load_stage_iter(stage_id, Ctx::kWarpIters);
           };
         };
