@@ -437,8 +437,11 @@ def test_tcgen05_zp_bias(has_zero_point, has_bias):
 # cta_group::2 (2x1SM) on the SS-mode WS kernel. A cluster pair of CTAs
 # (adjacent M-tiles, same N-tile) runs one leader-issued tcgen05.mma with
 # idesc.M = 2*BlockM; each CTA dequants only its own BlockN/2 half of the
-# shared weight tile. Requires warp-spec + BlockM=128 + BlockN=128 and
-# shape_m a multiple of 2*BlockM (the cluster pairs M-tiles).
+# shared weight tile. Requires warp-spec + BlockM=128 + BlockN=128.
+# Any shape_m works: the scheduler always launches full cluster pairs
+# (m_blocks counts pairs), so a grid-edge rank-1 CTA past shape_m still
+# runs the mainloop on TMA-zero-filled data and predicates its stores
+# (see test_tcgen05_cg2_odd_tile_grid_edge).
 # ---------------------------------------------------------------------------
 
 
@@ -469,6 +472,22 @@ def test_tcgen05_cg2_bitwise_matches_cg1(block_k, num_stages):
     out_cg1, out_cg2, _ = _run_cg2_pair(
         shape_m=512, shape_n=512, shape_k=1024,
         num_stages=num_stages, block_k=block_k,
+    )
+    assert torch.equal(out_cg1, out_cg2)
+
+
+@pytest.mark.parametrize("shape_m", [320, 384, 640])
+def test_tcgen05_cg2_odd_tile_grid_edge(shape_m):
+    """Odd M-tile counts leave the last cluster pair with a rank-1 CTA
+    whose tile is partially (M=320: tile 2 has 64 valid rows) or fully
+    (M=384/640: the tail tile is past shape_m) out of range. That CTA
+    must still run the full mainloop (TMA OOB reads fill zeros,
+    gmem_writer predicates stores) so the per-K-iter pair rendezvous
+    stays balanced -- an unpaired leader here deadlocks, and a mapping
+    bug corrupts the last valid tile."""
+    out_cg1, out_cg2, _ = _run_cg2_pair(
+        shape_m=shape_m, shape_n=512, shape_k=1024,
+        num_stages=4, block_k=128,
     )
     assert torch.equal(out_cg1, out_cg2)
 
