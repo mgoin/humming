@@ -53,6 +53,8 @@
 // All off by default -- enable only when investigating regressions.
 // #define TCGEN05_DEBUG_CONST_B 1
 // #define TCGEN05_CG2_DEBUG_DRAIN 1
+// #define TCGEN05_CG2_DEBUG_NO_RENDEZVOUS 1
+// #define TCGEN05_CG2_DEBUG_NO_FENCE 1
 // #define TCGEN05_DEBUG_SKIP_TMEM 1
 // #define TCGEN05_DEBUG_SCATTER_SENTINEL 1
 // #define TCGEN05_DEBUG_REGS_B_SENTINEL 1
@@ -147,15 +149,6 @@ public:
   // Rank of this CTA within its cluster pair (0 = leader = even CTA).
   CUDA_INLINE static uint32_t cg2_rank() { return blockIdx.x & 1u; }
 
-  // Whether this warp's N-slice belongs to this CTA's half of the
-  // weight tile. The 2SM atom assigns B cols [rank*BlockN/2, +BlockN/2)
-  // to CTA `rank`; with WarpN == 64 == BlockN/2 that is exactly the
-  // N-slice of warps with (warp_id % kNWarpsN) == rank.
-  CUDA_INLINE static bool cg2_warp_owns_half() {
-    constexpr uint32_t kNWarpsN = MAX(BlockShape::N / WarpShape::N, 1u);
-    return ((threadIdx.x / 32u) % kNWarpsN) == cg2_rank();
-  }
-
   // Per-K-iter pair rendezvous. Caller must have executed
   // `ctx.sync_math_threads()` after the scatter stores. One elected
   // math thread per CTA arrives on BOTH CTAs' pair mbar (local +
@@ -165,6 +158,12 @@ public:
   // workbook B.32) -- all waits are local.
   CUDA_INLINE void cg2_rendezvous() {
     if constexpr (kUseTcgen05Cg2) {
+#ifdef TCGEN05_CG2_DEBUG_NO_RENDEZVOUS
+      // Timing-only experiment: skip the pair handshake entirely.
+      // CORRECTNESS IS BROKEN (the leader can issue before the peer's
+      // scatter lands); used to bound the rendezvous cost.
+      return;
+#endif
       if (threadIdx.x == 0) {
         uint32_t peer_rank = cg2_rank() ^ 1u;
         void *peer_mbar =
@@ -278,21 +277,20 @@ public:
     // iter (same pattern as wmma.cuh:60 -- previously this was reusing
     // the base pointer and overwriting on every call).
     //
-    // cg2: each CTA only stages its own BlockN/2 half of the weight
-    // tile, so warps whose N-slice belongs to the peer CTA skip the
-    // dequant entirely (warp-uniform branch, no intra-warp
-    // divergence). This is the cg2 perf lever: per-CTA transform work
-    // halves.
-    if (!kUseTcgen05Cg2 || cg2_warp_owns_half()) {
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < WarpShape::N / 16; i++) {
-        uint32_t *regs_b_ptr = &regs_b_tmp[buffer_id][i * 4u];
-        uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, i);
-        uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
-        dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(
-            regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
-        arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
-      }
+    // cg2: under the n_warp_id() override (context.cuh) EVERY warp's
+    // regs_qb/scales/zp hold the CTA's OWN BlockN/2 half of the weight
+    // tile, so all warps dequant it (redundantly, like the cg1 path's
+    // M-warp redundancy). Gating half the warps off instead starves
+    // the SM of latency-hiding warps: measured 1.5x slower end-to-end
+    // (long_scoreboard 1.54 -> 3.20, barrier 0.44 -> 1.71 per inst).
+    PRAGMA_UNROLL
+    for (uint32_t i = 0; i < WarpShape::N / 16; i++) {
+      uint32_t *regs_b_ptr = &regs_b_tmp[buffer_id][i * 4u];
+      uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, i);
+      uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
+      dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(
+          regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
+      arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
     }
 #ifdef TCGEN05_DEBUG_REGS_B_SENTINEL
     // Overwrite regs_b_tmp with a per-(reg_index)-derived sentinel so
@@ -398,16 +396,18 @@ public:
       // 4-way bank conflict cheaper than divergent gating -- a
       // 1-warp-per-N-slice variant was measured 10% slower.
       //
-      // cg2: only the warps whose N-slice belongs to this CTA's half
-      // scatter (warp-uniform gate), and the half is COMPACTED at
-      // row 0 (n_base = 0) so the 2SM atom's per-CTA (N/2, K) B
-      // fragment starts at the descriptor address.
+      // cg2: EVERY warp holds the CTA's own BlockN/2 half (the
+      // n_warp_id() override in context.cuh feeds all warps the same
+      // N-slice), so all warps scatter it redundantly to the same
+      // addresses, COMPACTED at row 0 (n_base = 0) so the 2SM atom's
+      // per-CTA (N/2, K) B fragment starts at the descriptor address.
+      // Gating half the warps off instead starves the SM of
+      // latency-hiding warps (measured 1.5x slower end-to-end).
       constexpr uint32_t kNWarps = MAX(BlockShape::N / WarpShape::N, 1u);
       uint32_t warp_id_local = threadIdx.x / 32u;
       uint32_t n_warp_id_scatter = warp_id_local % kNWarps;
       uint32_t n_base = kUseTcgen05Cg2 ? 0u
                                        : n_warp_id_scatter * WarpShape::N;
-      bool scatter_active = !kUseTcgen05Cg2 || cg2_warp_owns_half();
       // Hardware Swizzle<3,4,3> applies to the absolute byte address:
       // the descriptor encodes (smem_base >> 4) in its start_address,
       // and the HW XOR'ing of bits [4, 7) uses bits [7, 10) of the
@@ -428,7 +428,6 @@ public:
           reinterpret_cast<uint32_t *>(regs_b_tmp[buffer_id]);
       uint32_t *smem_b_u32 =
           reinterpret_cast<uint32_t *>(&smem.b_dequant[buffer_id][0]);
-      if (scatter_active) {
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kCalls; i++) {
         PRAGMA_UNROLL
@@ -465,7 +464,6 @@ public:
           }
         }
       }
-      }  // scatter_active
     }
 #endif
     // The scatter above uses regular SMEM stores (non-async), so the
@@ -485,7 +483,9 @@ public:
     // provides the cross-CTA release; the leader's wait the acquire)
     // before the leader issues. This is the CUTLASS mixed-input-2SM
     // transform->MMA publication pattern.
+#ifndef TCGEN05_CG2_DEBUG_NO_FENCE
     if constexpr (kUseTcgen05Cg2) fence_proxy_async_shared_cta();
+#endif
     ctx.sync_math_threads();
     cg2_rendezvous();
 

@@ -144,3 +144,141 @@ Launcher/scheduler untouched (mc plumbing does it all).
 BlockM=128 (per-CTA TMEM layout = proven cg1 M=128 atom; BlockM=64
 would need the 2SM M=128 half-lane TMEM layout re-derivation),
 BlockN=128, warp-spec path only. BlockK any of {64,128,256}.
+
+## Milestone 4: cg2 SS kernel landed (29d24bf)
+
+See commit message: bit-identical to cg1 at production shapes, suites
+green (67p/24s/1xf) + 6 cg2 tests. B.32 mask bug fixed in the cg2 mma
+wrapper.
+
+## Milestone 5: warp-redundancy redesign of the cg2 dequant
+
+### Triage of the mid-flight dirty state (predecessor killed mid-edit)
+
+Found dirty: tcgen05_mma.cuh + context.cuh. Hunk-by-hunk decisions:
+
+* KEPT: `n_warp_id()` override in context.cuh (cg2 => every warp loads
+  the CTA's own BlockN/2 slice, id = pair rank). Verified the tcgen05
+  epilogue computes its own warp->TMEM mapping from raw warp_id
+  (tcgen05_mma.cuh:637-638) and reads smem.bias directly, so the
+  override only affects the B s2r loaders (loader_b/bs/bzp) as claimed.
+  smem_writer + loader_bias are not on the tcgen05 path.
+* KEPT: transform_b ungating (all warps dequant the CTA's own half).
+  Rationale from the predecessor's measurement: gating half the warps
+  off starves the SM of latency-hiding warps -- 1.5x slower end-to-end
+  (long_scoreboard 1.54 -> 3.20, barrier 0.44 -> 1.71 per inst).
+* FINISHED: the scatter path still called the deleted
+  cg2_warp_owns_half() (would not compile). Completed the redesign:
+  removed the scatter_active gate -- under cg2 ALL warps scatter the
+  CTA's own half redundantly to the same addresses (n_base = 0
+  compacted), 2x the cg1 path's benign store redundancy.
+* DISCARDED: `#define TCGEN05_CG2_DEBUG_NO_RENDEZVOUS 1` and
+  `#define TCGEN05_CG2_DEBUG_NO_FENCE 1` were left ENABLED -- these are
+  timing-only experiments that break correctness (leader can issue
+  before the peer's scatter lands). Restored to commented-out knobs.
+  The `#ifdef` plumbing for them is kept (harmless, consistent with the
+  file's other debug knobs).
+
+NOTE the perf implication of this redesign: with full warp redundancy
+each CTA performs the SAME total dequant+scatter instruction count as
+cg1 (8 warps x half tile vs 8 warps' slices of the full tile with 4-way
+M-warp store redundancy). The remaining cg2 levers are (a) multicast
+weight-code loads (one L2/DRAM fetch serves the pair), (b) leader-only
+MMA issue. Milestone 2 showed issue rate is saturated either way, so
+expect modest gains at best; measurement below decides.
+
+## Design note: composing cg2 with track B's TS-mode kernel (NOT implemented)
+
+Track B (prototype/b-ts-staging, tcgen05_ts_mma.cuh) swaps A<->B:
+MMA-A = weights from TMEM (kMmaM = BlockN = 128 rows), MMA-B =
+activations from SMEM descriptor (MmaN = BlockM). Stacking cta_group::2
+on it therefore mirrors the SS design across the A/B swap:
+
+### Pairing flips from mc_b to mc_a
+
+2x1SM M-splits the A operand across the pair: M_tot = 256 weight rows
+= CTA r supplies weight rows [r*128, (r+1)*128) FROM ITS OWN TMEM.
+So the CTA pair covers two ADJACENT N-TILES at the SAME M-TILE
+(n_block_id = 2n + rank, same m_block_id) -- the multi_cast_size_A=2
+pairing, opposite of SS-cg2's mc_b=2. Consequences:
+* Weights: per-CTA TMEM staging halves are DISJOINT weight tiles --
+  each CTA g2s-loads, dequants, and tcgen05.st's its OWN 128-row
+  weight tile exactly as in cg1 TS. NO weight multicast, no
+  half-tile compaction, loader_b/bs/bzp and the TS s2r contract
+  UNTOUCHED. (Much cleaner than SS-cg2's half-tile dequant.)
+* Activations: SHARED by the pair, but the 2x1SM BLayout N-splits the
+  B fragment: CTA r supplies MMA-B cols [r*BlockM/2, +BlockM/2) = its
+  half of the activation M-tile from its own SMEM at the (common)
+  b_desc address. A plain mc_a=2 multicast (full duplicate tile in
+  both CTAs) does NOT match: each CTA needs its HALF compacted at the
+  stage base. That is exactly SM100_TMA_2SM_LOAD semantics:
+  `cp.async.bulk.tensor.cta_group::2`, leader-issued, HW splits the
+  box across the pair's SMEM, ONE mbarrier arrival covers both halves.
+
+### Exact touch points in B's code
+
+1. config.py: `use_tcgen05_ts_cg2` forcing the mc_a=2-style pairing
+   (scheduler: adjacent n_block at same m_block; mc plumbing gives the
+   cluster launch + cluster-mapped mbar init, as SS-cg2 reused mc_b).
+2. memory/g2s_loader/loader_a.cuh:64-76 (`load_tma`): add a cg2 branch
+   -- leader-only issue of the 2SM TMA (new ptx wrapper
+   `tma_load_2d_cg2`), expect-tx on the LEADER's stage mbar = full-tile
+   bytes; box M = BlockM covering both halves. The peer's producer
+   thread issues nothing for A. NOTE: the peer CTA's math threads never
+   read A from SMEM (s2r skips loader_a under TCGEN05; only the
+   MMA-B descriptor reads it), and under cg2 only the LEADER issues the
+   MMA, so only the leader's stage-arrival mbar matters for RAW; the
+   peer's stage lifecycle needs an explicit review of consumer.arrive
+   accounting (stage refill WAR: peer's half is overwritten by the
+   NEXT leader-issued 2SM TMA -- the WAR gate must prove the pair MMA
+   retired, which the multicast cg2 commit (below) gives both CTAs).
+3. mma/tcgen05_ts_mma.cuh transform_b(): unchanged dequant + st (own
+   tile, own TMEM). The per-slot WAR gate (arrivals_/waits_ vs
+   tcgen05_ts_mbar[slot]) must become PAIR-scoped: slot commit switches
+   to the leader-issued multicast cg2 commit
+   (umma_arrive_multicast_2x1SM, mask 0x3) landing on BOTH CTAs' slot
+   mbars -- same drain pattern SS-cg2 uses for its epilogue, applied
+   per slot. Peer never commits (it issues no MMA).
+4. tcgen05_ts_mma.cuh run(): after ctx.sync_math_threads() +
+   fence_after_thread_sync, add the SS-cg2 pair rendezvous
+   (cg2_rendezvous: cluster-mapped mbar arrive local+remote, local
+   wait) so the peer's tcgen05.st of ITS half is complete before the
+   leader issues. Then leader-only elect-one issues
+   tcgen05.mma.cta_group::2 TS variant with idesc M = 256 (M_tot),
+   a_tmem = staging slot col (same col index in both CTAs by paired
+   alloc), b_desc = CTA-local activation half (fragment starts at row 0
+   of the descriptor -- holds because the 2SM TMA compacts each half at
+   the stage base). No {m0..m3} mask on the cg2 PTX (B.32).
+   OPEN QUESTION to verify on-die: whether tcgen05.st (TMEM store) by
+   the PEER is made visible to the leader's cta_group::2 MMA by
+   fence::before_thread_sync + cluster mbar arrive/wait alone --
+   CUTLASS's 2SM mixed-input kernels use exactly this pattern
+   (tmem_store -> fence -> cluster barrier -> leader mma), so expected
+   yes, but this is the first thing to synccheck.
+5. Epilogue final_regs_c_as_ptr(): UNCHANGED math -- 2x1SM CLayout
+   gives CTA r TMEM D = (M_tot/2 = its own 128 weight rows) x full
+   MmaN = BlockM cols, i.e. exactly the cg1 TS transposed D. Each CTA
+   drains its own D and writes its own (m_block, n_block) output tile.
+   Drain commit is already leader-multicast under (3)'s scheme (reuse
+   SS-cg2's epilogue drain).
+6. humming_ws.cuh alloc/dealloc: reuse SS-cg2's cta_group::2
+   alloc/relinquish/dealloc + pre-dealloc rendezvous verbatim; TMEM
+   cols = TS's kTcgen05TmemCols (16 + BlockM rounded) per CTA.
+
+### v1 constraints (inherit both prototypes' intersections)
+
+BlockN=128 (one 128-row tile per CTA, M_tot=256 <= cg2 idesc max),
+BlockM in {64,128} -> MmaN in {64,128} (cg2 N range ok), BlockK=64,
+WS-only, bf16 A, uint4 B, int zp. Even n-tile count per M handled by
+the mc scheduler's existing edge behavior (verify grid-edge odd-N
+behaves like mc_a=2 does today: unpaired tail tile must fall back or
+pad -- same question SS-cg2 answered for odd M-tiles).
+
+### Why this composition is attractive
+
+SS-cg2's dequant-halving lever died (warp starvation, milestone 5);
+TS-cg2's lever is DIFFERENT: the activation halves. Each CTA's
+SMEM stage traffic for A halves (BlockM/2 rows), and the pair
+fetches each activation tile from L2/DRAM once instead of twice --
+at large M activations dominate bandwidth, which is where cg1 TS is
+strongest. Weight-side work is untouched (already the TS win).

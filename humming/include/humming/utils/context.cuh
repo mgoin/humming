@@ -82,7 +82,20 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   CUDA_INLINE const uint32_t cluster_rank() { return blockIdx.x % kMultiCastSize; }
 
   CUDA_INLINE const uint32_t m_warp_id() { return M_WARPS == 1 ? 0 : (warp_id() / N_WARPS % M_WARPS); }
-  CUDA_INLINE const uint32_t n_warp_id() { return N_WARPS == 1 ? 0 : (warp_id() % N_WARPS); }
+  CUDA_INLINE const uint32_t n_warp_id() {
+    // tcgen05 cta_group::2: the 2SM atom N-splits B across the CTA
+    // pair, so EVERY warp of CTA `rank` loads/dequants the SAME
+    // N-slice (the CTA's own BlockN/2 half of the weight tile,
+    // slice id = pair rank). This feeds the s2r loaders (codes,
+    // scales, zero-points); all warps stay busy (2x the cg1 path's
+    // store redundancy, which the HW serialises cheaply -- idling
+    // half the warps instead was measured 1.5x slower end-to-end).
+    // The tcgen05 epilogue computes its own warp->TMEM mapping and
+    // bypasses smem_writer, so this override only affects the
+    // B-operand load path.
+    if constexpr (TuningConfig_::kUseTcgen05Cg2) return blockIdx.x & 1;
+    return N_WARPS == 1 ? 0 : (warp_id() % N_WARPS);
+  }
   CUDA_INLINE const uint32_t k_warp_id() { return K_WARPS == 1 ? 0 : (warp_id() / (M_WARPS * N_WARPS)); }
 
   CUDA_INLINE const uint32_t m_warp_offset() { return m_warp_id() * WarpShape::M; }
