@@ -198,9 +198,13 @@ public:
                 "supported (untested interaction with the b_dequant "
                 "staging buffer in the reduce union).");
 
-  // Dequant int4 (from regs_qb) -> bf16 (RMEM) -> SMEM b_dequant staging.
-  CUDA_INLINE
-  void transform_b(uint32_t buffer_id) {
+  // Dequant a subset of the kCalls dequant calls: i = i_first + ig *
+  // kIStepT for ig in [0, kNumCallsT). The classic path uses
+  // <kCalls, 1> with i_first = 0; the WS pipeline hands each warp a
+  // strided subset so the block-wide dequant work is partitioned
+  // instead of replicated.
+  template <uint32_t kNumCallsT, uint32_t kIStepT>
+  CUDA_INLINE void dequant_impl(uint32_t buffer_id, uint32_t i_first) {
     // For dtypes where ElementA == ElementB we'd skip dequant; tcgen05
     // bf16xbf16 isn't our target so just emit the int4 path inline.
     static_assert(!std::is_same<ElementA, ElementB>::value,
@@ -212,7 +216,8 @@ public:
     // iter (same pattern as wmma.cuh:60 -- previously this was reusing
     // the base pointer and overwriting on every call).
     PRAGMA_UNROLL
-    for (uint32_t i = 0; i < WarpShape::N / 16; i++) {
+    for (uint32_t ig = 0; ig < kNumCallsT; ig++) {
+      uint32_t i = i_first + ig * kIStepT;
       uint32_t *regs_b_ptr = &regs_b_tmp[buffer_id][i * 4u];
       uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, i);
       uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
@@ -220,6 +225,12 @@ public:
           regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
       arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
     }
+  }
+
+  // Dequant int4 (from regs_qb) -> bf16 (RMEM) -> SMEM b_dequant staging.
+  CUDA_INLINE
+  void transform_b(uint32_t buffer_id) {
+    dequant_impl<WarpShape::N / 16, 1>(buffer_id, 0);
 #ifdef TCGEN05_DEBUG_REGS_B_SENTINEL
     // Overwrite regs_b_tmp with a per-(reg_index)-derived sentinel so
     // the scatter writes bf16(my_n+1) at (my_n, my_k). If the (n,k)
@@ -251,31 +262,14 @@ public:
     fence_proxy_async_shared_cta();
   }
 
-  CUDA_INLINE
-  void run(uint32_t stage_id, uint32_t iter_id) {
-    uint32_t buffer_id = iter_id % 2;
-
-#ifdef TCGEN05_DEBUG_CONST_B
-    // Debug: ALL threads bulk-fill smem.b_dequant[buffer_id] with bf16(1.0),
-    // covering the FULL buffer (BlockN * BlockK bf16). Swizzle is
-    // irrelevant since the fill is constant. Output should equal
-    //   out[m, n] = sum_k A[m, k] * 1 = sum_k A[m, k]
-    // N-independent. Lets us isolate MMA + t2r + epilogue from dequant.
-    {
-      __nv_bfloat16 one = __float2bfloat16(1.0f);
-      __nv_bfloat162 one2 = __halves2bfloat162(one, one);
-      uint32_t one2_uint = *reinterpret_cast<uint32_t *>(&one2);
-      uint32_t *smem_b_u32 = reinterpret_cast<uint32_t *>(
-          &smem.b_dequant[buffer_id][0]);
-      constexpr uint32_t kTotalU32 =
-          BlockShape::N * BlockShape::K / 2;  // bf16 elems / 2 per uint32
-      uint32_t t = threadIdx.x;
-      PRAGMA_UNROLL
-      for (uint32_t i = t; i < kTotalU32; i += blockDim.x) {
-        smem_b_u32[i] = one2_uint;
-      }
-    }
-#else
+  // Scatter dequantised bf16 pairs of i-calls {i_first + ig * kIStepT}
+  // from regs_b_tmp[buffer_id] into smem.b_dequant[slot], K-chunk
+  // `iter_id`. The classic path uses <kCalls, 1> with slot ==
+  // buffer_id; the WS pipeline scatters a per-warp subset into a
+  // per-k-block slot.
+  template <uint32_t kNumCallsT, uint32_t kIStepT>
+  CUDA_INLINE void scatter_impl(uint32_t slot, uint32_t iter_id,
+                                uint32_t buffer_id, uint32_t i_first) {
     // ---- r2s of the just-dequantised B tile to swizzled SMEM ----
     //
     // Per PTX ISA 7.0 Table 32 (mma.m16n8k16.f16, B-matrix layout),
@@ -297,7 +291,7 @@ public:
     //   k = k_base + 2*(t%4) + (v_in_frag & 1) + 8 * (v_in_frag >> 1)
     {
       __nv_bfloat16 *smem_b_bf16 =
-          reinterpret_cast<__nv_bfloat16 *>(&smem.b_dequant[buffer_id][0]);
+          reinterpret_cast<__nv_bfloat16 *>(&smem.b_dequant[slot][0]);
       __nv_bfloat16 *regs_b_bf16 =
           reinterpret_cast<__nv_bfloat16 *>(regs_b_tmp[buffer_id]);
       // For BlockK > 64 we section-major-ise B in SMEM (same as A in
@@ -344,9 +338,11 @@ public:
       uint32_t *regs_b_u32_buf =
           reinterpret_cast<uint32_t *>(regs_b_tmp[buffer_id]);
       uint32_t *smem_b_u32 =
-          reinterpret_cast<uint32_t *>(&smem.b_dequant[buffer_id][0]);
+          reinterpret_cast<uint32_t *>(&smem.b_dequant[slot][0]);
+      static_assert(kNumCallsT <= kCalls, "scatter_impl: too many calls");
       PRAGMA_UNROLL
-      for (uint32_t i = 0; i < kCalls; i++) {
+      for (uint32_t ig = 0; ig < kNumCallsT; ig++) {
+        uint32_t i = i_first + ig * kIStepT;
         PRAGMA_UNROLL
         for (uint32_t frag_id = 0; frag_id < 2u; frag_id++) {
           uint32_t n = n_base + i * 16u + 8u * frag_id + (t / 4u);
@@ -382,6 +378,34 @@ public:
         }
       }
     }
+  }
+
+  CUDA_INLINE
+  void run(uint32_t stage_id, uint32_t iter_id) {
+    uint32_t buffer_id = iter_id % 2;
+
+#ifdef TCGEN05_DEBUG_CONST_B
+    // Debug: ALL threads bulk-fill smem.b_dequant[buffer_id] with bf16(1.0),
+    // covering the FULL buffer (BlockN * BlockK bf16). Swizzle is
+    // irrelevant since the fill is constant. Output should equal
+    //   out[m, n] = sum_k A[m, k] * 1 = sum_k A[m, k]
+    // N-independent. Lets us isolate MMA + t2r + epilogue from dequant.
+    {
+      __nv_bfloat16 one = __float2bfloat16(1.0f);
+      __nv_bfloat162 one2 = __halves2bfloat162(one, one);
+      uint32_t one2_uint = *reinterpret_cast<uint32_t *>(&one2);
+      uint32_t *smem_b_u32 = reinterpret_cast<uint32_t *>(
+          &smem.b_dequant[buffer_id][0]);
+      constexpr uint32_t kTotalU32 =
+          BlockShape::N * BlockShape::K / 2;  // bf16 elems / 2 per uint32
+      uint32_t t = threadIdx.x;
+      PRAGMA_UNROLL
+      for (uint32_t i = t; i < kTotalU32; i += blockDim.x) {
+        smem_b_u32[i] = one2_uint;
+      }
+    }
+#else
+    scatter_impl<WarpShape::N / 16u, 1>(buffer_id, iter_id, buffer_id, 0);
 #endif
     // The scatter above uses regular SMEM stores (non-async), so the
     // implicit __threadfence_block from the bar.sync/__syncthreads is
@@ -393,8 +417,15 @@ public:
     //     threads must NOT be awaited here -- they're busy doing
     //     gmem->smem loads).
     ctx.sync_math_threads();
+    issue_mma(stage_id, buffer_id, iter_id);
+  }
 
-    // ---- now build descriptors + issue tcgen05.mma ----
+  // Build the SMEM descriptors for K-chunk `iter_id` (A from
+  // smem.stages[stage_id].a, B from smem.b_dequant[slot]) and issue
+  // one tcgen05.mma from the elected thread of warp 0.
+  CUDA_INLINE
+  void issue_mma(uint32_t stage_id, uint32_t slot, uint32_t iter_id) {
+    // ---- build descriptors + issue tcgen05.mma ----
     // A descriptor reads from smem.stages[stage_id].a; advance the pointer by
     // `iter_id * kKChunkUint128` so this MMA processes K-chunk `iter_id`.
     // (tcgen05.mma.kind::f16 only sees 16 bf16 of K per issue; the
@@ -423,7 +454,7 @@ public:
     // advance crosses sections via `section_idx * kBSectionSizeUint128`
     // (where the B section size in uint128 is `BlockN * 8`).
     constexpr uint32_t kBSectionSizeUint128 = BlockShape::N * 8u;
-    int4 *b_ptr = &smem.b_dequant[buffer_id][0]
+    int4 *b_ptr = &smem.b_dequant[slot][0]
                   + section_idx * kBSectionSizeUint128
                   + iter_in_section * kKChunkUint128;
 
@@ -446,6 +477,42 @@ public:
     if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
       tcgen05_mma_ss_bf16(smem.tcgen05_tmem_col, a_desc, b_desc, idesc, scale_d);
     }
+  }
+
+  // ---- WS Transform->MMA pipeline helpers (Ctx::kUseWsPipeline) ----
+  //
+  // Role geometry: warp w keeps the n-slice its loader_b / loader_bs
+  // already deliver (n_base = (w % kNWarpsWs) * WarpN) and owns the
+  // strided i-call subset i = ws_i_first() + ig * kIStepWs, so the
+  // block-wide dequant + scatter is PARTITIONED across the math warps
+  // instead of replicated 4x (classic path). At the prod config
+  // (8 warps, kNWarps=2, kCalls=4) each warp owns exactly one i-call:
+  // 8x fewer stores per warp per K-iter and zero redundancy.
+  static constexpr uint32_t kNWarpsWs = MAX(BlockShape::N / WarpShape::N, 1u);
+  static constexpr uint32_t kMathWarpsWs = Ctx::kNumMathThreads / 32u;
+  static constexpr uint32_t kCallsWs = WarpShape::N / 16u;
+  static constexpr uint32_t kNumIGroupsWs = MAX(kMathWarpsWs / kNWarpsWs, 1u);
+  static constexpr uint32_t kIStepWs = MIN(kNumIGroupsWs, kCallsWs);
+  static constexpr uint32_t kCallsPerWarpWs = kCallsWs / kIStepWs;
+  static_assert(kCallsWs % kIStepWs == 0,
+                "TCGEN05 WS pipeline: i-calls must split evenly");
+
+  CUDA_INLINE uint32_t ws_i_first() {
+    // When kNumIGroupsWs > kCallsWs, groups beyond kCallsWs wrap and
+    // write redundantly (same bytes; benign, HW serialises).
+    return (ctx.warp_id() / kNWarpsWs) % kIStepWs;
+  }
+
+  // Dequant this warp's i-subset of K-chunk codes in regs_qb[buffer_id].
+  CUDA_INLINE void transform_ws(uint32_t buffer_id) {
+    dequant_impl<kCallsPerWarpWs, kIStepWs>(buffer_id, ws_i_first());
+  }
+
+  // Scatter this warp's i-subset into the per-k-block slot.
+  CUDA_INLINE void scatter_ws(uint32_t slot, uint32_t iter_id,
+                              uint32_t buffer_id) {
+    scatter_impl<kCallsPerWarpWs, kIStepWs>(slot, iter_id, buffer_id,
+                                            ws_i_first());
   }
 
   // Run the t2r and write the result directly into `smem.reduce` in

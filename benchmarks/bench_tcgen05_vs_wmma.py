@@ -47,7 +47,7 @@ def time_kernel(launch_fn, warmup=10, iters=50):
 
 def build_launcher(shape_m, shape_n, shape_k, mma_type, block_m=64,
                    block_n=128, block_k=64, num_stages=3,
-                   use_warp_spec=False):
+                   use_warp_spec=False, use_ws_pipeline=False):
     if mma_type == "tcgen05":
         # TCGEN05 path: BlockM ∈ {64, 128}, WarpM = BlockM/4.
         block_shape = (block_m, block_n, block_k)
@@ -90,7 +90,8 @@ def build_launcher(shape_m, shape_n, shape_k, mma_type, block_m=64,
         use_mbarrier=use_warp_spec,
         use_tma_bzp=False,
         has_bias=False, mma_type=mma_type,
-        use_tcgen05=(mma_type == "tcgen05"), use_stream_k=False,
+        use_tcgen05=(mma_type == "tcgen05"),
+        use_ws_pipeline=use_ws_pipeline, use_stream_k=False,
     )
 
     def launch():

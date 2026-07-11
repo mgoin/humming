@@ -88,6 +88,7 @@ def _run_tcgen05(
     group_size=128,
     use_tma=False,
     use_warp_spec=False,
+    use_ws_pipeline=False,
 ):
     """Construct a TCGEN05 kernel, run it on a random problem, and
     return (outputs, outputs_ref). Reference is computed BEFORE the
@@ -128,6 +129,7 @@ def _run_tcgen05(
         has_bias=has_bias,
         mma_type="tcgen05",
         use_tcgen05=True,
+        use_ws_pipeline=use_ws_pipeline,
         use_stream_k=False,
     )
 
@@ -427,5 +429,89 @@ def test_tcgen05_zp_bias(has_zero_point, has_bias):
         num_stages=2,
         has_zero_point=has_zero_point,
         has_bias=has_bias,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# use_ws_pipeline=True: warp-specialized Transform->MMA pipeline
+# (track a-ws-pipeline). Per-k-block b_dequant slot ping-pong gated by
+# t2m_full/t2m_empty mbarriers instead of the per-K-iter bar.sync.
+# Requires warp-spec + num_stages >= 3. Large-K cases guard the
+# deferred-G2S-release fix (commit-issue release raced the producer's
+# smem.a refill at K=4096).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_stages", [3, 4])
+@pytest.mark.parametrize("shape_k", [512, 2048])
+def test_tcgen05_ws_pipeline_prod(shape_k, num_stages):
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=256, shape_n=512, shape_k=shape_k,
+        block_shape=(128, 128, 128), warp_shape=(32, 64, 128),
+        num_stages=num_stages,
+        use_warp_spec=True,
+        use_ws_pipeline=True,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_tcgen05_ws_pipeline_bitexact_vs_classic():
+    """The pipeline reorders WORK, not MATH: both paths issue the same
+    tcgen05.mma sequence over the same dequantised values, so outputs
+    must be bit-identical. This is the strongest guard against
+    scheduling races (at K=4096 the fp32 reference comparison drowns
+    in bf16 accumulation noise -- both paths show identical ~0.7% of
+    cells beyond atol=0.5, max|err|=2.0)."""
+    kwargs = dict(
+        shape_m=512, shape_n=1024, shape_k=4096,
+        block_shape=(128, 128, 128), warp_shape=(32, 64, 128),
+        num_stages=4, use_warp_spec=True,
+    )
+    torch.manual_seed(7)
+    out_classic, ref = _run_tcgen05(use_ws_pipeline=False, **kwargs)
+    torch.manual_seed(7)
+    out_ws, ref2 = _run_tcgen05(use_ws_pipeline=True, **kwargs)
+    assert torch.equal(ref, ref2), "problem generation not deterministic"
+    assert torch.equal(out_classic, out_ws), (
+        "ws-pipeline output diverged from the classic tcgen05 path "
+        f"(max|diff|={(out_classic.float() - out_ws.float()).abs().max().item()})"
+    )
+
+
+@pytest.mark.parametrize(
+    "has_zero_point, has_bias",
+    [(True, False), (False, False), (True, True), (False, True)],
+)
+def test_tcgen05_ws_pipeline_zp_bias(has_zero_point, has_bias):
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=128, shape_n=256, shape_k=1024,
+        block_shape=(128, 128, 128), warp_shape=(32, 64, 128),
+        num_stages=4,
+        has_zero_point=has_zero_point,
+        has_bias=has_bias,
+        use_warp_spec=True,
+        use_ws_pipeline=True,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+@pytest.mark.parametrize(
+    "block_shape, warp_shape",
+    [
+        ((64, 128, 128), (16, 64, 128)),   # BlockM=64 (kIGroups=4)
+        ((128, 64, 128), (32, 64, 128)),   # BlockN=64 (kIGroups=8 > kCalls, wraps)
+        ((128, 128, 64), (32, 64, 64)),    # BlockK=64 (kWarpIters=4)
+        # BlockN=256 needs BlockK=64 to fit SMEM (workbook B.29).
+        ((128, 256, 64), (32, 64, 64)),    # BlockN=256 (kNWarps=4)
+    ],
+)
+def test_tcgen05_ws_pipeline_block_shapes(block_shape, warp_shape):
+    outputs, outputs_ref = _run_tcgen05(
+        shape_m=256, shape_n=512, shape_k=1024,
+        block_shape=block_shape, warp_shape=warp_shape,
+        num_stages=3,
+        use_warp_spec=True,
+        use_ws_pipeline=True,
     )
     _assert_close(outputs, outputs_ref)

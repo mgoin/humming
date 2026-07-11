@@ -227,4 +227,11 @@ public:
   // sync.  Only present when use_tcgen05 is set.
   IF_USE_TCGEN05(alignas(16) uint32_t tcgen05_tmem_col;)
   IF_USE_TCGEN05(alignas(8) uint64_t tcgen05_mbar;)
+  // Transform->MMA pipeline mbarriers (use_ws_pipeline only, but the
+  // 32 B are kept unconditionally under use_tcgen05 for simplicity).
+  // full[slot]: all math warps arrive (lane 0) after scattering a
+  // k-block into b_dequant[slot]; empty[slot]: tcgen05.commit arrives
+  // after the slot's MMAs retire.
+  IF_USE_TCGEN05(alignas(8) uint64_t tcgen05_t2m_full_mbar[kNumBDequantBuffers];)
+  IF_USE_TCGEN05(alignas(8) uint64_t tcgen05_t2m_empty_mbar[kNumBDequantBuffers];)
 };

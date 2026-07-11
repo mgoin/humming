@@ -128,3 +128,35 @@ New `TuningConfig.use_ws_pipeline` (default False) → `kUseWsPipeline`;
 new mainloop branch in humming_ws.cuh under
 `kMmaType == TCGEN05 && kUseWsPipeline`. Old SS path untouched so the
 existing test matrix keeps passing unchanged.
+
+## M3: implementation findings (2026-07-11)
+
+* First working version passed the prod config immediately (M=128
+  N=256 K=512) but two design iterations were forced by measurement:
+
+1. **Retire-wait on the MMA warp serializes the whole pipeline**
+   (measured 0.31-0.62x vs mma.sync, i.e. ~2.3x SLOWER than the
+   classic tcgen05 path). Warp 0 waiting its own commit (MMA
+   retirement) before releasing the G2S stage puts the full MMA
+   execution inside warp 0's per-stage loop; since warp 0 also
+   transforms, the next block's t2m_full then waits on it -> transform
+   and MMA exec alternate instead of overlapping. Removed.
+
+2. **Releasing the G2S stage at commit-ISSUE races the producer at
+   large K** (max|err|=4.0 of ref 536 at M=512 N=1024 K=4096; small
+   shapes pass). Unlike the classic path -- where the per-iter
+   bar.sync keeps the MMA queue empty so "issued" ~= "retired" -- the
+   pipeline can hold 8-16 MMAs in flight, so the producer's refill of
+   buffer T-2 (triggered by arrivals for stage T-1) can TMA over
+   smem.a still being read. Fix with zero added waits: warp 0 DEFERS
+   its math_mbar arrival for block T-1 until after its t2m_full wait
+   of block T. At that point transforms(T) completed, which required
+   empty[slot(T)] = commit(T-2) COMPLETION, and T-2's buffer is
+   exactly the one the producer refills next -> provably retired.
+   Costs nothing (the arrival is just delayed, producer keeps
+   kNumStages-2 of slack). Deadlocks at kNumStages=2 (static_assert +
+   Python assert; prod configs are stages>=3).
+
+* Also: the next-stage G2S wait must come AFTER the current stage's
+  arrivals (classic interleaves them at kWarpIters-2); the cross-stage
+  s2r prefetch moved after the arrive/wait pair accordingly.

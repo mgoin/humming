@@ -143,10 +143,28 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       }
       if (threadIdx.x == 0) {
         __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
+        if constexpr (TuningConfig::kUseWsPipeline) {
+          PRAGMA_UNROLL
+          for (uint32_t i = 0; i < SharedStorage::kNumBDequantBuffers; i++) {
+            // full[slot]: one lane-0 arrival per math warp after the
+            // slot's scatter; empty[slot]: one tcgen05.commit arrival
+            // after the slot's MMAs retire.
+            __mbarrier_init(&smem.tcgen05_t2m_full_mbar[i],
+                            TuningConfig::kNumMathThreads / 32);
+            __mbarrier_init(&smem.tcgen05_t2m_empty_mbar[i],
+                            /*expected_count=*/1);
+          }
+        }
       }
     }
     mbarrier_init_sync<((TuningConfig::kMultiCastSizeA * TuningConfig::kMultiCastSizeB) > 1)>();
     consumer.arrive(kNumStages);
+
+    // WS Transform->MMA pipeline state (kUseWsPipeline only; persists
+    // across tiles so slot parity / mbar phases stay consistent).
+    [[maybe_unused]] uint32_t ws_slot_ctr = 0;
+    [[maybe_unused]] uint32_t ws_full_phase[2] = {0, 0};
+    [[maybe_unused]] uint32_t ws_empty_phase[2] = {0, 0};
 
     while (scheduler.get_next_block()) {
       mma.zero_accum();
@@ -157,6 +175,97 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
       consumer.wait_stage<true>(kNumStages);
       s2r_pipe.load_stage_iter<true>(0, 0);
+
+      if constexpr (Ctx::kMmaType == MmaType::TCGEN05 && TuningConfig::kUseWsPipeline) {
+        // ---- WS Transform->MMA pipeline mainloop ----
+        // Per k-block: every math warp dequants + scatters its i-call
+        // subset of all kWarpIters K-chunks into b_dequant[slot]
+        // (slot = k_block % 2), then arrives t2m_full[slot]. Warp 0
+        // waits t2m_full, issues the slot's kWarpIters MMAs and
+        // tcgen05.commits to t2m_empty[slot]. All warps wait
+        // t2m_empty[slot] before REWRITING the slot 2 k-blocks later.
+        // No per-K-iter bar.sync anywhere.
+        static_assert(kNumStages >= 3,
+                      "WS pipeline: warp 0's deferred G2S release "
+                      "deadlocks the producer handshake at 2 stages");
+        const bool is_mma_warp = ctx.warp_id() == 0;
+        // Warp 0 releases the G2S stage of k-block T-1 only after the
+        // t2m_full wait of block T. By then transforms(T) completed,
+        // which required empty[slot(T)] = commit(T-2) COMPLETION -- and
+        // the buffer the producer refills on arrivals(T-1) is exactly
+        // T-2's (s -> s-1 refill pattern), whose MMAs have therefore
+        // provably retired. Releasing at commit *issue* instead
+        // produced rare wrong cells at K=4096 (TMA overwrote smem.a
+        // under a backlogged MMA queue).
+        uint32_t ws_prev_stage = 0;
+        bool ws_has_prev = false;
+        while (slice_iters) {
+          PRAGMA_UNROLL
+          for (uint32_t stage_id = 0; stage_id < kNumStages; stage_id++) {
+            uint32_t slot = ws_slot_ctr & 1u;
+            // WAR on the staging slot: the MMAs that read it (k-block
+            // ws_slot_ctr - 2) must have retired before rewriting.
+            if (ws_slot_ctr >= 2) {
+              mbarrier_wait(&smem.tcgen05_t2m_empty_mbar[slot],
+                            ws_empty_phase[slot]);
+              ws_empty_phase[slot] ^= 1u;
+            }
+            PRAGMA_UNROLL
+            for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
+              // Within-stage s2r prefetch only; the cross-stage
+              // prefetch happens after the arrivals below (waiting on
+              // the next stage's G2S before arriving would deadlock
+              // the producer handshake at kNumStages == 2).
+              if (warp_iter_id < Ctx::kWarpIters - 1) {
+                s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
+              }
+              mma.transform_ws(warp_iter_id % 2);
+              mma.scatter_ws(slot, warp_iter_id, warp_iter_id % 2);
+            }
+            // Publish the generic-proxy stores to the async proxy the
+            // MMA reads through, then signal slot readiness.
+            fence_proxy_async_shared_cta();
+            if (ctx.lane_id() == 0) {
+              mbarrier_arrive(&smem.tcgen05_t2m_full_mbar[slot]);
+            }
+            if (is_mma_warp) {
+              mbarrier_wait(&smem.tcgen05_t2m_full_mbar[slot],
+                            ws_full_phase[slot]);
+              ws_full_phase[slot] ^= 1u;
+              if (ws_has_prev) consumer.arrive(ws_prev_stage);
+              PRAGMA_UNROLL
+              for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
+                mma.issue_mma(stage_id, slot, warp_iter_id);
+              }
+              if (tcgen05_elect_one_sync()) {
+                tcgen05_commit_to_mbarrier(
+                    cast_smem_ptr_to_uint(&smem.tcgen05_t2m_empty_mbar[slot]));
+              }
+              // The G2S stage is released below with the MMAs possibly
+              // still in flight -- same producer-latency contract the
+              // classic path relies on (it arrives even earlier, before
+              // the last two K-iters' MMAs are issued). A retire-wait
+              // here was measured 2.3x slower: it serializes warp 0's
+              // next-block transform behind the MMA execution.
+            } else {
+              consumer.arrive(stage_id);
+            }
+            ws_prev_stage = stage_id;
+            ws_has_prev = true;
+            ws_slot_ctr++;
+            slice_iters--;
+            if (!slice_iters) break;
+            // Cross-stage prefetch of the next stage's first K-chunk
+            // (into regs_qb[0]) once its G2S landed.
+            consumer.wait_stage((stage_id + 1) % kNumStages);
+            s2r_pipe.load_stage_iter(stage_id, Ctx::kWarpIters);
+          };
+        };
+        // Warp 0's deferred release of the tile's final stage. Safe:
+        // the producer only acts on it after wait_math_epilogue, and
+        // the epilogue's tcgen05_mbar drain retires all MMAs first.
+        if (is_mma_warp && ws_has_prev) consumer.arrive(ws_prev_stage);
+      } else {
       mma.transform_b(0);
 
       while (slice_iters) {
@@ -180,6 +289,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           if (!slice_iters) break;
         };
       };
+      }
 
       consumer.wait_channel();
       s2r_pipe.load_channel(scheduler.slice_id);

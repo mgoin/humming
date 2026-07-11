@@ -164,6 +164,13 @@ class TuningConfig(BaseHummingConfig):
     # mma.sync / wgmma paths are unaffected.
     use_tcgen05: bool | None = None
 
+    # Warp-specialized Transform->MMA pipeline for the tcgen05 path:
+    # transform warps produce dequantised B into per-k-block
+    # smem.b_dequant slots gated by t2m mbarriers; warp 0 issues the
+    # MMAs. Replaces the per-K-iter bar.sync. Requires use_tcgen05 and
+    # use_warp_spec. Default False -- the shipped SS path is unchanged.
+    use_ws_pipeline: bool | None = None
+
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
         "num_threads",
         "num_math_threads",
@@ -187,6 +194,16 @@ class TuningConfig(BaseHummingConfig):
 
         if self.use_tcgen05 is None:
             self.use_tcgen05 = False
+
+        if self.use_ws_pipeline is None:
+            self.use_ws_pipeline = False
+        if self.use_ws_pipeline:
+            assert self.use_tcgen05, "use_ws_pipeline requires use_tcgen05"
+            assert self.use_warp_spec, "use_ws_pipeline requires use_warp_spec"
+            assert self.num_stages >= 3, (
+                "use_ws_pipeline requires num_stages >= 3 (warp 0's "
+                "deferred G2S release deadlocks at 2 stages)"
+            )
 
         if self.use_mbarrier is None:
             self.use_mbarrier = self.use_tma or self.use_warp_spec
