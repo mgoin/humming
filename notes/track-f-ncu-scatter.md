@@ -357,3 +357,97 @@ expect_tx/arrive accounting in g2s_pipeline.cuh and the producer's
   timing-dependent and the TS consumer has different timing; "not
   exposed at every geometry we can hit" is the honest claim. The B.37
   root cause should still be found before TS ships as default.
+  (Scripts preserved as benchmarks/trackb_stress_ts_bk64_race.py and
+  trackb_ncu_target_ts.py -- run them from a b-ts-staging checkout.)
+
+## F.6 Closed-form scatter: full-kernel effect (2026-07-11)
+
+`bench_track_f_baseline.py`, GPU 5, same protocol as F.1 (wmma
+baselines reproduce F.1 within noise -> same-GPU comparability).
+Closed form active at the BK128 prod-WS config:
+
+```
+shape            M     F.1 elem us   closed us   speedup
+Llama70B gate   16        230.63       203.24     1.13x
+Llama70B gate   128       232.24       205.32     1.13x
+Llama70B gate   512       789.27       691.04     1.14x
+Llama70B gate   2048     2839.00      2508.20     1.13x
+Llama70B down   128       398.45       351.16     1.13x
+Llama70B down   512       798.17       705.23     1.13x
+Llama70B down   2048     2790.03      2468.52     1.13x
+```
+
+A flat 1.13-1.14x at every M -- at the TOP of the predicted range
+("well under 15%" was pessimistic). NCU (same protocol, report
+/tmp/trackf_ss_closedform_m2048.ncu-rep) vs the F.2 element-wise
+profile: inst executed 2.17G -> 1.68G (-23%), elapsed cycles 5.33M ->
+4.71M (-11.6%), Compute SoL 57.3 -> 60.4%, stall total 5.05 -> 4.74
+cyc/issued (long_sb 1.54->1.41, barrier 0.44->0.37, wait 0.66->0.62);
+SMEM store wavefronts unchanged (244M) as expected -- pure address-
+math elimination. Note the removed inst share (23%) exceeded the
+static estimate (16%) -- ptxas also dropped spill/setup code with the
+16 freed address registers.
+
+CAVEAT: bench dtype is uint4 zp=T, whose BK128 prod config is
+B.37-broken (wrong outputs at HEAD too); timing is still apples-to-
+apples. Correct-config coverage: the BK128 SAFE_PROD_WS_CONFIG
+dtypes (uint3/5/6 zp=T, fp4/fp8) all pass the dtype suite with the
+closed form active. Implication vs track B: SS closed-form at down
+M=2048 = 2469us, within 3% of TS-mode's 2400us -- the TS advantage
+at large M is now mostly the (still-unfixed-in-SS) scatter
+instruction stream, so TS integration should re-baseline against
+closed-form SS before claiming wins.
+
+## F.7 NCU profile of track B's TS kernel (Llama70B-down M=2048)
+
+Protocol identical to F.2 (skip 2, count 1, --set full), GPU 1,
+b-ts-staging 52f39ef, TS config M128/BN128/BK64 s4 WS. Report:
+/tmp/trackf_ts_m2048.ncu-rep. Grid (148,1,1)x(256,1,1) -- 8 warps.
+
+```
+metric                    TS (now)    SS elem (F.2)   SS closed (F.6)
+Elapsed cycles            4.60 M         5.33 M          4.71 M
+Inst executed             636 M          2.17 G          1.68 G
+Compute (SM) SoL          24.6 %         57.3 %          60.4 %
+Memory SoL                11.0 %         56.8 %          n/a
+Tensor pipe active        17.6 %         15.5 %          17.7 %
+Issued IPC                0.95           2.37            n/a
+Achieved occupancy        12.5 %         18.75 %         18.75 %
+Registers/thread          232            168             168
+Dynamic SMEM/CTA          85.0 KiB       232.5 KiB       n/a
+SMEM st wavefronts        3.35 M         243.9 M         244.0 M
+SMEM ld wavefronts        39.4 M         147.7 M         n/a
+```
+
+Stall table (cyc per issued inst; total 8.39 vs SS 5.05/4.74):
+
+```
+long_scoreboard    4.05   (48.2%)   <- NEW LIMITER
+wait               1.65   (19.7%)
+selected           1.00
+barrier            0.92   (11.0%)
+branch_resolving   0.39
+short_scoreboard   0.18
+no_instruction     0.13
+```
+
+Warp stall sampling (162.9k samples): the top-4 sites are the
+producer/consumer mbarrier try_wait spin BRAs at 39.2% combined (SS:
+27.5%); next distinct site is the producer's zp/scale STS.128 pair
+(~2%); the rest is a flat ~0.7-0.8%/site spread over the unrolled
+math body (NOP padding sites -- no single hot instruction).
+
+WHERE THE BARRIER STALL WENT: the SS scatter + its 256-thread
+bar.sync are gone (SMEM stores down 73x; barrier stall in absolute
+cycles down ~40% even though its per-inst share rose). The TS kernel
+is now LATENCY-bound, not issue- or store-bound: 12.5% occupancy
+(1 CTA/SM, 8 warps), IPC 0.95, and half of all warp cycles waiting
+on L1TEX scoreboard (the s2r LDS of packed codes/scales feeding
+dequant->tcgen05.st, plus epilogue loads) with another 20% in
+mbar/tcgen05 waits. Guidance for tracks A/E: (a) track A's pipeline
+restructure attacks exactly the 39% spin + 1.65 wait -- highest
+leverage; (b) deeper s2r prefetch / wider LDS to cover the
+long-scoreboard gap is second; (c) the epilogue is NOT a major
+stall concentration at M=2048 in this profile -- track E's TMEM
+epilogue should be justified on other grounds (M=16 latency, SMEM
+budget), not on this stall table.
