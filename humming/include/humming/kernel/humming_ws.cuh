@@ -139,10 +139,14 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       if (threadIdx.x < 32) {
         uint32_t smem_addr =
             cast_smem_ptr_to_uint(&smem.tcgen05_tmem_col);
-        tcgen05_alloc<128>(smem_addr);
+        tcgen05_alloc<SharedStorage::kTcgen05TmemCols>(smem_addr);
       }
       if (threadIdx.x == 0) {
         __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
+#if HUMMING_USE_TCGEN05_TS
+        __mbarrier_init(&smem.tcgen05_ts_mbar[0], /*expected_count=*/1);
+        __mbarrier_init(&smem.tcgen05_ts_mbar[1], /*expected_count=*/1);
+#endif
       }
     }
     mbarrier_init_sync<((TuningConfig::kMultiCastSizeA * TuningConfig::kMultiCastSizeB) > 1)>();
@@ -200,7 +204,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       ctx.sync_math_threads();
       if (threadIdx.x < 32) {
         tcgen05_relinquish_alloc_permit();
-        tcgen05_dealloc<128>(smem.tcgen05_tmem_col);
+        tcgen05_dealloc<SharedStorage::kTcgen05TmemCols>(smem.tcgen05_tmem_col);
       }
     }
   }

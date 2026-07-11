@@ -1,6 +1,7 @@
 #pragma once
 
 #include <humming/mma/tcgen05_mma.cuh>
+#include <humming/mma/tcgen05_ts_mma.cuh>
 #include <humming/mma/wgmma.cuh>
 #include <humming/mma/wmma.cuh>
 
@@ -20,7 +21,12 @@ struct MmaSelector<MmaType::WGMMA, Ctx, ArithClass> {
 
 template <class Ctx, class ArithClass>
 struct MmaSelector<MmaType::TCGEN05, Ctx, ArithClass> {
-  using Type = TCGEN05<Ctx, ArithClass>;
+  // SS mode (dequant -> r2s scatter -> SMEM descriptor) by default;
+  // TS mode (dequant -> r2t -> TMEM operand) when the tuning config
+  // opts in via use_tcgen05_ts.
+  using Type = std::conditional_t<Ctx::TuningConfig::kUseTcgen05Ts,
+                                  TCGEN05_TS<Ctx, ArithClass>,
+                                  TCGEN05<Ctx, ArithClass>>;
 };
 
 template <class Ctx, class ArithClass>

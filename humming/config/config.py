@@ -163,6 +163,11 @@ class TuningConfig(BaseHummingConfig):
     # SMEM-resident bf16 operands. Default False -- the existing
     # mma.sync / wgmma paths are unaffected.
     use_tcgen05: bool | None = None
+    # TS-mode tcgen05 ("method 2"): dequantised weights staged in TMEM
+    # via tcgen05.st and consumed as the (A<->B swapped) TMEM operand.
+    # Requires weights/scales/zp packed by the TS contract packer
+    # (tests/ts_contract_pack.py for the prototype). Implies use_tcgen05.
+    use_tcgen05_ts: bool | None = None
 
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
         "num_threads",
@@ -176,6 +181,7 @@ class TuningConfig(BaseHummingConfig):
         "use_tma_bs": "kUseTmaBS",
         "use_tma_bzp": "kUseTmaBZP",
         "use_tcgen05": "kUseTcgen05",
+        "use_tcgen05_ts": "kUseTcgen05Ts",
     }
 
     def __post_init__(self):
@@ -185,8 +191,14 @@ class TuningConfig(BaseHummingConfig):
         if self.use_tma is None:
             self.use_tma = False
 
+        if self.use_tcgen05_ts is None:
+            self.use_tcgen05_ts = False
+
         if self.use_tcgen05 is None:
-            self.use_tcgen05 = False
+            self.use_tcgen05 = self.use_tcgen05_ts
+
+        if self.use_tcgen05_ts:
+            assert self.use_tcgen05, "use_tcgen05_ts requires use_tcgen05"
 
         if self.use_mbarrier is None:
             self.use_mbarrier = self.use_tma or self.use_warp_spec
