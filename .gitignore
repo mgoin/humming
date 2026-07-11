@@ -13,3 +13,4 @@ build
 
 # setuptools_scm generated
 humming/_version.py
+.humming-tmp/
