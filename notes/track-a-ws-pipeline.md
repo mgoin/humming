@@ -248,3 +248,39 @@ v6 bitmask mbar phases (arrays spilled at 185M
    empty-wait chain.
 4. Dedicated MMA warp (warp 0 not transforming) -- likely a wash now
    that transform is cheap, but untested.
+
+## M6: three-way bench (deliverable table, GPU0, merged tree 27a4146)
+
+`bench_ws_pipeline_baseline.py --three-way` -- mma.sync heuristic vs
+classic tcgen05 SS (BlockM=128@M>=128/64 else, BN128, BK128, s4, WS)
+vs the same geometry + use_ws_pipeline:
+
+```
+shape                M   mma.sync   tcg-clas    tcg-wsp  wsp/clas   wsp/mma
+Llama70B gate       16     166.13     229.89     200.96     1.14x     0.83x
+Llama70B gate      128     329.63     231.83     203.45     1.14x     1.62x
+Llama70B gate      512    1062.19     795.14     696.09     1.14x     1.53x
+Llama70B gate     2048    3996.90    2833.27    2478.20     1.14x     1.61x
+Llama70B down       16     280.66     393.29     344.68     1.14x     0.81x
+Llama70B down      128     280.85     397.92     349.18     1.14x     0.80x
+Llama70B down      512    1133.38     796.38     689.93     1.15x     1.64x
+Llama70B down     2048    3883.89    2779.90    2387.37     1.16x     1.63x
+```
+
+Uniform 1.14-1.16x over classic SS at every M on both shapes (the
+pipeline removes a per-iter cost, so the ratio is M-independent).
+mma.sync still wins at M=16 both shapes and down M=128.
+
+## M7: synccheck finding (tool artifact, pre-existing)
+
+compute-sanitizer synccheck on the ws-pipeline kernel reports "Barrier
+error: divergent thread(s) in block" + the kernel then aborts
+(unspecified launch failure). CONTROL: the SHIPPED classic warp-spec SS
+path (test_tcgen05_warp_spec, untouched code) fails identically
+(13696 errors). Cause: the partial-block named barrier
+`bar.sync 1, kNumMathThreads` (producer warps legitimately absent) trips
+synccheck's divergence instrumentation -- pre-existing for the whole
+warp-spec tcgen05 family, NOT a pipeline regression. Track B's clean
+synccheck run was over their TS suite whose barrier is also named but
+apparently tolerated at their config; our correctness bar stays the
+suite + the bit-exact-vs-classic test.
