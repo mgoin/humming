@@ -86,4 +86,112 @@ Predecessor died mid-flight with uncommitted edits. Triage decisions:
   `!(kHasInputScale && kInputScaleGroupSize == 0)` for kAccStages > 1.
 * GPU 4 is NOT exclusive right now: root runs a 128 GB
   `vLLM-Omni::DiffusionWorker-0` on it. Perf numbers this session may be
-  noisier than Milestone 1's.
+  noisier than Milestone 1's. (Verified idle-resident during the
+  Milestone-3 measurements below: full 2032 MHz clocks, my kernel the
+  only one executing.)
+
+## Milestone 3: 4x acc1 regression found + fixed (2026-07-11)
+
+Predecessor's plumbing regressed the SHIPPED path (acc_stages=1) 4x:
+Llama70B-down M=2048 went 2781 -> 11210 us. NOT environment: pristine
+0954db9 in a /tmp worktree measured 2780.6 us in the same session.
+
+Root cause: `uint32_t mbar_phase_[kAccStages]` indexed by the runtime
+member `acc_buf_`. Dynamic indexing of a member array demotes the whole
+TCGEN05 object (including its hot state) to a local-memory stack frame:
+`cuobjdump -res-usage` shows STACK 16 -> 1104 B between the fast and
+slow cubins, REG unchanged at 168. Fix (commit 8c71b67): scalar
+`mbar_phase_bits_` bitfield + `accum_buf()`/`accum_col_off()` accessors
+that fold to compile-time 0 at kAccStages==1.
+
+After fix, same GPU, same session (Llama70B down M=2048):
+
+```
+a1s4 (shipped)        2778.6 us   (Milestone-1 baseline: 2777.9)
+a1s3                  2844.4 us   (s3 costs +2.4% -- acc2 needs the
+                                   32KB dedicated reduce, s4 does not
+                                   fit: cuFuncSetAttribute fails)
+a2s3 NO_DEFER         2892.4 us   (+1.7% rotation plumbing overhead)
+```
+
+LESSON for any future TMEM multi-staging work: never dynamically index
+member arrays in the MMA/pipeline objects; nvcc demotes the aggregate.
+
+## Milestone 4: deferred drain debugging -- missing tcgen05.wait::ld
+
+Enabling the deferred drain (NO_DEFER off) corrupted output with a
+crisp pattern: at M=2048 4096x4096 exactly ~148 bad tiles = each CTA's
+SECOND-TO-LAST tile (strided persistent scheduling); single-tile-CTA
+shapes (M=512: 128 tiles < 148 CTAs) were RANDOMLY ~70-90% bad,
+run-to-run varying. Bad tiles held mostly-right data with ~half the
+elements per row wrong and a time-gradient across rows.
+
+Bisection matrix (M=512 / M=1024, 3 runs each):
+* NO_DEFER (drain immediately, new plumbing): clean.
+* Test A (defer by one tile, drain BEFORE consumer.arrive -- zero
+  producer overlap): BAD (worse: 119/128).
+* Test C (pending/snapshot/set_accum_buf machinery, drain in the SAME
+  iteration): clean -- machinery correct, so the corruption depended
+  only on WHERE in the instruction stream the drain ran.
+
+ROOT CAUSE: the t2r drain reads `tmp` immediately after
+`tcgen05_ld_32x32b_x32`, and NO `tcgen05.wait::ld` exists anywhere in
+humming. tcgen05.ld is ASYNC -- destination registers are undefined
+until the wait. The SHIPPED SS epilogue has the same latent UB and
+passes tests through SASS-scheduling luck; the deferred builds shuffle
+the schedule and expose it. (The predecessor's tmem_ld_bench.py itself
+uses tcgen05.wait::ld -- the pattern was known.)
+
+Fix: `tcgen05_wait_ld()` after each t2r in drain_accum.
+
+CROSS-TRACK: track B's TS kernel drains TMEM through the same
+tcgen05.ld path -- if it doesn't wait::ld it has the same latent bug
+masked by luck. Flag when merging b-ts-staging.
+
+After the wait::ld fix the corruption became deterministic and moved:
+single-tile/loop-exit drains CLEAN, but each CTA's second-to-last tile
+(the drain issued in the LAST loop iteration, i.e. the one whose
+smem.reduce is overwritten by the loop-exit drain right behind it)
+stayed bad, with ZERO-filled bands. Two more latent bugs:
+
+* LATENT BUG 2: no `fence.proxy.async.shared::cta` anywhere on the
+  TMA-C store path -- smem.reduce is written through the generic proxy
+  and read by cp.async.bulk.tensor through the async proxy. Fixed in
+  gmem_writer.write_tma.
+* LATENT BUG 3: `tma_commit_store_group()` had ZERO call sites, so
+  EVERY `tma_wait_store_group` in the codebase waits on zero committed
+  groups = no-op. The shipped flow survives because a full mainloop
+  separates consecutive smem.reduce writers; back-to-back deferred
+  drains do not. Fixed: commit after store issue in write_tma + a
+  math barrier after the deferred-path waits (the wait is per-thread;
+  without the barrier the OTHER math warps can overwrite smem.reduce
+  early). This also silently un-no-ops the stream-k TmaC waits.
+
+With all three fixes the deferred drain is CLEAN: 0 bad tiles x 3 runs
+at M in {128, 512, 1024, 2048, 2112} on 4096x4096 (+128x128x4096).
+
+## Milestone 5: Part-1 verdict on the SS kernel -- honest negative
+
+Perf with all fixes (GPU 4, 50 iters, DiffusionWorker idle-resident):
+
+```
+shape              a1s4        a1s3        a2s3(deferred)
+L70B-down M=2048   2773.7 us   2845.3 us   2883.4 us
+L70B-down M=4096   5543.5 us   5680.4 us   5756.9 us
+4096^2    M=2048    235.5 us    242.1 us    244.1 us
+4096^2    M=256      61.9 us     63.8 us     64.0 us
+```
+
+* Shipped a1s4 is UNCHANGED by the three correctness fixes (2773.7 vs
+  2777.9 baseline) -- they are free.
+* Deferred rotation LOSES everywhere on the SS kernel: +1.3% vs a1s3
+  at identical stages, and it cannot use s4 (dedicated reduce +32KB
+  exceeds max SMEM), so its real deficit vs shipped is ~4%.
+* Why no win: the deferred drain still runs INLINE in the math
+  threads; it only overlaps PRODUCER loads, and at these shapes the
+  producer is not the bottleneck (mainloop-dominated; s4->s3 alone
+  costs 2.4%). Epilogue-exposed M=256 is single-wave (1 tile/CTA), so
+  rotation has nothing to overlap by construction.
+* REMAINING HOPE for rotation: the TS kernel (BK64 s4, ~81KB SMEM),
+  where +32KB dedicated reduce still fits (~113KB < 116KB 2-CTA
+  bound) and the epilogue is the top headroom (track B's notes).

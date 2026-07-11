@@ -213,7 +213,9 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         // overlap the t2r + gmem write below.
         mma.commit_accum();
         mma.wait_accum();
-#define TCGEN05_ACC2_NO_DEFER 1
+// Bisection switch: define to keep shipped drain ordering while using
+// all the new storage/alloc/rotation plumbing.
+// #define TCGEN05_ACC2_NO_DEFER 1
 #ifdef TCGEN05_ACC2_NO_DEFER
         // Bisection mode: shipped ordering (drain this tile now, arrive
         // after), keeping the new storage/alloc/rotation plumbing.
@@ -231,7 +233,14 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           epilogue.seek(p_expert, p_m_blk, p_n_blk, p_shape_m, p_m_off);
           epilogue.set_streamk_state(p_scount, p_sid, p_lockoff);
           epilogue.call(mma.drain_accum());
-          if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
+          // The TMA-store wait is PER-THREAD (only the issuing thread
+          // tracks the group); the barrier keeps the other math warps
+          // from overwriting smem.reduce with the NEXT drain before
+          // the store engine has read this one.
+          if constexpr (TuningConfig::kUseTmaC) {
+            tma_wait_store_group<0, true>();
+            ctx.sync_math_threads();
+          }
           pending = false;
         }
         if (scheduler.slice_count > 1) {
@@ -244,7 +253,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           epilogue.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.current_shape_m, scheduler.m_offset);
           epilogue.set_streamk_state(scheduler.slice_count, scheduler.slice_id, scheduler.locks_offset);
           epilogue.call(mma.drain_accum());
-          if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
+          if constexpr (TuningConfig::kUseTmaC) {
+            tma_wait_store_group<0, true>();
+            ctx.sync_math_threads();
+          }
         } else {
           pending = true;
           pending_buf = acc_buf;

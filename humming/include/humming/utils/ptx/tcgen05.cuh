@@ -460,6 +460,14 @@ CUDA_INLINE void tcgen05_fence_view_async_tmem_store() {
   asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
 }
 
+CUDA_INLINE void tcgen05_wait_ld() {
+  // tcgen05.ld is ASYNC: its destination registers are undefined until
+  // this wait retires. Reading them earlier is UB that happens to be
+  // masked by SASS scheduling in some builds -- the deferred-epilogue
+  // build exposed it as nondeterministic half-tile corruption.
+  asm volatile("tcgen05.wait::ld.sync.aligned;\n" ::: "memory");
+}
+
 
 // ============================================================================
 // TMEM→register load (t2r) for the epilogue

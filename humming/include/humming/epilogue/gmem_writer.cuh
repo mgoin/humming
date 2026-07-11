@@ -123,18 +123,36 @@ public:
   CUDA_INLINE
   void write_tma(uint32_t slice_id, uint32_t slice_count) {
     static_assert(!kIsIndexedGemm);
+    // smem.reduce was written through the GENERIC proxy (st.shared);
+    // cp.async.bulk.tensor reads it through the ASYNC proxy. PTX
+    // requires fence.proxy.async between them (issued after the
+    // math-thread sync that covers all writers). Without it the TMA
+    // engine can read stale SMEM -- observed as zero-filled bands in
+    // the deferred tcgen05 drain (notes Milestone 4); the shipped
+    // ordering only worked by scheduling luck.
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     constexpr uint32_t count = BlockShape::N / 64;
     const uint32_t block_idx = threadIdx.x;
     const uint32_t smem_offset = BlockShape::M * 64 / 8 * block_idx;
     const uint32_t col_offset2 = col_offset + 64 * block_idx;
+    // NOTE: cp.async.bulk.wait_group only tracks COMMITTED groups; the
+    // commit_group below is what makes every later
+    // `tma_wait_store_group` actually wait. It was missing entirely
+    // (tma_commit_store_group had zero call sites), so those waits
+    // were no-ops -- masked in the shipped flow by the full mainloop
+    // between consecutive smem.reduce writers, exposed by back-to-back
+    // deferred drains (notes Milestone 4).
     if (block_idx < count) {
       if constexpr (!kUseStreamK) {
         tma_store_2d(ctx.smem.reduce + smem_offset, tensor_map_ptr, col_offset2, row_offset);
+        tma_commit_store_group();
       } else if (slice_count == 1 || slice_id == 0) {
         tma_store_2d(ctx.smem.reduce + smem_offset, tensor_map_ptr, col_offset2, row_offset);
+        tma_commit_store_group();
         if (slice_count > 1) tma_wait_store_group<0>();
       } else {
         tma_reduce_add_2d(ctx.smem.reduce + smem_offset, tensor_map_ptr, col_offset2, row_offset);
+        tma_commit_store_group();
         if (slice_id != slice_count - 1) tma_wait_store_group<0>();
       }
     }

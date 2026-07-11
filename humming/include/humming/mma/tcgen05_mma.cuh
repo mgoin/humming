@@ -609,6 +609,11 @@ public:
 #else
       uint32_t addr = base_addr + ni * 32u;
       tcgen05_ld_32x32b_x32(addr, tmp);
+      // tcgen05.ld is ASYNC -- `tmp` is undefined until wait::ld.
+      // The shipped kernel omitted this and got away with it through
+      // SASS scheduling luck; the deferred-drain build exposed it as
+      // nondeterministic half-tile corruption (see notes Milestone 4).
+      tcgen05_wait_ld();
       // No per-ni `tcgen05_fence_view_async_tmem_store()` -- the
       // outer commit+mbar_wait that drained the K-loop MMA chain
       // (above) already ordered TMEM writes vs these reads, and
