@@ -190,3 +190,170 @@ Prediction from F.2 fact 3: removes ~30 of ~195 inst per K-iter body
 (0.59 issue/cycle/smsp; stalls dominated by long_sb+wait+barrier =
 52%), so wall-time gain should be well under 15%. HYPOTHESIS (task):
 second-order vs the bar.sync serialization.
+
+Generated SASS confirms the design: per K-iter the scatter is exactly
+16 `STS [Rbase{0,1}+imm]` off two base registers with compile-time
+immediates, zero per-store ALU (verified in
+/tmp/trackf_cache/c00e90c3.../kernel.cubin; ordering STS -> BAR.SYNC
+-> UTCHMMA -> MEMBAR intact).
+
+## F.4 Microbench: the workbook's 2052-cyc r2s figure was an artifact
+
+`benchmarks/bench_r2s_vs_r2t.cu` extended with two variants (B300,
+1 CTA, 256 threads, 10000 iters):
+
+```
+Path 1  (r2s synthetic addr + bar.sync)   : 2052.1 cyc/iter
+Path 1' (r2s synthetic, no bar)           : 2048.1 cyc/iter
+Path 1p (r2s PRODUCTION addressing + bar) :  292.0 cyc/iter   NEW
+Path 1c (r2s CLOSED-FORM addr + bar)      :  143.5 cyc/iter   NEW
+Path 2a (r2t 8-warp + fence)              :   43.0 cyc/iter
+Path 2b (r2t 2-warp + fence + bar.sync)   :   53.5 cyc/iter
+```
+
+The original Path-1 kernel used a synthetic offset pattern
+`(tid*16+s+it*7) & 1023` whose lane stride is 16 words == 2 banks
+apart -> ~16-way intra-warp bank conflicts. Humming's REAL scatter is
+conflict-free by swizzle construction (F.2 fact 1), and costs 292
+cyc/iter, not 2052. Consequences:
+
+* The Path-2 doc's "r2s is ~50x more expensive than r2t" TL;DR is
+  wrong: the true primitive gap is 292/43 = 6.8x (old addressing) or
+  143/43 = 3.3x (closed form). The TS-mode pipeline-restructure
+  argument survives (Swordfish errata already said the restructure is
+  where the cycles are), but the r2s-primitive-cost motivation is
+  much weaker than documented.
+* The closed form halves the isolated scatter primitive (292 -> 143
+  cyc/iter, 2.03x) by eliminating ~2 LOP3 per store.
+
+RE-MEASUREMENT (same GPU 5, final committed bench binary, stable
+across 3 runs at 2032 MHz): Path 1 = 4449, Path 1' = 4446, Path 1p
+= 780, Path 1c = 143.5, Path 2a = 43.0, Path 2b = 53.5 cyc/iter.
+Paths 1c/2a/2b reproduce the table above exactly; Paths 1/1p read
+~2.2x/2.7x HIGHER than first recorded (cause unknown -- possibly an
+earlier binary build; the first-recorded 2052/292 were not
+re-reproducible). Use the re-measured numbers: closed form cuts the
+in-kernel-style r2s primitive 780 -> 143.5 (5.4x); r2t remains 3.3x
+cheaper than the best r2s (143.5 vs 43). The qualitative conclusions
+(synthetic 16-way-conflict figure was an artifact; restructure, not
+raw primitive cost, is TS-mode's main win) stand.
+
+## F.5 The BlockK=64 WS+TMA corruption: a pre-existing producer-side
+## race that the closed-form scatter amplifies (2026-07-11)
+
+The closed-form scatter is address-exact (compile-time
+`static_assert scatter_closed_form_matches()` enumerates every
+(t, warp, iter, i, frag, pair) against the element-wise formula), yet
+enabling it at the SAFE_PROD_WS_CONFIG BlockK=64 configs produced
+wrong outputs. Full experiment matrix, uint4 zp=T (512,512,4096)
+block (128,128,64) s3 unless noted, GPU 5 (B300), bf16-noise
+baseline max|err| = 2.0:
+
+```
+E1  element-wise BK64, WS+TMA / WS-only / plain     : 2.0 everywhere (x12 runs
+                                                      incl. E4 stress) CLEAN
+E2  closed-form  BK64, WS+TMA                       : 356 / 343 / 374  FAIL
+E2  closed-form  BK64, WS-only (cp.async), plain    : 2.0              CLEAN
+E2b closed-form  BK64, WS+TMA, seeded identical x2  : NOT bit-exact ->
+    genuine nondeterministic race. 1.77% bad cells spread over ALL
+    16 output tiles; within a tile bad cols cluster in n%128 = 32..63.
+E3  E2 + fence.proxy.async after scatter            : 441 / 295 / 370  FAIL
+    (TCGEN05_DEBUG_SCATTER_PROXY_FENCE -- does NOT fix)
+E5a closed-form  BK128 s4 uint4 zp=T (B.37 broken)  : 313 / 295 / 215  FAIL
+E5a closed-form  BK128 uint4 zp=F s4, uint8 zp=T s3 : 2.0              CLEAN
+E5b element-wise BK128 s4 uint4 zp=T (HEAD-equiv)   : 4.0 / 2.0 / 2.0  MARGINAL
+    (B.37 documented this config failing outright at the same shape --
+    it is WHY uint4 was demoted to BK64 in SAFE_PROD_WS_CONFIG)
+```
+
+Plus predecessor probes (per staged code comments): MMA-drain before
+every scatter (TCGEN05_DEBUG_DRAIN_PER_ITER) and defer-arrive-until-
+MMA-drain at stage release (TCGEN05_DEBUG_DEFER_ARRIVE) do NOT fix
+E2 either.
+
+**Verdict: this is NOT a bug in the closed-form scatter and NOT the
+scatter->mma visibility gap. It is the pre-existing workbook-B.37
+WS+TMA race** ("disabling TMA alone fixes it" -- exactly reproduced
+here: WS-only is clean at identical geometry). The race lives on the
+producer (TMA) side of the WS pipeline; the closed-form scatter only
+compresses math-warp K-iter time (~30 fewer inst/iter), which shifts
+consumer timing enough to pull BK64 s3 into the failing envelope that
+BK128 s4 uint4 zp=T was already inside at HEAD.
+
+Ruled out by direct experiment:
+* b_dequant ping-pong WAR vs async MMA reads (DRAIN_PER_ITER no-fix)
+* A-stage release WAR (consumer.arrive at kWarpIters-2 vs in-flight
+  MMA descriptor reads; DEFER_ARRIVE no-fix) -- track B's latent
+  audit item is NOT this bug (still worth fixing for hygiene)
+* generic->async proxy visibility of the scatter STS
+  (SCATTER_PROXY_FENCE no-fix). NOTE: the fence is still formally
+  required by the PTX memory model -- transform_b's
+  fence_proxy_async_shared_cta() executes BEFORE the deferred
+  scatter stores it is supposed to publish (SASS: STS -> BAR.SYNC ->
+  UTCHMMA -> MEMBAR per K-iter, membar on the WRONG side of the
+  UTCHMMA). Latent hazard; fix independent of this race.
+* BOTH drain probes together (E7: DRAIN_PER_ITER + DEFER_ARRIVE
+  simultaneously, closed form on): 322 / 370 / 328 -- STILL FAILS.
+  This is decisive: with a full MMA drain before every scatter and
+  before every stage release there is no in-flight UTCHMMA read left
+  to race with, yet the output is still corrupt. The corruption is in
+  the CONSUMED INPUT DATA (A / B-codes / scales / zp as delivered by
+  the TMA producer), not in any math-side WAR.
+* compute-sanitizer racecheck (closed form BK64 WS+TMA): 62,467
+  errors, all displayed records ONE site pair -- WAR at stage-SMEM
+  bytes (~0x5500-0x6100 region), Read = math-warp thread in the
+  dequant block (SASS ~+0x4150), Write = producer thread 256
+  `@!P0 STS.128 [R3+0x6100]` (SASS +0x1610: an LDG.E.128 ->
+  STS.128 -> ARRIVES.LDGSTSBAR path, i.e. the producer's NON-TMA
+  side-channel for zp/scales when use_tma_bzp=0). Racecheck may not
+  fully model the mbar handshake (hazards also present in passing
+  runs; corruption itself vanishes under sanitizer timing, err=2.0),
+  so treat as a pointer, not proof. Full log:
+  /tmp/trackf_racecheck_full.log; SASS: /tmp/trackf_bk64_sass.txt.
+* NOT the math_mbar protocol shape: expected count =
+  kNumMathThreads/32 (all math warps), consumer.arrive fires from
+  lane 0 of every math warp -- accounting is consistent.
+
+Best remaining hypothesis: premature stage-ready flip on the TMA
+side -- e.g. `tma_commit_mbarrier(&load_mbar[stage], load_bytes.x)`
+expect_tx undercounting vs what actually lands (the producer ALSO
+does LDG->STS.128 zp/scale stores into the same stage between
+mbarrier ops), so the consumer's wait_stage returns while part of
+the stage (zp/scales or B codes) is still in flight. That is
+nondeterministic, TMA-specific, dtype-dependent (zp=T adds
+transfers), BlockK-dependent (transfer sizes), and consumer-speed
+dependent (faster math = reads closer behind the premature flip) --
+matches every observation including B.37's BK128 uint4 zp=T failure
+with the SLOW element-wise scatter. Next probe for a future session:
+TCGEN05_DEBUG_CONST_B (output = rowsum(A), independent of B/zp/bs)
+to split A-path vs B/zp/bs-path corruption; then audit load_bytes
+accounting in g2s_pipeline.cuh::load_stage vs the loaders' actual
+TMA + STS traffic at (uint4, zp=T, BK64, s3).
+
+Mitigation shipped on this branch: `kUseClosedFormScatter =
+BlockShape::K >= 128` keeps the element-wise scatter at BlockK=64
+(12/12 clean) and enables the closed form at BlockK>=128, where the
+only affected config (uint4 zp=T s4) is already excluded from
+SAFE_PROD_WS_CONFIG by B.37. Root cause of the producer-side race
+remains OPEN -- next probes should target the TMA mbarrier
+expect_tx/arrive accounting in g2s_pipeline.cuh and the producer's
+`load_stage` overwrite timing, not the math-warp side.
+
+### Is track B (TS mode) exposed? NO (LOUD VERDICT)
+
+* Architecturally: the TS kernel (tcgen05_ts_mma.cuh) has no
+  generic-proxy STS into descriptor-read SMEM at all -- dequant goes
+  regs -> tcgen05.st -> TMEM with the documented
+  fence::before_thread_sync / bar.sync / fence::after_thread_sync
+  pattern; activations are TMA(async proxy) -> act_desc(async proxy)
+  with mbarrier ordering.
+* Empirically (GPU 1, /tmp/wt-b-check @ origin/prototype/b-ts-staging
+  52f39ef): tests/test_tcgen05_ts.py 10/10 x6 consecutive runs, AND a
+  targeted stress at the EXACT failing SS geometry -- uint4 zp=T
+  (512,512,4096) block (128,128,64) s3 and s4, WS+TMA, 5 reps each:
+  max|err| = 2.0 on all 10 runs (script:
+  /tmp/wt-b-check/benchmarks/stress_ts_bk64_race.py).
+* Caveat: the underlying producer-side WS+TMA race is
+  timing-dependent and the TS consumer has different timing; "not
+  exposed at every geometry we can hit" is the honest claim. The B.37
+  root cause should still be found before TS ships as default.
