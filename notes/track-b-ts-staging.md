@@ -119,3 +119,41 @@ smem.b_dequant (2 x BlockN x BlockK bf16) is NOT emitted for TS. At the
 SS prod config that buffer is 64KB (BK=128) / 32KB (BK=64); TS at
 BM=128 BN=128 BK=64 s=4 pencils out to ~81KB/CTA total -- under the
 116KB 2-CTAs/SM bound, which SS could never reach.
+
+## Milestone 4: TS-mode MMA fires correctly (2026-07-11)
+
+`tests/test_tcgen05_ts.py` -- 10/10 pass on B300 GPU 1:
+* 512^3 bf16 x uint4 gs=128, zp on AND off
+* stages {2, 3, 4} (kNumStages==2 exercises the deferred-load path)
+* BlockM {64, 128} (MMA-N = 64 and 128 atoms)
+* has_bias=True (per-lane bias add in the t2r drain)
+* warp-spec + TMA on
+* M=128 N=1024 K=8192 (multi-N-block, 128-iteration K walk, s=4)
+
+SS regression suites untouched: test_tcgen05.py + test_tcgen05_dtypes.py
++ test_sm100_smoke.py = 77 passed / 24 skipped / 1 xfailed (identical to
+pre-change).
+
+### Tolerance finding (worth keeping)
+
+Against the fp32-weight reference the K=8192 shape shows 21/131072
+elements over atol=0.5 (max 0.875). Against a reference whose weights
+are rounded to bf16 after (code-zp)*scale -- exactly what the kernel's
+__hmul2 dequant produces -- mean|err| drops 0.093 -> 4e-4 and max err
+is 1.0 = precisely 1 bf16 ulp at |out| in [128,256). I.e. the TS path
+is bit-faithful to its dequant semantics; the drift is bf16 weight
+rounding, same class as workbook B.38's "looser atol at prod shapes"
+note. The TS test rounds the reference weights instead of loosening
+atol -- strictly tighter check.
+
+### What made it work first-try (for the record)
+
+* The Python contract simulation (M2) validated the pack -> smem ->
+  regs -> dequant mapping before any CUDA ran. The historically
+  hardest part of this port (the (thread, reg) -> (n, k) mapping,
+  cf. Phase B.10's weeks of scatter debugging) was verified offline.
+* TS PTX form taken from CUTLASS SM100_MMA_F16BF16_TS::fma verbatim
+  (WITH the {m0..m3} mask operand Jinzhen's codegen dropped).
+* The mbar counter handshake (design note above) needed no tile-
+  boundary special cases; phases stayed consistent across scheduler
+  blocks including the stream-k-style trailing transform.
