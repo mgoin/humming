@@ -72,12 +72,40 @@ break anything" reference.
 * `nvidia-smi` ignores CUDA_VISIBLE_DEVICES -- always export it and let
   torch pick device 0 (= physical GPU 3).
 
+## LOUD: cross-track divergence vs b-ts-staging (decision needed)
+
+Track b's throwaway packer (wt-b-ts-staging commit 9fed616,
+`tests/ts_contract_pack.py`) was written independently to the same
+CONTRACT. Comparison (`tests/test_ts_packing_cross_track.py`, 3 tests):
+
+* **IDENTICAL**: nibble interleave ([0,2,4,6,1,3,5,7]), word-pair
+  semantics (word j covers K 8j..8j+7), scale stream (plain [g, N]),
+  zero-point stream (nibble-packed natural order) -- bit-for-bit.
+* **DIFFERENT**: weight word placement within a K-chunk row.
+    b: col = (n/32)*64  + (n%32)*2 + j            (band-major flat)
+    d: col = (n/64)*128 + (n%32)*4 + ((n%64)/32)*2 + j  (slot-paired)
+  Related by a pure column permutation (test pins it). NOT
+  interchangeable: b's tensor fed through the existing loader_b
+  half-group gather gives 124/128 threads the wrong row.
+* Root cause: b assumes a NEW TS s2r loader (thread reads 8 B at
+  warp*256B + lane*8B, fully linear per warp); d targets the EXISTING
+  loader_b WarpN==32 half-group path (zero kernel loader changes).
+  This is decision point 2 in docs/tcgen05_ts_packing.md -- must be
+  resolved with Jinzhen/track b before the production format freezes.
+  Both register-level contracts are met by both packers via their own
+  read pattern, so the TS kernel work is unblocked either way.
+
 ## Status
 
 - [x] Baseline recorded (above).
 - [x] Python reference packer + inverse + scale/zp streams
       (`humming/utils/ts_packing.py`), round-trip + contract-sim tests
       green (19 CPU tests + 4 GPU cross-validation tests).
-- [ ] CUDA repack kernel variant (`use_tcgen05_ts`) bit-exact vs ref.
-- [ ] docs/tcgen05_ts_packing.md spec + Jinzhen interface contract.
-- [ ] Cross-check vs track b's packer if landed.
+- [x] CUDA repack kernel variant (`use_tcgen05_ts` /
+      `weight_repack_nk<..., kUseTcgen05Ts=true>`) bit-exact vs the
+      Python reference: 6 shapes x {u4, u8}, packed input, MoE,
+      gs {64, 128}. Existing SS correctness bar re-run green
+      (77 passed / 24 skipped / 1 xfailed).
+- [x] docs/tcgen05_ts_packing.md spec + Jinzhen interface contract (S7).
+- [x] Cross-check vs track b's packer: divergence found + documented
+      (above), pinned by tests.

@@ -208,13 +208,21 @@ the epilogue, whose layout is owned by the TS epilogue work, not the pack.
    (`kSwizzleSizeK >= WarpK`), and our SS kernel already solved A-side
    sectionization (workbook B.19). Recommendation: keep the pack as
    specified (no sectionization), solve BlockK > 64 on the descriptor side.
-2. **loader_b half-group path — survives.** The spec deliberately targets
-   the existing WarpN==32 half-group gather (§4), so v1 needs zero loader
-   changes. If you prefer a dedicated TS loader branch (plain 8-B gather at
-   `word = (32·band + lane)·W_r`), the file layout that matches is the
-   band-major variant `col = B·64·W_r + h·32·W_r + l·W_r + j`; the reference
-   packer implements the slot-paired (half-group) variant only. Decide
-   before freezing the production format.
+2. **loader_b half-group path — survives (DECISION NEEDED, live
+   divergence).** This spec deliberately targets the existing WarpN==32
+   half-group gather (§4), so v1 needs zero loader changes. Track
+   b-ts-staging's independently-written throwaway packer chose the OTHER
+   option: band-major flat `col = (n/32)·2·W_r·32… = (n/32)·64 + (n%32)·2
+   + j` (u4), which requires a NEW TS s2r gather (8 B per thread at
+   `warp·256B + lane·8B`, 32 consecutive words per warp). Everything else
+   (nibble interleave, word-pair semantics, scale stream, zp stream) is
+   bit-identical between the two tracks —
+   `tests/test_ts_packing_cross_track.py` pins the exact column
+   permutation relating them and shows track b's tensor fails the
+   existing-loader contract (124/128 threads wrong). Pick one before
+   freezing the production format: slot-paired (this spec) = zero loader
+   change; band-major (track b) = simpler formula + fully-linear per-warp
+   read, at the cost of a loader branch.
 3. **Odd-bit dtypes (u3/u5/u7)**: `kLoadHalfGroup` requires even kBitsB, so
    the half-group gather does not split odd-bit slots; and
    `humming_pack_weight`'s 3/5/6/7-bit re-compression crosses the row
