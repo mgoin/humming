@@ -26,10 +26,14 @@ class RepackWeightKernel(KernelRuntime):
     use_wgmma: bool = False
     use_fused_e8m0_scale: bool = False
     group_size_zp: int = 0
+    use_tcgen05_ts: bool = False
 
     def init_kernel(self):
         if self.should_preprocess_with_zp:
             assert self.should_preprocess_for_int2fp
+        if self.use_tcgen05_ts:
+            assert not self.use_wgmma
+            assert self.activation_bits == 16
 
         should_transpose_mini_block = self.use_wgmma and not self.use_fused_e8m0_scale
 
@@ -50,7 +54,8 @@ class RepackWeightKernel(KernelRuntime):
             f"    {int(self.should_preprocess_for_int2fp)},\n"
             f"    {int(self.should_preprocess_with_zp)},\n"
             f"    {int(should_transpose_mini_block)},\n"
-            f"    {self.group_size_zp}>"
+            f"    {self.group_size_zp},\n"
+            f"    {int(self.use_tcgen05_ts)}>"
         )
         self.arg_types = (
             ctypes.c_void_p,

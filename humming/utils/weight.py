@@ -182,6 +182,7 @@ def prepare_humming_weight(
     padded_shape_n: int | None = None,
     padded_shape_k: int | None = None,
     interleave_mode: int = 3,
+    use_tcgen05_ts: bool = False,
 ) -> torch.Tensor:
     is_moe = weight.ndim == 3
     weight = weight.unsqueeze(0) if not is_moe else weight
@@ -247,6 +248,7 @@ def prepare_humming_weight(
         interleave_mode=interleave_mode,
         use_fused_e8m0_scale=use_fused_e8m0_scale,
         group_size_zp=group_size_zp,
+        use_tcgen05_ts=use_tcgen05_ts,
     )
 
     return repacked_weight if is_moe else repacked_weight.squeeze(0)

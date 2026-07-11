@@ -18,7 +18,7 @@ Layers (cheapest first):
 import pytest
 import torch
 
-from humming import dtypes, ops
+from humming import ops
 from humming.utils.ts_packing import (
     pack_scales_tcgen05_ts,
     pack_weight_tcgen05_ts,

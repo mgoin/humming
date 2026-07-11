@@ -96,11 +96,11 @@ def pack_weight_tcgen05_ts(codes: torch.Tensor, weight_bits: int = 4) -> torch.T
     col = torch.arange(num_cols, device=dev, dtype=torch.long)
     B = col // (64 * wpr)
     r = col % (64 * wpr)
-    l = r // (2 * wpr)
+    lane = r // (2 * wpr)
     q = r % (2 * wpr)
     h = q // wpr
     j = q % wpr
-    src_n = B * 64 + h * 32 + l                     # [num_cols]
+    src_n = B * 64 + h * 32 + lane                  # [num_cols]
 
     s = torch.arange(vpw, device=dev, dtype=torch.long)
     e = (s % (vpw // 2)) * 2 + s // (vpw // 2)      # [vpw]
@@ -141,11 +141,11 @@ def unpack_weight_tcgen05_ts(
     col = torch.arange(num_cols, device=dev, dtype=torch.long)
     B = col // (64 * wpr)
     r = col % (64 * wpr)
-    l = r // (2 * wpr)
+    lane = r // (2 * wpr)
     q = r % (2 * wpr)
     h = q // wpr
     j = q % wpr
-    src_n = B * 64 + h * 32 + l
+    src_n = B * 64 + h * 32 + lane
     e = (s % (vpw // 2)) * 2 + s // (vpw // 2)
     k_in = j.unsqueeze(1) * vpw + e.unsqueeze(0)     # [num_cols, vpw]
 

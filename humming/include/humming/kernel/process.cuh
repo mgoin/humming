@@ -118,7 +118,8 @@ CUDA_INLINE uint32_t extract_packed_value(uint32_t *smem_row, uint32_t index) {
 template <
     uint32_t kNumBitsB, uint32_t kNumBitsA, bool kPackedInput,
     bool kShouldPreprocessForINT2FP, bool kShouldPreprocessWithZP,
-    bool kShouldTransposeMiniBlock, uint32_t kGroupSizeZP>
+    bool kShouldTransposeMiniBlock, uint32_t kGroupSizeZP,
+    bool kUseTcgen05Ts = false>
 __global__ void weight_repack_nk(
     const uint32_t *in_ptr, uint32_t *out_ptr, const uint32_t *zp_ptr,
     uint32_t shape_n, uint32_t shape_k,
@@ -193,6 +194,61 @@ __global__ void weight_repack_nk(
   // - INDEX6 (2) = 64 (total_elements) / 32 (num_threads)
   uint32_t tmp[kNumBitsA / 4][16 / kNumBitsA][kNumBitsA / 4][2][2][32 / kNumBitsA];
 
+  if constexpr (kUseTcgen05Ts) {
+    // tcgen05 TS-mode layout (docs/tcgen05_ts_packing.md): thread t owns
+    // full rows {t, t + 32} of the 64-row block (lane = row contract);
+    // logical element order per 16-K group is [row t: K ascending,
+    // row t+32: K ascending] so that after humming_pack_weight's
+    // (i, i+4) interleave compensation, dequant reg r of each word pair
+    // holds the (K=2r, K=2r+1) bf16 pair -- the K-major order
+    // tcgen05.st/TS-mode TMEM A requires. Output word placement is
+    // unchanged: thread t's words = the 16-B slot loader_b's WarpN==32
+    // half-group path gathers for lanes t of the covering warp pair.
+    static_assert(!kUseTcgen05Ts || kNumBitsA == 16,
+                  "tcgen05 TS packing is defined for 16-bit activations");
+    uint32_t *tmp_flat = reinterpret_cast<uint32_t *>(tmp);
+
+    PRAGMA_UNROLL
+    for (uint32_t rr = 0; rr < 2; rr++) {
+      uint32_t row = rr * 32 + threadIdx.x;
+      uint32_t zp_smem_row[MAX(zp_smem_stride, 1)];
+
+      PRAGMA_UNROLL
+      for (uint32_t j = 0; j < zp_smem_stride; j++) {
+        if constexpr (!kPackedInput) {
+          zp_smem_row[j] = zp_smem[row][j];
+        } else {
+          constexpr uint32_t extracted_mask = (1 << kNumBitsB) - 1;
+          zp_smem_row[j] = zp_smem[row * kNumBitsB / 32][j];
+          zp_smem_row[j] = (zp_smem_row[j] >> (row * kNumBitsB % 32)) & extracted_mask;
+        }
+      }
+
+      uint32_t *smem_row = smem[row];
+      PRAGMA_UNROLL
+      for (uint32_t kk = 0; kk < 64; kk++) {
+        uint32_t extract_value = extract_packed_value<kNumBitsB, kPackedInput>(smem_row, kk);
+
+        if constexpr (kShouldPreprocessForINT2FP) {
+          uint32_t zp_val;
+          constexpr uint32_t extracted_mask = (1 << kNumBitsB) - 1;
+
+          if constexpr (kShouldPreprocessWithZP) {
+            zp_val = zp_smem_row[kk / kGroupSizeZP];
+          } else {
+            zp_val = 1 << (kNumBitsB - 1);
+          }
+
+          extract_value = extract_value & extracted_mask;
+          extract_value = extract_value >= zp_val ? extract_value - zp_val : extracted_mask - extract_value;
+        }
+
+        // group = 16-K block, element = rr * 16 + K-in-chunk (ascending).
+        tmp_flat[(kk / 16) * 32 + rr * 16 + (kk % 16)] = extract_value;
+      }
+    }
+  } else {
+
   PRAGMA_UNROLL
   for (uint32_t i = 0; i < 8; i++) {
     uint32_t row = i * 8 + threadIdx.x / 4;
@@ -247,6 +303,7 @@ __global__ void weight_repack_nk(
         }
       }
     }
+  }
   }
 
   uint32_t *tmp2 = reinterpret_cast<uint32_t *>(tmp);
