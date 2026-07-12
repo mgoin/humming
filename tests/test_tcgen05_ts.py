@@ -46,9 +46,9 @@ def _run_ts(
     has_bias=False,
     group_size=128,
     use_warp_spec=False,
+    b_dtype=dtypes.uint4,
 ):
     a_dtype = dtypes.bfloat16
-    b_dtype = dtypes.uint4
     c_dtype = dtypes.bfloat16
     bs_dtype = dtypes.bfloat16
 
@@ -133,16 +133,16 @@ def _run_ts(
     return outputs, outputs_ref
 
 
-def _assert_close(outputs, outputs_ref):
+def _assert_close(outputs, outputs_ref, atol=0.5):
     abs_err = (outputs.float() - outputs_ref.float()).abs()
     ref_abs = outputs_ref.float().abs()
     print(
         f"\n  max|err|={abs_err.max().item():.3e} "
         f"mean|err|={abs_err.mean().item():.3e} "
         f"|ref|.mean={ref_abs.mean().item():.3e} "
-        f"|ref|.max={ref_abs.max().item():.3e}"
+        f"|ref|.max={ref_abs.max().item():.3e} atol={atol}"
     )
-    torch.testing.assert_close(outputs, outputs_ref, rtol=1e-2, atol=0.5)
+    torch.testing.assert_close(outputs, outputs_ref, rtol=1e-2, atol=atol)
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +157,132 @@ def test_ts_512_cubed(has_zero_point):
         has_zero_point=has_zero_point,
     )
     _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# uint2 weight dtype (milestone b): same integer uint_to_f16 path, kWpr=1
+# half-group loader, no-zp midpoint 2 vs int-zp. Reference is the same
+# bf16-rounded-weight dequant GEMM.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("has_zero_point", [False, True])
+def test_ts_uint2_512_cubed(has_zero_point):
+    outputs, outputs_ref = _run_ts(
+        shape_m=512, shape_n=512, shape_k=512,
+        has_zero_point=has_zero_point, b_dtype=dtypes.uint2,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_uint2_block_m128_fatn():
+    """uint2 on a fat-N gate/up slice with BlockM=128, multi-block N/K."""
+    outputs, outputs_ref = _run_ts(
+        shape_m=256, shape_n=1024, shape_k=1024,
+        block_shape=(128, 128, 64), b_dtype=dtypes.uint2,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_uint2_minimal_tile():
+    """N=128 K=64 single minimal tile, no zp."""
+    outputs, outputs_ref = _run_ts(
+        shape_m=128, shape_n=128, shape_k=64,
+        group_size=64, has_zero_point=False, b_dtype=dtypes.uint2,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# float4e2m1 weight dtype (milestone c, headline production dtype): fp_to_fp
+# decode + a constant 2^126 (get_dtype_dequant_exp_offset<bf16,fp4>) weight
+# mul; no zero point, no epilogue exp-offset. The group-scale hmul2 in
+# transform_b applies unchanged. Reference: same bf16-rounded dequant GEMM.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "shape_m,shape_n,shape_k",
+    [(512, 512, 512), (128, 1024, 1024), (128, 128, 64)],
+)
+def test_ts_fp4_shapes(shape_m, shape_n, shape_k):
+    gs = 64 if shape_k == 64 else 128
+    outputs, outputs_ref = _run_ts(
+        shape_m=shape_m, shape_n=shape_n, shape_k=shape_k,
+        group_size=gs, has_zero_point=False, b_dtype=dtypes.float4e2m1,
+        block_shape=(128, 128, 64) if shape_m >= 128 else (64, 128, 64),
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_fp4_prod_shape():
+    """Llama70B-gate slice, fat-N/K walk at large K (bf16-accum tail)."""
+    outputs, outputs_ref = _run_ts(
+        shape_m=128, shape_n=1024, shape_k=8192,
+        block_shape=(128, 128, 64), num_stages=4,
+        has_zero_point=False, b_dtype=dtypes.float4e2m1,
+    )
+    _assert_close(outputs, outputs_ref, atol=2.0)
+
+
+# ---------------------------------------------------------------------------
+# uint8 (milestone d): normalized_uint_to_fp (8 > bf16 mantissa) + a split
+# 2^133 exp offset (2^127 lifts the subnormal dequant to normal range, then
+# 2^6), 8-bit zp byte-extract, regs_qb[2][4] int4 load. SMEM fits at
+# BlockK=64 stages=4.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("has_zero_point", [False, True])
+def test_ts_uint8_512_cubed(has_zero_point):
+    outputs, outputs_ref = _run_ts(
+        shape_m=512, shape_n=512, shape_k=512,
+        has_zero_point=has_zero_point, b_dtype=dtypes.uint8,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_uint8_block_m128():
+    outputs, outputs_ref = _run_ts(
+        shape_m=256, shape_n=1024, shape_k=1024,
+        block_shape=(128, 128, 64), b_dtype=dtypes.uint8,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_uint8_prod_shape():
+    outputs, outputs_ref = _run_ts(
+        shape_m=128, shape_n=1024, shape_k=8192,
+        block_shape=(128, 128, 64), num_stages=4, b_dtype=dtypes.uint8,
+    )
+    _assert_close(outputs, outputs_ref, atol=2.0)
+
+
+# ---------------------------------------------------------------------------
+# float8e4m3 (milestone d): fp_to_fp decode + a single 2^120 exp offset
+# (<=127, fully in the mainloop weight); no zp; regs_qb[2][4].
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "shape_m,shape_n,shape_k", [(512, 512, 512), (256, 1024, 1024)],
+)
+def test_ts_fp8_shapes(shape_m, shape_n, shape_k):
+    outputs, outputs_ref = _run_ts(
+        shape_m=shape_m, shape_n=shape_n, shape_k=shape_k,
+        has_zero_point=False, b_dtype=dtypes.float8e4m3,
+        block_shape=(128, 128, 64) if shape_m >= 128 else (64, 128, 64),
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_fp8_prod_shape():
+    outputs, outputs_ref = _run_ts(
+        shape_m=128, shape_n=1024, shape_k=8192,
+        block_shape=(128, 128, 64), num_stages=4,
+        has_zero_point=False, b_dtype=dtypes.float8e4m3,
+    )
+    _assert_close(outputs, outputs_ref, atol=2.0)
 
 
 @pytest.mark.parametrize("num_stages", [2, 3, 4])

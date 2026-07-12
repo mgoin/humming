@@ -39,7 +39,7 @@ def _rand_codes(n, k, weight_bits=4, seed=0, device="cpu"):
 
 
 @pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("weight_bits", [4, 8])
+@pytest.mark.parametrize("weight_bits", [2, 4, 8])
 def test_ts_pack_roundtrip(shape, weight_bits):
     n, k = shape
     codes = _rand_codes(n, k, weight_bits)
@@ -57,7 +57,7 @@ def test_ts_pack_roundtrip_moe():
     assert torch.equal(out, codes)
 
 
-@pytest.mark.parametrize("weight_bits", [4, 8])
+@pytest.mark.parametrize("weight_bits", [2, 4, 8])
 def test_ts_register_contract_simulation(weight_bits):
     """The load-bearing test: simulate loader_b's WarpN==32 half-group
     gather + the lop3 dequant slot extraction and check every thread's
@@ -101,7 +101,7 @@ def test_scale_stream_roundtrip():
     assert torch.equal(unpack_scales_tcgen05_ts(packed), ws)
 
 
-@pytest.mark.parametrize("weight_bits", [4, 8])
+@pytest.mark.parametrize("weight_bits", [2, 4, 8])
 def test_zero_point_stream_roundtrip(weight_bits):
     g = torch.Generator().manual_seed(4)
     zp = torch.randint(0, 1 << weight_bits, (128, 4), generator=g, dtype=torch.int32)
@@ -151,7 +151,7 @@ CUDA_TS_SHAPES = [(64, 64), (128, 128), (128, 256), (256, 512), (512, 1024), (10
 
 @requires_cuda
 @pytest.mark.parametrize("shape", CUDA_TS_SHAPES)
-@pytest.mark.parametrize("weight_bits", [4, 8])
+@pytest.mark.parametrize("weight_bits", [2, 4, 8])
 def test_cuda_ts_repack_matches_reference(shape, weight_bits):
     n, k = shape
     codes = _rand_codes(n, k, weight_bits, seed=6, device="cuda")

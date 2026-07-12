@@ -70,11 +70,12 @@ def _assert_close(outputs, outputs_ref, label="", atol=0.5):
     torch.testing.assert_close(outputs, outputs_ref, rtol=1e-2, atol=atol)
 
 
-def _build_ts_layer(shape_n, shape_k, group_size, has_zero_point, weight_orig):
+def _build_ts_layer(shape_n, shape_k, group_size, has_zero_point, weight_orig,
+                    b_dtype=dtypes.uint4):
     """Build + load + transform a TS-opted-in HummingLayer from a real
     (unquantized) bf16 weight, exactly as a production caller would."""
     schema = HummingWeightSchema(
-        b_dtype=dtypes.uint4,
+        b_dtype=b_dtype,
         bs_dtype=dtypes.bfloat16,
         weight_scale_group_size=group_size,
         has_zero_point=has_zero_point,
@@ -161,6 +162,98 @@ def test_ts_e2e_uint4_layer(shape_m, shape_n, shape_k, has_zero_point):
     )
 
 
+@pytest.mark.parametrize("has_zero_point", [True, False])
+@pytest.mark.parametrize(
+    "shape_m,shape_n,shape_k",
+    [
+        (16, 512, 512),      # decode-ish M (TS runs at every M)
+        (256, 1024, 2048),   # multi-block N/K walk
+    ],
+)
+def test_ts_e2e_uint2_layer(shape_m, shape_n, shape_k, has_zero_point):
+    """uint2 driven through the full HummingLayer path vs the dequant
+    reference. Also pins that the heuristic actually dispatches TS."""
+    group_size = 128
+
+    torch.manual_seed(0xBEEF)
+    (weight_orig, weight_ref, _codes, _scale, _zp, _gs) = generate_random_weight(
+        n=shape_n, k=shape_k, group_size=group_size,
+        dtype=dtypes.uint2, scale_dtype=dtypes.bfloat16,
+        has_zero_point=has_zero_point,
+    )
+
+    layer = _build_ts_layer(
+        shape_n, shape_k, group_size, has_zero_point, weight_orig,
+        b_dtype=dtypes.uint2,
+    )
+    _assert_ts_dispatched(layer, shape_m)
+
+    _, inputs_ref, inputs, _ = generate_random_inputs(
+        m=shape_m, k=shape_k, group_size=0, dtype=dtypes.bfloat16,
+    )
+
+    weight_ref_bf16 = weight_ref.to(torch.bfloat16).float()
+    outputs_ref = inputs_ref.matmul(weight_ref_bf16.T).to(torch.bfloat16)
+    torch.cuda.synchronize()
+
+    outputs = layer.forward(inputs.clone())
+    torch.cuda.synchronize()
+
+    assert outputs.shape == (shape_m, shape_n)
+    assert torch.isfinite(outputs).all()
+    atol = 0.5 if shape_k <= 1024 else 1.5
+    _assert_close(
+        outputs, outputs_ref, atol=atol,
+        label=f"uint2 gs128 zp={has_zero_point} m{shape_m} n{shape_n} k{shape_k}",
+    )
+
+
+@pytest.mark.parametrize(
+    "shape_m,shape_n,shape_k",
+    [
+        (16, 512, 512),      # decode-ish M
+        (256, 1024, 2048),   # multi-block N/K walk
+    ],
+)
+def test_ts_e2e_fp4_layer(shape_m, shape_n, shape_k):
+    """float4e2m1 (no zero point) driven through the full HummingLayer
+    path vs the dequant reference; pins TS dispatch. Exercises the fp_to_fp
+    + constant-2^126 exp-offset weight path end to end."""
+    group_size = 128
+
+    torch.manual_seed(0xBEEF)
+    (weight_orig, weight_ref, _codes, _scale, _zp, _gs) = generate_random_weight(
+        n=shape_n, k=shape_k, group_size=group_size,
+        dtype=dtypes.float4e2m1, scale_dtype=dtypes.bfloat16,
+        has_zero_point=False,
+    )
+
+    layer = _build_ts_layer(
+        shape_n, shape_k, group_size, False, weight_orig,
+        b_dtype=dtypes.float4e2m1,
+    )
+    _assert_ts_dispatched(layer, shape_m)
+
+    _, inputs_ref, inputs, _ = generate_random_inputs(
+        m=shape_m, k=shape_k, group_size=0, dtype=dtypes.bfloat16,
+    )
+
+    weight_ref_bf16 = weight_ref.to(torch.bfloat16).float()
+    outputs_ref = inputs_ref.matmul(weight_ref_bf16.T).to(torch.bfloat16)
+    torch.cuda.synchronize()
+
+    outputs = layer.forward(inputs.clone())
+    torch.cuda.synchronize()
+
+    assert outputs.shape == (shape_m, shape_n)
+    assert torch.isfinite(outputs).all()
+    atol = 0.5 if shape_k <= 1024 else 1.5
+    _assert_close(
+        outputs, outputs_ref, atol=atol,
+        label=f"fp4 gs128 m{shape_m} n{shape_n} k{shape_k}",
+    )
+
+
 def test_ss_tcgen05_default_path_stream_k_regression():
     """The DEFAULT (non-opt-in) sm100 tcgen05 fast-path also had
     use_stream_k defaulting to True via HummingKernel, which corrupts
@@ -214,20 +307,48 @@ def test_ss_tcgen05_default_path_stream_k_regression():
     )
 
 
-def test_ts_e2e_uint8_deferred():
-    """uint8 is NOT e2e-reachable: the TS kernel static_asserts
-    ElementB::kBits == 4 and supports_tcgen05_ts gates b_dtype to uint4.
-    Requesting mma_type=tcgen05 with uint8 must fail loudly at transform
-    (not silently mispack or fall back to SS). Pins the scoping note."""
-    schema = HummingWeightSchema(
-        b_dtype=dtypes.uint8, bs_dtype=dtypes.bfloat16,
-        weight_scale_group_size=128, has_zero_point=True,
+@pytest.mark.parametrize(
+    "b_dtype,has_zero_point",
+    [
+        (dtypes.uint8, True),
+        (dtypes.uint8, False),
+        (dtypes.float8e4m3, False),
+    ],
+)
+@pytest.mark.parametrize("shape_m,shape_n,shape_k", [(16, 512, 512), (256, 1024, 2048)])
+def test_ts_e2e_8bit_layer(b_dtype, has_zero_point, shape_m, shape_n, shape_k):
+    """uint8 / float8e4m3 driven through the full HummingLayer path vs the
+    dequant reference; pins TS dispatch. Exercises the 8-bit dequant bodies
+    (normalized_uint_to_fp split-2^133 offset / fp_to_fp 2^120) end to end."""
+    group_size = 128
+
+    torch.manual_seed(0xBEEF)
+    (weight_orig, weight_ref, _c, _s, _z, _g) = generate_random_weight(
+        n=shape_n, k=shape_k, group_size=group_size,
+        dtype=b_dtype, scale_dtype=dtypes.bfloat16,
+        has_zero_point=has_zero_point,
     )
-    w = torch.randn(512, 512, dtype=torch.bfloat16, device="cuda") / (512 ** 0.5)
-    layer = HummingLayer(
-        shape_n=512, shape_k=512, weight_config=schema,
-        torch_dtype=torch.bfloat16, mma_type="tcgen05",
-    ).cuda()
-    layer.load_from_unquantized(w)
-    with pytest.raises(AssertionError):
-        layer.transform()
+
+    layer = _build_ts_layer(
+        shape_n, shape_k, group_size, has_zero_point, weight_orig,
+        b_dtype=b_dtype,
+    )
+    _assert_ts_dispatched(layer, shape_m)
+
+    _, inputs_ref, inputs, _ = generate_random_inputs(
+        m=shape_m, k=shape_k, group_size=0, dtype=dtypes.bfloat16,
+    )
+    weight_ref_bf16 = weight_ref.to(torch.bfloat16).float()
+    outputs_ref = inputs_ref.matmul(weight_ref_bf16.T).to(torch.bfloat16)
+    torch.cuda.synchronize()
+
+    outputs = layer.forward(inputs.clone())
+    torch.cuda.synchronize()
+
+    assert outputs.shape == (shape_m, shape_n)
+    assert torch.isfinite(outputs).all()
+    atol = 0.5 if shape_k <= 1024 else 1.5
+    _assert_close(
+        outputs, outputs_ref, atol=atol,
+        label=f"{b_dtype} gs128 zp={has_zero_point} m{shape_m} n{shape_n} k{shape_k}",
+    )
