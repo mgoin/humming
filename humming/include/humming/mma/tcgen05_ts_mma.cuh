@@ -81,15 +81,17 @@ CUDA_INLINE typename F16Conversion<EA>::scalar_t2 ts_mul_pow2(
 // the dequant magic (bf16 0x4300 vs fp16 0x6400 base, via uint_to_f16 /
 // fp_to_fp / normalized_uint_to_fp) and the exp-offset element type. bf16 is
 // the shipped path (EA defaults to BFloat16, bit-exact).
-template <class EB, class EA, bool kHasZeroPoint>
+template <class EB, class EA, bool kHasZeroPoint, bool kIsFpZeroPoint = false>
 CUDA_INLINE uint32_t ts_dequant_b_pair(uint32_t shifted, uint32_t bias2) {
   using Scalar2 = typename F16Conversion<EA>::scalar_t2;
   if constexpr (EB::kIsIntegerType && EB::kBits <= EA::kMantissaBits) {
-    // uint{2,4}: bias2 is the folded EA(2^(k-1) + zp) subtrahend, so
-    // uint_to_f16 (kHasZeroPoint=true) always emits (code - zp); the
-    // no-zp midpoint is baked into bias2 by s2r. No exp offset (kOff==0).
-    return uint_to_f16<EB, EA, /*kHasZeroPoint=*/true,
-                       /*kIsFpZeroPoint=*/false>(shifted, bias2);
+    // uint{2,4}: with an integer zp, bias2 is the folded EA(2^(k-1) + zp)
+    // subtrahend so uint_to_f16 emits (code - zp) (no-zp midpoint baked
+    // in by s2r). With an fp zp, uint_to_f16 subtracts only the base and
+    // returns the RAW code as EA; the caller subtracts the per-lane bf16
+    // zp post-dequant, pre-scale. No exp offset (kOff==0) either way.
+    return uint_to_f16<EB, EA, /*kHasZeroPoint=*/true, kIsFpZeroPoint>(
+        shifted, bias2);
   } else if constexpr (EB::kIsIntegerType) {
     // uint8: 8 > bf16 mantissa, so the 0x4300 trick breaks; route to
     // normalized_uint_to_fp with the RAW integer zp (bias2, broadcast
@@ -199,8 +201,11 @@ public:
   static_assert(kTsBDtypeSupported,
                 "TCGEN05_TS: ElementB not in the TS weight-dtype allowlist "
                 "(currently {uint2, uint4, uint8, float4e2m1, float8e4m3})");
-  static_assert(!kIsFpZeroPoint,
-                "TCGEN05_TS: fp zero-point not yet wired for TS mode");
+  static_assert(!kIsFpZeroPoint || (ElementB::kIsIntegerType &&
+                                    ElementB::kBits <= ElementA::kMantissaBits),
+                "TCGEN05_TS fp zero-point: only the uint_to_f16 weight dtypes "
+                "(kBits <= mantissa, e.g. uint2/uint4); uint8's normalized "
+                "path does not carry the post-scale fp subtract");
   static_assert(Ctx::kIsGroupWeightScale || Ctx::kIsChannelWeightScale,
                 "TCGEN05_TS: group or channelwise weight scale (block/mx "
                 "unsupported)");
@@ -229,6 +234,11 @@ public:
   // bf16x2(128 + zp, 128 + zp), also filled by the s2r TS branch.
   uint32_t regs_bs2_ts[2];
   uint32_t regs_bias2_ts[2];
+  // Per-lane bf16x2 broadcast fp zero-point (kIsFpZeroPoint only): a real
+  // bf16 subtracted post-dequant / pre-scale to give (code - zp_fp) * scale.
+  // Filled by the s2r TS branch from the [K/gs, N] bf16 zp stream. Unused
+  // (never written) on the integer-zp path.
+  uint32_t regs_zpfp2_ts[2];
 
   CUDA_INLINE
   TCGEN05_TS(Ctx &ctx_, ArithClass &arith_)
@@ -258,9 +268,19 @@ public:
         // Extract the (r, r + kVpw/2) codes of q into the lo/hi ElementA
         // halves and dequant per ElementB; the pack pre-compensates the
         // slot order so this yields reg = (K = 2*idx, K = 2*idx + 1).
-        uint32_t v = ts_dequant_b_pair<ElementB, ElementA, kHasZeroPoint>(
-            q >> (r * kBBits), bias2);
+        uint32_t v =
+            ts_dequant_b_pair<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint>(
+                q >> (r * kBBits), bias2);
         Scalar2 t = *reinterpret_cast<Scalar2 *>(&v);
+        // FP zero point: ts_dequant returned the raw code as EA, so the
+        // zp is a real bf16 subtracted here, BEFORE the scale, matching
+        // the SS order (code - zp_fp) * scale. Integer zp is already
+        // folded into the code by uint_to_f16 (nothing to do here).
+        if constexpr (kIsFpZeroPoint) {
+          const Scalar2 zpfp =
+              *reinterpret_cast<const Scalar2 *>(&regs_zpfp2_ts[buffer_id]);
+          t = __hsub2(t, zpfp);
+        }
         // Group scale folds here (per-lane, per-stage). Channelwise scale
         // is K-invariant and commutes with the K-sum, so it is deferred
         // to the drain (epilogue-fold) and NOT applied per code here.

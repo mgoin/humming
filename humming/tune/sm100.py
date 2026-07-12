@@ -94,7 +94,11 @@ def supports_tcgen05_ts(meta) -> bool:
     if meta.bs_dtype != dtypes.bfloat16:
         return False
     if meta.has_zero_point and meta.is_fp_zero_point:
-        return False
+        # FP zero point subtracts a per-lane bf16 post-dequant / pre-scale;
+        # wired only for the uint_to_f16 weight dtypes (<= 4 bit). uint8's
+        # normalized dequant path does not carry the post-scale fp subtract.
+        if meta.b_dtype.num_bits > 4:
+            return False
     # Weight scale: channelwise (gs == 0, folded per-row in the TS drain)
     # or one group per BlockK=64 stage (gs >= BlockK). Block scale
     # (group_size_n > 1) and sub-stage groups (gs < 64) are separate

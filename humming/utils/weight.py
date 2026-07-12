@@ -297,8 +297,11 @@ def prepare_humming_zero_point(
 ) -> torch.Tensor | None:
     num_experts = None if zero_point.ndim == 2 else zero_point.size(0)
     if zero_point.dtype.is_floating_point:
-        assert not use_tcgen05_ts, "TS mode requires integer zero points"
-        return prepare_humming_weight_scale(zero_point, False)
+        # FP zero point is a bf16 stream in the SAME [K/gs, N] natural-row
+        # layout as the weight scale, so the TS scale packer produces it.
+        return prepare_humming_weight_scale(
+            zero_point, False, use_tcgen05_ts=use_tcgen05_ts
+        )
 
     if packed:
         zero_point = zero_point.transpose(-1, -2).contiguous()

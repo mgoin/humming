@@ -48,6 +48,7 @@ def _run_ts(
     use_warp_spec=False,
     b_dtype=dtypes.uint4,
     a_dtype=dtypes.bfloat16,
+    is_fp_zero_point=False,
 ):
     # Activation dtype drives the whole f16-family compute path: scales,
     # zero-point dequant base, MMA operand format, and the drain convert
@@ -60,17 +61,23 @@ def _run_ts(
     random_weight = generate_random_weight(
         n=shape_n, k=shape_k, group_size=group_size,
         dtype=b_dtype, scale_dtype=bs_dtype,
-        has_zero_point=has_zero_point,
+        has_zero_point=has_zero_point, is_fp_zero_point=is_fp_zero_point,
     )
     _, weight_ref, weight_codes, weight_scale, zero_point, _ = random_weight
 
+    # FP zero point is a bf16 float, not folded into the weight repack
+    # (the kernel subtracts it post-dequant). Pass None to the weight
+    # repack and stream it as bf16 like the scale.
+    repack_zp = None if is_fp_zero_point else zero_point
     weight = prepare_humming_weight(
-        weight_codes, b_dtype, a_dtype, zero_point=zero_point,
+        weight_codes, b_dtype, a_dtype, zero_point=repack_zp,
         use_wgmma=False, use_tcgen05_ts=True,
     )
     weight_scale_p = pack_scales_tcgen05_ts(weight_scale).cuda()
     zero_point_p = None
-    if has_zero_point:
+    if has_zero_point and is_fp_zero_point:
+        zero_point_p = pack_scales_tcgen05_ts(zero_point).cuda()
+    elif has_zero_point:
         zero_point_p = pack_zero_point_tcgen05_ts(
             zero_point.to(torch.int32), b_dtype.num_bits).cuda()
 
@@ -93,6 +100,7 @@ def _run_ts(
         bs_dtype=bs_dtype,
         weight_scale_group_size=group_size,
         has_zero_point=has_zero_point,
+        is_fp_zero_point=is_fp_zero_point,
         num_stages=num_stages,
         use_warp_spec=use_warp_spec,
         use_tma=use_warp_spec,
@@ -213,6 +221,47 @@ def test_ts_fp16_uint4_prod_shape():
         has_zero_point=True, a_dtype=dtypes.float16,
     )
     assert outputs.dtype == torch.float16
+    _assert_close(outputs, outputs_ref, atol=2.0)
+
+
+# ---------------------------------------------------------------------------
+# FP ZERO POINT (milestone 4, scalar-formats): is_fp_zero_point=True. The
+# integer 0x4300|zp fold does NOT apply -- ts_dequant returns the raw code,
+# transform_b subtracts a per-lane bf16 zp (a new bf16 operand streamed like
+# the scale) BEFORE the group scale: (code - zp_fp) * scale, matching the SS
+# order. Reference is the standard bf16-rounded-weight GEMM (the kernel and
+# generate_random_weight round (code-zp) then *scale identically).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shape_m", [16, 128, 256], ids=lambda m: f"m{m}")
+def test_ts_fp_zero_point_uint4(shape_m):
+    block_m = 128 if shape_m >= 128 else 64
+    outputs, outputs_ref = _run_ts(
+        shape_m=shape_m, shape_n=512, shape_k=512,
+        block_shape=(block_m, 128, 64),
+        has_zero_point=True, is_fp_zero_point=True,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+@pytest.mark.parametrize("group_size", [32, 128], ids=["gs32", "gs128"])
+def test_ts_fp_zero_point_gs(group_size):
+    """fp zp composes with group scale at gs=128 and sub-stage gs=32."""
+    outputs, outputs_ref = _run_ts(
+        shape_m=256, shape_n=512, shape_k=512,
+        block_shape=(128, 128, 64), group_size=group_size,
+        has_zero_point=True, is_fp_zero_point=True,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_fp_zero_point_prod_shape():
+    outputs, outputs_ref = _run_ts(
+        shape_m=128, shape_n=1024, shape_k=8192,
+        block_shape=(128, 128, 64), num_stages=4,
+        has_zero_point=True, is_fp_zero_point=True,
+    )
     _assert_close(outputs, outputs_ref, atol=2.0)
 
 

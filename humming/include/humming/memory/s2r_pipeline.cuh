@@ -37,6 +37,7 @@ private:
   static constexpr bool kIsGroupOrBlockWeightScale = kIsGroupWeightScale || kIsBlockWeightScale;
 
   static constexpr bool kHasZeroPoint = Ctx::kHasZeroPoint;
+  static constexpr bool kIsFpZeroPoint = Ctx::kIsFpZeroPoint;
   static constexpr bool kHasBias = Ctx::kHasBias;
 
   using LoaderA = S2RMemoryLoaderA<Ctx>;
@@ -139,7 +140,20 @@ public:
     //   * kBits == 8 (uint8/fp8): the RAW integer zp byte (normalized_
     //     uint_to_fp broadcasts it); fp8 has no zp.
     constexpr uint32_t kBBits = Ctx::ElementB::kBits;
-    if constexpr (kBBits <= 4) {
+    if constexpr (kIsFpZeroPoint) {
+      // FP zero point: a per-lane bf16 (NOT a nibble/byte int). Same
+      // [K/gs, N] bf16 stream layout as the scale (stages[].bzp holds
+      // 16-bit zp when is_fp_zero_point). transform_b subtracts it from
+      // the raw code before the scale, so regs_bias2_ts just carries the
+      // raw-code dequant base (uint_to_f16 uses base internally anyway).
+      constexpr uint32_t kBiasBase =
+          std::is_same<ElementA, Float16>::value ? 0x64006400u : 0x43004300u;
+      mma.regs_bias2_ts[buffer_id] = kBiasBase;
+      const uint16_t *bzp16 =
+          reinterpret_cast<const uint16_t *>(smem.stages[stage_id].bzp);
+      uint32_t z = bzp16[bs_group * BlockShape::N + n];
+      mma.regs_zpfp2_ts[buffer_id] = (z << 16) | z;
+    } else if constexpr (kBBits <= 4) {
       // Dequant base per ElementA: bf16 128.0 == 0x4300, fp16 1024.0 ==
       // 0x6400 (both exactly hold 2^(kBits-1)+zp in the low mantissa, so
       // uint_to_f16 subtracts (base|zp) to emit code - zp). Folded into
