@@ -80,12 +80,55 @@ finite=True; masked rows zeroed.
   introduces NO new synchronization divergence beyond the dense TS
   baseline.
 
+## M4 — realistic-shape e2e + bench (benchmarks/bench_ts_moe.py)
+
+TS grouped (heuristic BlockM) vs mma.sync grouped, uint4 W4A16 gs=128,
+zp on, 512 tokens, B300. Every point correctness-verified (Y) against
+the per-expert dequant reference before timing. TS/mma < 1 means TS
+faster. contiguous and masked track within noise; contiguous shown:
+
+  shape                   E    tk  bm   TS us   mma us  TS/mma
+  Qwen3 gate/up (1536x4096) 8   2  128    47.9    61.9   0.77
+  Qwen3 gate/up            128  8   64   470.3   417.6   1.13
+  Qwen3 down (4096x1536)     8  2  128    58.0    70.4   0.82
+  Qwen3 down               128  8   64   486.0   380.4   1.28
+  DeepSeek gate/up (2048x7168) 8 2 128   152.1   227.8   0.67
+  DeepSeek gate/up         256  8   64  2029.9  1639.9   1.24
+  DeepSeek down (7168x2048)  8  2  128   119.7   138.7   0.86
+  DeepSeek down            256  8   64  2146.3  1664.9   1.29
+  Mixtral gate/up (14336x4096) 8 2 128  431.8   514.8   0.84
+  Mixtral down (4096x14336)  8  2  128   436.2   707.8   0.62
+
+Story: **TS wins at coarse experts** (E=8, ~128 tokens/expert fills the
+BlockM=128 tile: 0.62-0.86x, i.e. up to 1.6x faster) and **loses at
+fine-grained experts** (E=128/256, BlockM=64: 1.13-1.31x slower). The
+crossover is exactly the token-tile granularity flag below.
+
 ## M5 research flag — token-tile granularity for fine-grained MoE
 
-(Documented, not solved — see below and moe-grouped-gemm.md §Hardest.)
-TS pins the token tile = BlockShape::M in {64,128} (MMA-N, forced by
-WarpShape::N==32 / M_WARPS==1). With top-8-of-256 at low/medium batch,
-most experts get < 64 tokens, so every expert still costs a full 64-row
-MMA tile. The masked epilogue keeps it correct (proven) but the MMA does
-up to ~4x wasted rows vs a 16-token tile the mma.sync grouped path can
-use. This is throughput, not correctness. Quantified in M4 bench below.
+(Documented, not solved — see moe-grouped-gemm.md §Hardest.) TS pins the
+token tile = BlockShape::M in {64,128} (MMA-N, forced by
+WarpShape::N==32 / M_WARPS==1; static_assert tcgen05_ts_mma.cuh:89).
+mma.sync grouped runs BlockM as small as 16. With load-balanced MoE the
+per-expert token count is `num_tokens * top_k / num_experts`, so:
+
+  - DeepSeek 256-expert, 512 tok, top-8 => ~16 tokens/expert. TS BlockM=64
+    => ceil(16/64)=1 tile of 64 rows, **16 real => 4x MMA-row waste**;
+    mma.sync BlockM=16 => 0 waste. Measured wall-clock 1.24-1.29x slower.
+  - Qwen3 128-expert, 512 tok, top-8 => ~32 tokens/expert. TS BlockM=64
+    => **2x MMA-row waste**. Measured 1.13-1.31x slower.
+
+The wall-clock gap (1.1-1.3x) is smaller than the raw MMA-row waste
+(2-4x) because scale/zp loads and the epilogue amortize across the
+padded rows; the MMA itself is not the sole cost. Still throughput, not
+correctness — masking keeps every fine-grained point bit-correct (Y).
+
+Concrete next step (option b, deferred): relax the BlockM==64||128
+static_assert to admit BlockM=32. The TS drain already loops in
+kBlockM/32 chunks (tmem_ts_drain.cuh), so a 32-row token tile is
+plausibly near-free on the epilogue side and would halve the waste at
+16-32 tokens/expert. Needs the MMA-N=32 atom to hold with WarpShape::N
+unchanged; verify before committing. Option (c) two-experts-per-CTA
+packing is larger. Recommendation: ship BlockM=64 for fine-grained now
+(correct, and the TS coarse-expert win + the dtype-breadth roadmap are
+the higher-value items); pick up BlockM=32 as a focused perf follow-up.
