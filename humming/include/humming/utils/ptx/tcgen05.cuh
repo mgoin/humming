@@ -341,6 +341,23 @@ CUDA_INLINE uint32_t tcgen05_instr_desc_bf16_bf16_f32(uint32_t shape_m,
   return d.desc;
 }
 
+// Same kind::f16 family, with the a/b operand formats chosen at compile
+// time. TS mode issues kind::f16 for BOTH bf16 and fp16 activations; only
+// these two format fields (and the software weight-dequant target) change.
+// The TS kernel dequants weights to the SAME element type as the
+// activation, so kAFmt == kBFmt on that path.
+template <uint32_t kAFmt, uint32_t kBFmt>
+CUDA_INLINE uint32_t tcgen05_instr_desc_f16fam_f32(uint32_t shape_m,
+                                                   uint32_t shape_n) {
+  Tcgen05InstrDescriptor d{};
+  d.c_format = tcgen05_cfmt::F32;
+  d.a_format = kAFmt;
+  d.b_format = kBFmt;
+  d.n_dim    = (shape_n >> 3);
+  d.m_dim    = (shape_m >> 4);
+  return d.desc;
+}
+
 
 // ============================================================================
 // tcgen05.mma issue (SS = both operands from SMEM)

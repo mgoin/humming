@@ -128,13 +128,19 @@ public:
     //     uint_to_fp broadcasts it); fp8 has no zp.
     constexpr uint32_t kBBits = Ctx::ElementB::kBits;
     if constexpr (kBBits <= 4) {
+      // Dequant base per ElementA: bf16 128.0 == 0x4300, fp16 1024.0 ==
+      // 0x6400 (both exactly hold 2^(kBits-1)+zp in the low mantissa, so
+      // uint_to_f16 subtracts (base|zp) to emit code - zp). Folded into
+      // the per-lane subtrahend the transform passes to uint_to_f16.
+      constexpr uint32_t kBiasBase =
+          std::is_same<ElementA, Float16>::value ? 0x64006400u : 0x43004300u;
       uint32_t zp = 1u << (kBBits - 1u);
       if constexpr (kHasZeroPoint) {
         const uint8_t *bzp8 =
             reinterpret_cast<const uint8_t *>(smem.stages[stage_id].bzp);
         zp = (bzp8[n >> 1] >> ((n & 1u) * 4u)) & 0xFu;
       }
-      mma.regs_bias2_ts[buffer_id] = 0x43004300u | (zp << 16) | zp;
+      mma.regs_bias2_ts[buffer_id] = kBiasBase | (zp << 16) | zp;
     } else {
       uint32_t zp = 0u;
       if constexpr (kHasZeroPoint) {

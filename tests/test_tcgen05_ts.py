@@ -47,10 +47,14 @@ def _run_ts(
     group_size=128,
     use_warp_spec=False,
     b_dtype=dtypes.uint4,
+    a_dtype=dtypes.bfloat16,
 ):
-    a_dtype = dtypes.bfloat16
-    c_dtype = dtypes.bfloat16
-    bs_dtype = dtypes.bfloat16
+    # Activation dtype drives the whole f16-family compute path: scales,
+    # zero-point dequant base, MMA operand format, and the drain convert
+    # all follow it. c/bs match a_dtype for the W(u4)A16 path.
+    c_dtype = a_dtype
+    bs_dtype = a_dtype
+    torch_a = torch.float16 if a_dtype == dtypes.float16 else torch.bfloat16
 
     torch.manual_seed(123)
     random_weight = generate_random_weight(
@@ -76,7 +80,7 @@ def _run_ts(
     bias = None
     if has_bias:
         torch.manual_seed(456)
-        bias = torch.randn(shape_n, dtype=torch.bfloat16, device=inputs.device)
+        bias = torch.randn(shape_n, dtype=torch_a, device=inputs.device)
 
     kernel = HummingKernel(
         shape_n=shape_n,
@@ -108,16 +112,16 @@ def _run_ts(
     # large K. Against the fp32-weight reference the K=8192 prod shape
     # drifts to ~0.9 abs err (bf16 accumulation noise, cf. workbook
     # B.38); against this reference mean err is ~4e-4 with max 1 ulp.
-    weight_ref = weight_ref.to(torch.bfloat16).float()
+    weight_ref = weight_ref.to(torch_a).float()
     outputs_ref = inputs_ref.matmul(weight_ref.T)
     if has_bias:
-        outputs_ref = outputs_ref + bias
-    outputs_ref = outputs_ref.to(torch.bfloat16)
+        outputs_ref = outputs_ref + bias.float()
+    outputs_ref = outputs_ref.to(torch_a)
     torch.cuda.synchronize()
 
     from humming import ops
     outputs = torch.empty(
-        (shape_m, shape_n), dtype=torch.bfloat16, device=inputs.device,
+        (shape_m, shape_n), dtype=torch_a, device=inputs.device,
     )
     launch_kwargs = dict(
         configs=[kernel.kernel_id],
@@ -157,6 +161,40 @@ def test_ts_512_cubed(has_zero_point):
         has_zero_point=has_zero_point,
     )
     _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# fp16 ACTIVATION (milestone 1, scalar-formats): a_dtype=float16. Weights
+# dequant to fp16 (0x6400 base), fp16 scales, idesc a/b format F16 (still
+# kind::f16), drain converts f32->fp16. Reference is the fp16-rounded-weight
+# (0x6400 dequant) GEMM -- (code-zp)*scale rounded to fp16 per element,
+# matching the kernel's half2 arithmetic. Output dtype must be float16.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shape_m", [16, 128, 256, 512], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("has_zero_point", [False, True])
+def test_ts_fp16_uint4(has_zero_point, shape_m):
+    block_m = 128 if shape_m >= 128 else 64
+    outputs, outputs_ref = _run_ts(
+        shape_m=shape_m, shape_n=512, shape_k=512,
+        block_shape=(block_m, 128, 64),
+        has_zero_point=has_zero_point, a_dtype=dtypes.float16,
+    )
+    assert outputs.dtype == torch.float16
+    assert outputs_ref.dtype == torch.float16
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_fp16_uint4_prod_shape():
+    """fp16 A x uint4 on a Llama70B-gate slice at large K (fp16-accum tail)."""
+    outputs, outputs_ref = _run_ts(
+        shape_m=128, shape_n=1024, shape_k=8192,
+        block_shape=(128, 128, 64), num_stages=4,
+        has_zero_point=True, a_dtype=dtypes.float16,
+    )
+    assert outputs.dtype == torch.float16
+    _assert_close(outputs, outputs_ref, atol=2.0)
 
 
 # ---------------------------------------------------------------------------

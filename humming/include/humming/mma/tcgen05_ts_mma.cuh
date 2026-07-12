@@ -59,29 +59,36 @@
 // range, the residual then finishes it -- each factor is a pure power of
 // two (mantissa preserved, no rounding), mirroring SS's mainloop 2^127 +
 // epilogue 2^6 split but folded entirely into transform_b.
-template <uint32_t kOff>
-CUDA_INLINE __nv_bfloat162 ts_mul_pow2(__nv_bfloat162 t) {
+template <uint32_t kOff, class EA = BFloat16>
+CUDA_INLINE typename F16Conversion<EA>::scalar_t2 ts_mul_pow2(
+    typename F16Conversion<EA>::scalar_t2 t) {
+  using Scalar2 = typename F16Conversion<EA>::scalar_t2;
   if constexpr (kOff == 0u) {
     return t;
   } else {
     constexpr uint32_t kW = kOff > 127u ? 127u : kOff;
-    const nv_bfloat162 f0 = prepare_exp_scale_factor<nv_bfloat162, kW>();
-    t = __hmul2(t, *reinterpret_cast<const __nv_bfloat162 *>(&f0));
+    const Scalar2 f0 = prepare_exp_scale_factor<Scalar2, kW>();
+    t = __hmul2(t, f0);
     if constexpr (kOff > kW) {
-      const nv_bfloat162 f1 = prepare_exp_scale_factor<nv_bfloat162, kOff - kW>();
-      t = __hmul2(t, *reinterpret_cast<const __nv_bfloat162 *>(&f1));
+      const Scalar2 f1 = prepare_exp_scale_factor<Scalar2, kOff - kW>();
+      t = __hmul2(t, f1);
     }
     return t;
   }
 }
 
-template <class EB, bool kHasZeroPoint>
+// Dequant one 16-bit-format code pair to ElementA (bf16 or fp16). EA drives
+// the dequant magic (bf16 0x4300 vs fp16 0x6400 base, via uint_to_f16 /
+// fp_to_fp / normalized_uint_to_fp) and the exp-offset element type. bf16 is
+// the shipped path (EA defaults to BFloat16, bit-exact).
+template <class EB, class EA, bool kHasZeroPoint>
 CUDA_INLINE uint32_t ts_dequant_b_pair(uint32_t shifted, uint32_t bias2) {
-  if constexpr (EB::kIsIntegerType && EB::kBits <= BFloat16::kMantissaBits) {
-    // uint{2,4}: bias2 is the folded bf16(128 + zp) subtrahend, so
+  using Scalar2 = typename F16Conversion<EA>::scalar_t2;
+  if constexpr (EB::kIsIntegerType && EB::kBits <= EA::kMantissaBits) {
+    // uint{2,4}: bias2 is the folded EA(2^(k-1) + zp) subtrahend, so
     // uint_to_f16 (kHasZeroPoint=true) always emits (code - zp); the
     // no-zp midpoint is baked into bias2 by s2r. No exp offset (kOff==0).
-    return uint_to_f16<EB, BFloat16, /*kHasZeroPoint=*/true,
+    return uint_to_f16<EB, EA, /*kHasZeroPoint=*/true,
                        /*kIsFpZeroPoint=*/false>(shifted, bias2);
   } else if constexpr (EB::kIsIntegerType) {
     // uint8: 8 > bf16 mantissa, so the 0x4300 trick breaks; route to
@@ -90,21 +97,21 @@ CUDA_INLINE uint32_t ts_dequant_b_pair(uint32_t shifted, uint32_t bias2) {
     // result is a subnormal ~(code-zp)*2^-133, corrected by 2^kOff (133).
     static_assert(EB::kBits == 8, "TS integer dtypes: {uint2, uint4, uint8}");
     constexpr uint32_t kOff =
-        get_dtype_dequant_exp_offset<BFloat16, EB, kHasZeroPoint>();
-    uint32_t v = normalized_uint_to_fp<EB, BFloat16, kHasZeroPoint,
+        get_dtype_dequant_exp_offset<EA, EB, kHasZeroPoint>();
+    uint32_t v = normalized_uint_to_fp<EB, EA, kHasZeroPoint,
                                        /*kIsFpZeroPoint=*/false>(shifted, bias2);
-    __nv_bfloat162 t = ts_mul_pow2<kOff>(*reinterpret_cast<__nv_bfloat162 *>(&v));
+    Scalar2 t = ts_mul_pow2<kOff, EA>(*reinterpret_cast<Scalar2 *>(&v));
     return *reinterpret_cast<uint32_t *>(&t);
   } else if constexpr (EB::kIsFloatingPointType && EB::kBits <= 8u) {
-    // Software fp -> bf16: relocate each code to the top of its 16-bit
+    // Software fp -> EA: relocate each code to the top of its 16-bit
     // half, decode via fp_to_fp (exponent bits copied, NOT rebiased),
     // then multiply by 2^kOff to correct the bias. For bf16 A the whole
     // fp4/fp8 offset (126/120 <= 127) lives in the mainloop weight
     // (get_epilogue_exp_offset == 0), so the caller's per-lane group-scale
     // hmul2 needs NO epilogue exp-offset plumbing (cf SS kEpilogueExpOffset).
-    constexpr uint32_t kOff = get_dtype_dequant_exp_offset<BFloat16, EB>();
-    uint32_t v = fp_to_fp<EB, BFloat16>(shifted << (BFloat16::kBits - EB::kBits));
-    __nv_bfloat162 t = ts_mul_pow2<kOff>(*reinterpret_cast<__nv_bfloat162 *>(&v));
+    constexpr uint32_t kOff = get_dtype_dequant_exp_offset<EA, EB>();
+    uint32_t v = fp_to_fp<EB, EA>(shifted << (EA::kBits - EB::kBits));
+    Scalar2 t = ts_mul_pow2<kOff, EA>(*reinterpret_cast<Scalar2 *>(&v));
     return *reinterpret_cast<uint32_t *>(&t);
   } else {
     static_assert(EB::kBits == 0,
@@ -125,6 +132,7 @@ public:
   using WarpShape = typename Ctx::WarpShape;
   using ElementA = typename Ctx::ElementA;
   using ElementB = typename Ctx::ElementB;
+  using ElementC = typename Ctx::ElementC;
   using CRegistersType = typename MmaOpClass::CRegisters;
   // Never used on this path (K_WARPS == 1 so smem_reducer is dead and
   // smem_writer is bypassed); any well-formed shape works.
@@ -172,9 +180,11 @@ public:
   static_assert(BlockShape::M == 64 || BlockShape::M == 128,
                 "TCGEN05_TS: BlockM (= MMA-N) must be 64 or 128 "
                 "(M=128 atom requires N % 16 == 0, N <= 256)");
-  static_assert(std::is_same<ElementA, BFloat16>::value,
-                "TCGEN05_TS: ElementA must be BFloat16 (kind::f16 idesc "
-                "and the 0x4300 dequant trick are bf16-specific)");
+  static_assert(std::is_same<ElementA, BFloat16>::value ||
+                    std::is_same<ElementA, Float16>::value,
+                "TCGEN05_TS: ElementA must be BFloat16 or Float16 (both issue "
+                "kind::f16; the dequant base is chosen per ElementA -- bf16 "
+                "0x4300 vs fp16 0x6400)");
   // TS weight-dtype allowlist: extended one dtype per milestone alongside
   // the matching ts_dequant_b_pair branch + ts_packing.py guard +
   // supports_tcgen05_ts clause. Start: {uint4}.
@@ -228,21 +238,22 @@ public:
   // Dequant (contract order) + WAR-gated r2t into the slot.
   CUDA_INLINE
   void transform_b(uint32_t buffer_id) {
+    using Scalar2 = typename F16Conversion<ElementA>::scalar_t2;
     uint32_t out[8];
     uint32_t bias2 = regs_bias2_ts[buffer_id];
-    const __nv_bfloat162 scale =
-        *reinterpret_cast<const __nv_bfloat162 *>(&regs_bs2_ts[buffer_id]);
+    const Scalar2 scale =
+        *reinterpret_cast<const Scalar2 *>(&regs_bs2_ts[buffer_id]);
     PRAGMA_UNROLL
     for (uint32_t w = 0; w < kWpr; w++) {
       uint32_t q = regs_qb[buffer_id][w];
       PRAGMA_UNROLL
       for (uint32_t r = 0; r < kRegsPerWord; r++) {
-        // Extract the (r, r + kVpw/2) codes of q into the lo/hi bf16
+        // Extract the (r, r + kVpw/2) codes of q into the lo/hi ElementA
         // halves and dequant per ElementB; the pack pre-compensates the
         // slot order so this yields reg = (K = 2*idx, K = 2*idx + 1).
-        uint32_t v = ts_dequant_b_pair<ElementB, kHasZeroPoint>(
+        uint32_t v = ts_dequant_b_pair<ElementB, ElementA, kHasZeroPoint>(
             q >> (r * kBBits), bias2);
-        __nv_bfloat162 t = *reinterpret_cast<__nv_bfloat162 *>(&v);
+        Scalar2 t = *reinterpret_cast<Scalar2 *>(&v);
         t = __hmul2(t, scale);
         out[w * kRegsPerWord + r] = *reinterpret_cast<uint32_t *>(&t);
       }
@@ -280,8 +291,14 @@ public:
     // BlockK == 64 -> single section, advance is iter_id * 2 uint128.
     int4 *act_ptr = &smem.stages[stage_id].a[0] + iter_id * 2u;
     uint64_t b_desc = tcgen05_smem_desc<128, BlockShape::K>(act_ptr);
-    // A<->B swap: idesc M = weight rows (128), N = activation MmaN.
-    uint32_t idesc = tcgen05_instr_desc_bf16_bf16_f32(kMmaM, BlockShape::M);
+    // A<->B swap: idesc M = weight rows (128), N = activation MmaN. Weights
+    // are dequanted to ElementA, so both operand formats follow ElementA
+    // (fp16 -> F16, bf16 -> BF16); the MMA kind stays f16 for both.
+    constexpr uint32_t kFmt = std::is_same<ElementA, Float16>::value
+                                  ? tcgen05_fmt::F16
+                                  : tcgen05_fmt::BF16;
+    uint32_t idesc =
+        tcgen05_instr_desc_f16fam_f32<kFmt, kFmt>(kMmaM, BlockShape::M);
 
     bool scale_d = !first_issue_;
     first_issue_ = false;
@@ -318,9 +335,12 @@ public:
 
     float bias_val = 0.0f;
     if constexpr (Ctx::kHasBias) {
-      const __nv_bfloat16 *smem_bias =
-          reinterpret_cast<const __nv_bfloat16 *>(&smem.bias[0]);
-      bias_val = __bfloat162float(smem_bias[n]);
+      using ScalarC = typename F16Conversion<ElementC>::scalar_t;
+      const ScalarC *smem_bias =
+          reinterpret_cast<const ScalarC *>(&smem.bias[0]);
+      bias_val = F16Conversion<ElementC>::num22float2(
+                     F16Conversion<ElementC>::num2num2(smem_bias[n]))
+                     .x;
     }
 
     uint32_t smem_reduce_base = offsetof(SharedStorage, reduce) / 128u % 8u;
@@ -329,7 +349,7 @@ public:
     // four swizzled 128-bit stores per lane per 32-m chunk, replacing
     // the scalar 2-byte scatter. Standalone-tested against a Python
     // model of the gmem_writer layout in tests/test_tmem_ts_drain.py.
-    tmem_ts_drain_transposed<BlockShape::M>(
+    tmem_ts_drain_transposed<BlockShape::M, ElementC>(
         d_base, n, smem.reduce, smem_reduce_base, bias_val);
     ctx.sync_math_threads();
     return nullptr;

@@ -25,13 +25,16 @@
 // After stage 3: lane = 8g + c, reg p = 4h + i2i1, half = i0, so the
 // int4 {v[4h] .. v[4h+3]} is n-ascending as the layout requires.
 
+#include <humming/datatype/base_conversion.cuh>
 #include <humming/utils/base.cuh>
 #include <humming/utils/ptx/tcgen05.cuh>
 
 // Drain one warp's 32 TMEM lanes x kBlockM cols. `n` is this thread's
 // weight row ((warp % 4) * 32 + lane); `bias_val` is added per-n in
-// f32 before the bf16 convert (uniform per thread, pre-transpose).
-template <uint32_t kBlockM>
+// f32 before the output convert (uniform per thread, pre-transpose).
+// ElementC selects the f32->16-bit output convert (bf16 vs fp16); the
+// swizzled smem.reduce layout is identical for both (2-byte elements).
+template <uint32_t kBlockM, class ElementC = BFloat16>
 CUDA_INLINE void tmem_ts_drain_transposed(uint32_t d_base,
                                           uint32_t n,
                                           int4 *reduce,
@@ -48,14 +51,15 @@ CUDA_INLINE void tmem_ts_drain_transposed(uint32_t d_base,
     tcgen05_ld_32x32b_x32(d_base + chunk * 32u, tmp);
     tcgen05_wait_ld();
 
-    // f32 -> bf16 pairs: v[p] = bf16x2 (m = m0+2p, m0+2p+1) of row n.
+    // f32 -> 16-bit pairs: v[p] = ElementC x2 (m = m0+2p, m0+2p+1) of row n.
+    using Scalar2 = typename F16Conversion<ElementC>::scalar_t2;
     uint32_t v[16];
     PRAGMA_UNROLL
     for (uint32_t p = 0; p < 16u; p++) {
       float2 f2 = make_float2(
           *reinterpret_cast<float *>(&tmp[2u * p]) + bias_val,
           *reinterpret_cast<float *>(&tmp[2u * p + 1u]) + bias_val);
-      __nv_bfloat162 b2 = __float22bfloat162_rn(f2);
+      Scalar2 b2 = F16Conversion<ElementC>::float22num2(f2);
       v[p] = *reinterpret_cast<uint32_t *>(&b2);
     }
 
