@@ -34,12 +34,19 @@
 // f32 before the output convert (uniform per thread, pre-transpose).
 // ElementC selects the f32->16-bit output convert (bf16 vs fp16); the
 // swizzled smem.reduce layout is identical for both (2-byte elements).
-template <uint32_t kBlockM, class ElementC = BFloat16>
+// kApplyRowScale folds a per-row (channelwise) weight scale `scale_val`
+// into the f32 accumulator before bias + convert: out = acc*scale + bias.
+// It commutes with the K-sum (scale is constant along K), so the drain is
+// the correct apply site. Compile-time off for the group path (identical
+// codegen, bf16 stays bit-exact).
+template <uint32_t kBlockM, class ElementC = BFloat16,
+          bool kApplyRowScale = false>
 CUDA_INLINE void tmem_ts_drain_transposed(uint32_t d_base,
                                           uint32_t n,
                                           int4 *reduce,
                                           uint32_t smem_reduce_base,
-                                          float bias_val) {
+                                          float bias_val,
+                                          float scale_val = 1.0f) {
   uint32_t lane = threadIdx.x % 32u;
   uint32_t c = lane % 8u;                       // m offset after transpose
   uint32_t octet = n / 8u;                      // int4 column pre-swizzle
@@ -56,9 +63,13 @@ CUDA_INLINE void tmem_ts_drain_transposed(uint32_t d_base,
     uint32_t v[16];
     PRAGMA_UNROLL
     for (uint32_t p = 0; p < 16u; p++) {
-      float2 f2 = make_float2(
-          *reinterpret_cast<float *>(&tmp[2u * p]) + bias_val,
-          *reinterpret_cast<float *>(&tmp[2u * p + 1u]) + bias_val);
+      float a0 = *reinterpret_cast<float *>(&tmp[2u * p]);
+      float a1 = *reinterpret_cast<float *>(&tmp[2u * p + 1u]);
+      if constexpr (kApplyRowScale) {
+        a0 *= scale_val;
+        a1 *= scale_val;
+      }
+      float2 f2 = make_float2(a0 + bias_val, a1 + bias_val);
       Scalar2 b2 = F16Conversion<ElementC>::float22num2(f2);
       v[p] = *reinterpret_cast<uint32_t *>(&b2);
     }

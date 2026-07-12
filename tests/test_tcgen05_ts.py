@@ -106,17 +106,36 @@ def _run_ts(
         use_stream_k=False,
     )
 
-    # The TS dequant rounds (code - zp) * scale to bf16 per element
-    # (plain __hmul2, same as the SS path's bs application) -- round the
-    # reference weights identically so the comparison stays tight at
-    # large K. Against the fp32-weight reference the K=8192 prod shape
-    # drifts to ~0.9 abs err (bf16 accumulation noise, cf. workbook
-    # B.38); against this reference mean err is ~4e-4 with max 1 ulp.
-    weight_ref = weight_ref.to(torch_a).float()
-    outputs_ref = inputs_ref.matmul(weight_ref.T)
-    if has_bias:
-        outputs_ref = outputs_ref + bias.float()
-    outputs_ref = outputs_ref.to(torch_a)
+    if group_size == 0:
+        # Channelwise: the kernel folds the per-row scale in the DRAIN,
+        # i.e. it dequants (code - zp) to the a_dtype (exact for the
+        # integer), K-sums, THEN multiplies each output column by the
+        # a_dtype-rounded scale. Mirror that apply order so the reference
+        # rounds identically (baking scale per-element as in the group
+        # path would round in the wrong place).
+        if has_zero_point:
+            zp = zero_point.float().reshape(shape_n, 1)
+        else:
+            zp = float(2 ** (b_dtype.num_bits - 1))
+        w_int = (weight_codes.float() - zp).to(torch_a).float()
+        acc = inputs_ref.matmul(w_int.T)
+        acc = acc * weight_scale.float().reshape(1, shape_n)
+        outputs_ref = acc
+        if has_bias:
+            outputs_ref = outputs_ref + bias.float()
+        outputs_ref = outputs_ref.to(torch_a)
+    else:
+        # The TS dequant rounds (code - zp) * scale to bf16 per element
+        # (plain __hmul2, same as the SS path's bs application) -- round the
+        # reference weights identically so the comparison stays tight at
+        # large K. Against the fp32-weight reference the K=8192 prod shape
+        # drifts to ~0.9 abs err (bf16 accumulation noise, cf. workbook
+        # B.38); against this reference mean err is ~4e-4 with max 1 ulp.
+        weight_ref = weight_ref.to(torch_a).float()
+        outputs_ref = inputs_ref.matmul(weight_ref.T)
+        if has_bias:
+            outputs_ref = outputs_ref + bias.float()
+        outputs_ref = outputs_ref.to(torch_a)
     torch.cuda.synchronize()
 
     from humming import ops
@@ -194,6 +213,36 @@ def test_ts_fp16_uint4_prod_shape():
         has_zero_point=True, a_dtype=dtypes.float16,
     )
     assert outputs.dtype == torch.float16
+    _assert_close(outputs, outputs_ref, atol=2.0)
+
+
+# ---------------------------------------------------------------------------
+# CHANNELWISE weight scale (milestone 2, scalar-formats): group_size=0, one
+# bf16 scale per output row over all K. Applied via epilogue-fold in the TS
+# drain (commutes with the K-sum) rather than per-code in transform_b. zp is
+# staged once in bzp_c. Reference matches the kernel's apply order: dequant
+# (code-zp) to bf16, K-sum, THEN multiply the row by the bf16 scale.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shape_m", [16, 128, 256], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("has_zero_point", [False, True])
+def test_ts_channelwise_uint4(has_zero_point, shape_m):
+    block_m = 128 if shape_m >= 128 else 64
+    outputs, outputs_ref = _run_ts(
+        shape_m=shape_m, shape_n=512, shape_k=512,
+        block_shape=(block_m, 128, 64),
+        group_size=0, has_zero_point=has_zero_point,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_channelwise_uint4_prod_shape():
+    outputs, outputs_ref = _run_ts(
+        shape_m=128, shape_n=1024, shape_k=8192,
+        block_shape=(128, 128, 64), num_stages=4,
+        group_size=0, has_zero_point=True,
+    )
     _assert_close(outputs, outputs_ref, atol=2.0)
 
 

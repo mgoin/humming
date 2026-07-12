@@ -95,8 +95,14 @@ def supports_tcgen05_ts(meta) -> bool:
         return False
     if meta.has_zero_point and meta.is_fp_zero_point:
         return False
-    # One scale group per BlockK=64 stage (kernel asserts gs >= BlockK).
-    if meta.weight_scale_group_size < 64:
+    # Weight scale: channelwise (gs == 0, folded per-row in the TS drain)
+    # or one group per BlockK=64 stage (gs >= BlockK). Block scale
+    # (group_size_n > 1) and sub-stage groups (gs < 64) are separate
+    # milestones.
+    if meta.weight_scale_group_size_n > 1:
+        return False
+    gs = meta.weight_scale_group_size
+    if gs != 0 and gs < 64:
         return False
     # BlockN == 128 (exactly one MMA-M tile), BlockK == 64.
     if meta.shape_n % 128 != 0 or meta.shape_k % 64 != 0:

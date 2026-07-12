@@ -136,8 +136,15 @@ public:
           std::is_same<ElementA, Float16>::value ? 0x64006400u : 0x43004300u;
       uint32_t zp = 1u << (kBBits - 1u);
       if constexpr (kHasZeroPoint) {
-        const uint8_t *bzp8 =
-            reinterpret_cast<const uint8_t *>(smem.stages[stage_id].bzp);
+        // Group zp is per-stage (stages[].bzp); channelwise zp is
+        // K-invariant, staged once in bzp_c by the channel g2s load.
+        // Both use the identical nibble packing (row n -> byte n/2,
+        // nibble n%2), so only the base pointer differs.
+        const uint8_t *bzp8;
+        if constexpr (kIsChannelWeightScale)
+          bzp8 = reinterpret_cast<const uint8_t *>(smem.bzp_c);
+        else
+          bzp8 = reinterpret_cast<const uint8_t *>(smem.stages[stage_id].bzp);
         zp = (bzp8[n >> 1] >> ((n & 1u) * 4u)) & 0xFu;
       }
       mma.regs_bias2_ts[buffer_id] = kBiasBase | (zp << 16) | zp;

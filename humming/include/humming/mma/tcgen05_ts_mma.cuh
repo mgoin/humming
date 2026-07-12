@@ -141,6 +141,8 @@ public:
   static constexpr bool kHasZeroPoint = Ctx::kHasZeroPoint;
   static constexpr bool kIsFpZeroPoint = Ctx::kIsFpZeroPoint;
   static constexpr bool kUseFusedE8m0Scale = Ctx::kUseFusedE8m0Scale;
+  static constexpr bool kIsGroupWeightScale = Ctx::kIsGroupWeightScale;
+  static constexpr bool kIsChannelWeightScale = Ctx::kIsChannelWeightScale;
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
 
@@ -199,11 +201,13 @@ public:
                 "(currently {uint2, uint4, uint8, float4e2m1, float8e4m3})");
   static_assert(!kIsFpZeroPoint,
                 "TCGEN05_TS: fp zero-point not yet wired for TS mode");
-  static_assert(Ctx::kIsGroupWeightScale,
-                "TCGEN05_TS prototype: group weight scale only");
-  static_assert(Ctx::kWeightScaleGroupSize >= BlockShape::K,
-                "TCGEN05_TS prototype: one scale group per stage "
-                "(group_size >= BlockK)");
+  static_assert(Ctx::kIsGroupWeightScale || Ctx::kIsChannelWeightScale,
+                "TCGEN05_TS: group or channelwise weight scale (block/mx "
+                "unsupported)");
+  static_assert(!Ctx::kIsGroupWeightScale ||
+                    Ctx::kWeightScaleGroupSize >= BlockShape::K,
+                "TCGEN05_TS prototype: one group-scale group per stage "
+                "(group_size >= BlockK); gs < BlockK is a separate milestone");
   static_assert(!Ctx::kReduceOverlapLastStageOnly,
                 "TCGEN05_TS: reduce_overlap_last_stage_only unsupported");
 
@@ -254,7 +258,10 @@ public:
         uint32_t v = ts_dequant_b_pair<ElementB, ElementA, kHasZeroPoint>(
             q >> (r * kBBits), bias2);
         Scalar2 t = *reinterpret_cast<Scalar2 *>(&v);
-        t = __hmul2(t, scale);
+        // Group scale folds here (per-lane, per-stage). Channelwise scale
+        // is K-invariant and commutes with the K-sum, so it is deferred
+        // to the drain (epilogue-fold) and NOT applied per code here.
+        if constexpr (kIsGroupWeightScale) t = __hmul2(t, scale);
         out[w * kRegsPerWord + r] = *reinterpret_cast<uint32_t *>(&t);
       }
     }
@@ -343,14 +350,31 @@ public:
                      .x;
     }
 
+    // Channelwise weight scale: one bf16 scalar per output row n, staged
+    // in smem.bs_c by the channel g2s load. It commutes with the K-sum,
+    // so we fold it here (the group path folds its scale in transform_b
+    // instead). Read in natural n order -- the g2s copies the CTA's
+    // 128-row N slice contiguously, matching the bias read above.
+    float scale_val = 1.0f;
+    if constexpr (kIsChannelWeightScale) {
+      using ScalarBS = typename F16Conversion<
+          typename Ctx::ElementBS>::scalar_t;
+      const ScalarBS *smem_bs =
+          reinterpret_cast<const ScalarBS *>(&smem.bs_c[0]);
+      scale_val = F16Conversion<typename Ctx::ElementBS>::num22float2(
+                      F16Conversion<typename Ctx::ElementBS>::num2num2(
+                          smem_bs[n]))
+                      .x;
+    }
+
     uint32_t smem_reduce_base = offsetof(SharedStorage, reduce) / 128u % 8u;
     uint32_t d_base = smem.tcgen05_tmem_col + kDColOffset;
     // Vectorized drain (tmem_ts_drain.cuh): 8x8 register transpose +
     // four swizzled 128-bit stores per lane per 32-m chunk, replacing
     // the scalar 2-byte scatter. Standalone-tested against a Python
     // model of the gmem_writer layout in tests/test_tmem_ts_drain.py.
-    tmem_ts_drain_transposed<BlockShape::M, ElementC>(
-        d_base, n, smem.reduce, smem_reduce_base, bias_val);
+    tmem_ts_drain_transposed<BlockShape::M, ElementC, kIsChannelWeightScale>(
+        d_base, n, smem.reduce, smem_reduce_base, bias_val, scale_val);
     ctx.sync_math_threads();
     return nullptr;
   }
