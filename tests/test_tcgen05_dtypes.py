@@ -209,13 +209,16 @@ PROD_PROBE_SHAPE = (512, 512, 4096)
 # locks them in -- any future heuristic change that picks a different
 # config for an opted-in dtype must update this map.
 #
-# Note: at probe shape (128, 128, 256) the WS+TMA path triggers an
-# edge-case bug for some (dtype, stages, BlockK) combinations -- see
-# workbook B.37. The configs listed here are the ones verified safe.
+# Note: uint4 was originally demoted to BlockK=64 here by the
+# workbook-B.37 WS+TMA corruption at BlockK=128 s4. B.37 was
+# root-caused (track-f round 3, benchmarks/probe_b37_alias.py) to the
+# un-fenced/un-awaited TMA-C epilogue read of smem.reduce and fixed in
+# gmem_writer.cuh + the kernels; uint4 is back on the tuned
+# BlockK=128 s4 config the sm100 heuristic ships.
 SAFE_PROD_WS_CONFIG = {
     # (b_name, has_zp) -> (block_shape, warp_shape, num_stages)
-    ("uint4", True):  ((128, 128, 64),  (32, 64, 64),  3),
-    ("uint4", False): ((128, 128, 64),  (32, 64, 64),  3),
+    ("uint4", True):  ((128, 128, 128), (32, 64, 128), 4),
+    ("uint4", False): ((128, 128, 128), (32, 64, 128), 4),
     ("uint3", True):  ((128, 128, 128), (32, 64, 128), 3),
     ("uint5", True):  ((128, 128, 128), (32, 64, 128), 3),
     ("uint6", True):  ((128, 128, 128), (32, 64, 128), 3),

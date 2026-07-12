@@ -123,18 +123,32 @@ public:
   CUDA_INLINE
   void write_tma(uint32_t slice_id, uint32_t slice_count) {
     static_assert(!kIsIndexedGemm);
+    // smem.reduce was written through the GENERIC proxy (st.shared);
+    // cp.async.bulk.tensor reads it through the ASYNC proxy. PTX
+    // requires fence.proxy.async between them. Omitting it is the
+    // workbook-B.37 "WS+TMA race": the store engine read pre-drain
+    // SMEM content (stage-0 A bytes -- smem.reduce aliases stages[0]
+    // in the union), proven bit-exactly by
+    // benchmarks/probe_b37_alias.py.
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     constexpr uint32_t count = BlockShape::N / 64;
     const uint32_t block_idx = threadIdx.x;
     const uint32_t smem_offset = BlockShape::M * 64 / 8 * block_idx;
     const uint32_t col_offset2 = col_offset + 64 * block_idx;
+    // cp.async.bulk.wait_group only tracks COMMITTED groups; without
+    // the commit_group after each issue, every later
+    // `tma_wait_store_group` in the kernels was a no-op.
     if (block_idx < count) {
       if constexpr (!kUseStreamK) {
         tma_store_2d(ctx.smem.reduce + smem_offset, tensor_map_ptr, col_offset2, row_offset);
+        tma_commit_store_group();
       } else if (slice_count == 1 || slice_id == 0) {
         tma_store_2d(ctx.smem.reduce + smem_offset, tensor_map_ptr, col_offset2, row_offset);
+        tma_commit_store_group();
         if (slice_count > 1) tma_wait_store_group<0>();
       } else {
         tma_reduce_add_2d(ctx.smem.reduce + smem_offset, tensor_map_ptr, col_offset2, row_offset);
+        tma_commit_store_group();
         if (slice_id != slice_count - 1) tma_wait_store_group<0>();
       }
     }

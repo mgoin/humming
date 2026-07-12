@@ -121,7 +121,14 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     epilogue.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.current_shape_m, scheduler.m_offset);
     epilogue.set_streamk_state(scheduler.slice_count, scheduler.slice_id, scheduler.locks_offset);
 
-    if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
+    // The wait is PER-THREAD (only the issuing threads track the bulk
+    // group): barrier so no thread starts overwriting stage SMEM --
+    // which aliases smem.reduce in the union -- while the TMA-C engine
+    // of the previous block is still reading it.
+    if constexpr (TuningConfig::kUseTmaC) {
+      tma_wait_store_group<0, true>();
+      __syncthreads();
+    }
     producer.template load_stage<true, true>(0);
     PRAGMA_UNROLL
     for (uint32_t stage_id = 1; stage_id < MAX(kNumStages - 1, 2); stage_id++) {
@@ -189,6 +196,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     __syncthreads();
     epilogue.call(mma.final_regs_c_as_ptr());
   }
+
+  // Drain the last block's TMA-C store before the CTA retires: exiting
+  // with an un-awaited bulk-async group leaves the engine reading SMEM
+  // whose lifetime ends with the CTA.
+  if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
 
   // Release the TMEM column allocation before kernel exit. tcgen05.*
   // is .sync.aligned -- must be warp-uniform.

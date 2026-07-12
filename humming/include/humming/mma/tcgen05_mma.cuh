@@ -58,7 +58,6 @@
 // #define TCGEN05_DEBUG_NO_SCATTER 1
 // #define TCGEN05_DEBUG_DRAIN_PER_ITER 1
 // #define TCGEN05_DEBUG_DEFER_ARRIVE 1
-// #define TCGEN05_DEBUG_SCATTER_PROXY_FENCE 1
 // #define TCGEN05_DEBUG_TMEM_DUMP 1
 
 
@@ -195,17 +194,14 @@ public:
                 "TCGEN05: closed-form scatter offsets diverge from the "
                 "reference element-wise swizzle formula");
 
-  // Closed-form scatter opt-in. The closed form is address-equivalent
-  // (static_assert above), but its faster stores re-expose a latent
-  // nondeterministic WS+TMA corruption at BlockK=64 prod configs (the
-  // workbook B.37 PROD_WS_KNOWN_BROKEN set: uint4 zp={T,F}, uint8
-  // zp=T at (512,512,4096), block (128,128,64) s3). MMA-drain probes
-  // before every scatter AND before stage release do NOT fix it, so
-  // it is not a simple staging WAR -- root cause open (track-f notes
-  // F.5). BlockK >= 128 (the production heuristic config) shows no
-  // failure across the dtype matrix and the tcgen05 test suite, so
-  // gate on that and keep the element-wise formula for BlockK=64.
-  static constexpr bool kUseClosedFormScatter = BlockShape::K >= 128;
+  // Closed-form scatter, address-equivalent to the element-wise
+  // formula (static_assert above). Its faster stores used to
+  // re-expose the workbook-B.37 WS+TMA corruption at BlockK=64,
+  // which forced a BlockK >= 128 gate here; B.37 was root-caused
+  // (track-f round 3) to the un-fenced/un-awaited TMA-C epilogue
+  // read of smem.reduce -- fixed in gmem_writer.cuh + the kernels --
+  // so the closed form is now enabled everywhere.
+  static constexpr bool kUseClosedFormScatter = true;
 
   Ctx &ctx;
   SharedStorage &smem;
@@ -352,7 +348,10 @@ public:
     // (one K-chunk of 16 bf16 per K-iter) and `transform_b` only
     // receives buffer_id from humming's mainloop. The dequant results
     // stay in `regs_b_tmp[buffer_id]` until run() consumes them.
-    fence_proxy_async_shared_cta();
+    // NOTE: no fence here -- transform_b writes REGISTERS only. The
+    // fence.proxy.async that publishes the scatter lives in run(),
+    // between the scatter stores and sync_math_threads (it used to be
+    // here, i.e. on the wrong side of the UTCMMA in SASS).
   }
 
   CUDA_INLINE
@@ -486,18 +485,17 @@ public:
       }
     }
 #endif
-#ifdef TCGEN05_DEBUG_SCATTER_PROXY_FENCE
     // Publish the generic-proxy scatter stores to the async proxy
     // that tcgen05.mma reads B through (PTX ISA: cross-proxy ordering
     // requires fence.proxy.async; the bar.sync alone gives only
     // generic-proxy ordering). CUTLASS emits this fence after every
-    // dequant-store batch before UMMA issue.
+    // dequant-store batch before UMMA issue. This fence used to sit
+    // at the END of transform_b (after a register-only dequant --
+    // useless, and in SASS it landed after the UTCMMA); track-f
+    // round 3 moved it here. Not the B.37 race (that was the TMA-C
+    // epilogue read), but formally required.
     fence_proxy_async_shared_cta();
-#endif
-    // The scatter above uses regular SMEM stores (non-async), so the
-    // implicit __threadfence_block from the bar.sync/__syncthreads is
-    // sufficient to make them visible to subsequent tcgen05.mma SMEM
-    // reads. ctx.sync_math_threads() becomes:
+    // ctx.sync_math_threads() becomes:
     //   * __syncthreads() when kNumMathThreads == kNumThreads
     //     (non-warp-spec path)
     //   * bar.sync 1, kNumMathThreads under warp-spec (producer
@@ -652,6 +650,9 @@ public:
 #else
       uint32_t addr = base_addr + ni * 32u;
       tcgen05_ld_32x32b_x32(addr, tmp);
+      // tcgen05.ld is ASYNC -- `tmp` is undefined until wait::ld
+      // (track-e fix #1; masked by SASS scheduling luck without it).
+      tcgen05_wait_ld();
       // No per-ni `tcgen05_fence_view_async_tmem_store()` -- the
       // outer commit+mbar_wait that drained the K-loop MMA chain
       // (above) already ordered TMEM writes vs these reads, and

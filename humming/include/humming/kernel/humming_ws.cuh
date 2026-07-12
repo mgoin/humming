@@ -204,7 +204,16 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
       if constexpr (kReduceOverlapLastStageOnly) consumer.arrive(kNumStages);
       epilogue.call(mma.final_regs_c_as_ptr());
-      if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
+      // The TMA-store wait is PER-THREAD: only the issuing threads
+      // (block_idx < BlockN/64 inside write_tma) track the bulk group.
+      // Without the barrier the other math warps' lane-0s arrive on
+      // math_mbar[kNumStages] while the TMA-C engine is still READING
+      // smem.reduce -- which aliases stages[0] in the SMEM union -- so
+      // the producer's next-block loads overwrite the bytes mid-read.
+      if constexpr (TuningConfig::kUseTmaC) {
+        tma_wait_store_group<0, true>();
+        ctx.sync_math_threads();
+      }
       if constexpr (!kReduceOverlapLastStageOnly) consumer.arrive(kNumStages);
     }
     // Release TMEM (mirrors humming.cuh). All 32 threads of warp 0 must

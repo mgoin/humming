@@ -460,6 +460,12 @@ CUDA_INLINE void tcgen05_fence_view_async_tmem_store() {
   asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
 }
 
+CUDA_INLINE void tcgen05_wait_ld() {
+  // tcgen05.ld is ASYNC: its destination registers are undefined until
+  // this wait retires (track-e fix #1).
+  asm volatile("tcgen05.wait::ld.sync.aligned;\n" ::: "memory");
+}
+
 
 // ============================================================================
 // TMEM→register load (t2r) for the epilogue
