@@ -188,6 +188,7 @@ class HummingLayerMethod:
         has_bias: bool = False,
         torch_dtype: torch.dtype | None = None,
         sublayer_name: str = "",
+        mma_type: MmaType | str | None = None,
     ):
         if torch_dtype is None:
             torch_dtype = get_default_f16_torch_dtype()
@@ -219,6 +220,7 @@ class HummingLayerMethod:
             has_zero_point=weight_schema.has_zero_point,
             is_fp_zero_point=weight_schema.is_fp_zero_point,
             sublayer_name=sublayer_name,
+            mma_type=mma_type,
         )
 
         if not hasattr(layer, "humming_metas"):
@@ -425,6 +427,21 @@ class HummingLayerMethod:
         if meta.use_fused_e8m0_scale and meta.a_dtype == dtypes.float8e4m3:
             interleave_mode = 2
 
+        # TS-mode tcgen05 opt-in (see Sm100Heuristics.get_config): a layer
+        # requests TS by setting meta.mma_type == TCGEN05, which selects the
+        # slot-paired TS weight/scale/zp packing at EVERY M. The kernel
+        # dispatch (get_config) only routes such a meta through the TS kernel
+        # when supports_tcgen05_ts is also true, so pack in lockstep with it.
+        use_tcgen05_ts = meta.mma_type == MmaType.TCGEN05
+        if use_tcgen05_ts:
+            from humming.tune import get_heuristics_class
+
+            assert get_heuristics_class().supports_tcgen05_ts(meta), (
+                "meta.mma_type=TCGEN05 opts into TS-mode packing, but this "
+                "device/shape is not TS-legal; see "
+                "Sm100Heuristics.supports_tcgen05_ts."
+            )
+
         weight = prepare_humming_weight(
             weight=weight,
             b_dtype=meta.b_dtype,
@@ -434,17 +451,24 @@ class HummingLayerMethod:
             use_fused_e8m0_scale=meta.use_fused_e8m0_scale,
             packed=True,
             interleave_mode=interleave_mode,
+            use_tcgen05_ts=use_tcgen05_ts,
         )
 
         if weight_scale is not None:
             weight_scale = prepare_humming_weight_scale(
                 weight_scale,
-                to_apply_on_c=meta.should_apply_bs_on_c,
+                to_apply_on_c=False if use_tcgen05_ts else meta.should_apply_bs_on_c,
                 is_blockwise=meta.weight_scale_type == WeightScaleType.BLOCK,
+                use_tcgen05_ts=use_tcgen05_ts,
             )
 
         if zero_point is not None:
-            zero_point = prepare_humming_zero_point(zero_point, meta.b_dtype, packed=True)
+            zero_point = prepare_humming_zero_point(
+                zero_point,
+                meta.b_dtype,
+                packed=True,
+                use_tcgen05_ts=use_tcgen05_ts,
+            )
 
         if bias is not None:
             bias = prepare_humming_bias(bias)
@@ -631,6 +655,11 @@ class HummingLayer(HummingModule):
     num_experts: int | None = None
     has_bias: bool = False
     torch_dtype: torch.dtype | None = None
+    # Opt into an explicit MMA path. None keeps the per-device default
+    # (mma.sync/wgmma). "tcgen05" requests the TS-mode Blackwell kernel
+    # and its packed weight/scale/zp layouts (see prepare_layer_meta and
+    # Sm100Heuristics.supports_tcgen05_ts).
+    mma_type: MmaType | str | None = None
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -874,6 +903,7 @@ class HummingLayer(HummingModule):
             pad_k_to_multiple=self.pad_k_to_multiple,
             torch_dtype=self.torch_dtype,
             has_bias=self.has_bias,
+            mma_type=self.mma_type,
         )
 
         HummingLayerMethod.transform_humming_layer(self)

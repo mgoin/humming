@@ -6,9 +6,13 @@ import pytest
 import torch
 
 from humming import dtypes
-from humming.config import GemmType
+from humming.config import GemmType, MmaType
 from humming.layer import HummingLayerMeta
-from humming.tune.sm100 import Sm100Heuristics, _is_tcgen05_eligible
+from humming.tune.sm100 import (
+    Sm100Heuristics,
+    _is_tcgen05_eligible,
+    supports_tcgen05_ts,
+)
 
 
 def _is_blackwell() -> bool:
@@ -136,3 +140,84 @@ def test_heuristic_tile_count_fallback():
     assert not _is_tcgen05_eligible(meta, 128, GemmType.DENSE)
     # Same shape at M=256 (96 tiles) crosses the floor.
     assert _is_tcgen05_eligible(meta, 256, GemmType.DENSE)
+
+
+# ---------------------------------------------------------------------------
+# TS-mode ("method 2") opt-in: meta.mma_type == TCGEN05.
+# ---------------------------------------------------------------------------
+
+
+def _make_ts_meta(shape_n=14336, shape_k=4096, **kw):
+    return HummingLayerMeta(
+        shape_n=shape_n, shape_k=shape_k,
+        a_dtype=dtypes.bfloat16, b_dtype=dtypes.uint4,
+        c_dtype=dtypes.bfloat16, bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=kw.pop("weight_scale_group_size", 128),
+        has_zero_point=kw.pop("has_zero_point", True),
+        mma_type="tcgen05", **kw,
+    )
+
+
+def test_supports_tcgen05_ts_legal():
+    assert supports_tcgen05_ts(_make_meta(14336, 4096))
+    assert Sm100Heuristics.supports_tcgen05_ts(_make_meta(512, 512))
+
+
+@pytest.mark.parametrize("meta", [
+    # N not a multiple of 128 (only 64).
+    HummingLayerMeta(
+        shape_n=192, shape_k=4096, a_dtype=dtypes.bfloat16, b_dtype=dtypes.uint4,
+        c_dtype=dtypes.bfloat16, bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=128, has_zero_point=True),
+    # Scale group smaller than a BlockK=64 stage.
+    HummingLayerMeta(
+        shape_n=512, shape_k=512, a_dtype=dtypes.bfloat16, b_dtype=dtypes.uint4,
+        c_dtype=dtypes.bfloat16, bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=32, has_zero_point=True),
+    # fp8 activations: not the bf16 x uint4 TS shape.
+    HummingLayerMeta(
+        shape_n=14336, shape_k=4096, a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float8e4m3, c_dtype=dtypes.bfloat16, bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=128, has_zero_point=False),
+    # MoE (experts) is not wired into the TS kernel.
+    HummingLayerMeta(
+        shape_n=14336, shape_k=4096, num_experts=8, a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4, c_dtype=dtypes.bfloat16, bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=128, has_zero_point=True),
+])
+def test_supports_tcgen05_ts_rejects(meta):
+    assert not supports_tcgen05_ts(meta)
+
+
+@pytest.mark.parametrize("shape_m, block_m", [(64, 64), (128, 128), (2048, 128)])
+def test_ts_opt_in_config(shape_m, block_m):
+    """A TCGEN05 meta gets the TS config at EVERY M (no mma.sync
+    crossover): BlockK=64, warp-spec + TMA, use_tcgen05_ts set."""
+    meta = _make_ts_meta()
+    assert meta.mma_type == MmaType.TCGEN05
+    cfg = Sm100Heuristics.get_config(meta, shape_m=shape_m)
+    assert cfg["use_tcgen05_ts"] is True
+    assert cfg["use_tcgen05"] is True
+    assert cfg["mma_type"] == "tcgen05"
+    assert cfg["block_shape"] == (block_m, 128, 64)
+    assert cfg["warp_shape"] == (block_m, 32, 64)
+    assert cfg["use_warp_spec"] is True and cfg["use_tma"] is True
+
+
+def test_default_meta_never_gets_ts():
+    """Without the TCGEN05 opt-in the config is the SS/mma.sync path:
+    use_tcgen05_ts is never set, at every M."""
+    meta = _make_meta(14336, 4096)
+    assert meta.mma_type != MmaType.TCGEN05
+    for shape_m in [16, 64, 128, 512, 2048]:
+        cfg = Sm100Heuristics.get_config(meta, shape_m=shape_m)
+        assert not cfg.get("use_tcgen05_ts")
+
+
+def test_ts_opt_in_illegal_shape_falls_through():
+    """mma_type=TCGEN05 but a TS-illegal shape (N not %128) must NOT
+    emit a TS config -- the packer would refuse such a layer."""
+    meta = _make_ts_meta(shape_n=192, shape_k=4096)
+    assert not supports_tcgen05_ts(meta)
+    cfg = Sm100Heuristics.get_config(meta, shape_m=512)
+    assert not cfg.get("use_tcgen05_ts")

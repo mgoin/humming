@@ -208,3 +208,70 @@ def test_ts_prod_shape():
         block_shape=(128, 128, 64), num_stages=4,
     )
     _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end opt-in through the HummingLayer wrapper: mma_type="tcgen05"
+# threads meta.mma_type=TCGEN05 -> TS packing (transform) -> TS kernel
+# (get_heuristics_config). Compared against the trusted default
+# (mma.sync/SS) path on the SAME quantized weights -- both dequant the
+# same codes, so they agree to bf16 noise.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shape_m", [64, 256])
+def test_ts_layer_opt_in_matches_default(shape_m):
+    from humming.config import MmaType
+    from humming.layer import HummingLayer
+    from humming.schema.humming import HummingWeightSchema
+
+    shape_n, shape_k, group_size = 512, 512, 128
+    schema = HummingWeightSchema(
+        b_dtype=dtypes.uint4, bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=group_size, has_zero_point=True,
+    )
+
+    def build(mma_type):
+        torch.manual_seed(7)
+        w = torch.randn(shape_n, shape_k, dtype=torch.bfloat16,
+                        device="cuda") / (shape_k ** 0.5)
+        layer = HummingLayer(
+            shape_n=shape_n, shape_k=shape_k, weight_config=schema,
+            torch_dtype=torch.bfloat16, mma_type=mma_type,
+        ).cuda()
+        layer.load_from_unquantized(w)
+        layer.transform()
+        return layer
+
+    layer_default = build(None)
+    layer_ts = build("tcgen05")
+    assert layer_default.humming_metas[""].mma_type == MmaType.MMA
+    assert layer_ts.humming_metas[""].mma_type == MmaType.TCGEN05
+
+    torch.manual_seed(11)
+    x = torch.randn(shape_m, shape_k, dtype=torch.bfloat16,
+                    device="cuda") / (shape_k ** 0.5)
+    out_default = layer_default.forward(x.clone())
+    out_ts = layer_ts.forward(x.clone())
+    torch.cuda.synchronize()
+    _assert_close(out_ts, out_default)
+
+
+def test_ts_layer_illegal_shape_rejected():
+    """mma_type=tcgen05 on a TS-illegal shape (N not %128) must fail at
+    transform, not silently mispack."""
+    from humming.layer import HummingLayer
+    from humming.schema.humming import HummingWeightSchema
+
+    schema = HummingWeightSchema(
+        b_dtype=dtypes.uint4, bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=128, has_zero_point=True,
+    )
+    w = torch.randn(192, 512, dtype=torch.bfloat16, device="cuda") / (512 ** 0.5)
+    layer = HummingLayer(
+        shape_n=192, shape_k=512, weight_config=schema,
+        torch_dtype=torch.bfloat16, mma_type="tcgen05",
+    ).cuda()
+    layer.load_from_unquantized(w)
+    with pytest.raises(AssertionError, match="TS-legal"):
+        layer.transform()

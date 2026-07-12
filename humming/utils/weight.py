@@ -258,7 +258,15 @@ def prepare_humming_weight_scale(
     weight_scale: torch.Tensor,
     to_apply_on_c: bool = False,
     is_blockwise: bool = False,
+    use_tcgen05_ts: bool = False,
 ) -> torch.Tensor:
+    if use_tcgen05_ts:
+        # TS-mode lane = row ownership: natural [K/gs, N] order, no
+        # fragment permutation (docs/tcgen05_ts_packing.md SS5).
+        assert not to_apply_on_c and not is_blockwise
+        from humming.utils.ts_packing import pack_scales_tcgen05_ts
+        return pack_scales_tcgen05_ts(weight_scale)
+
     if is_blockwise:
         return weight_scale.transpose(-1, -2).contiguous()
 
@@ -285,9 +293,11 @@ def prepare_humming_zero_point(
     zero_point: torch.Tensor,
     dtype: dtypes.DataType,
     packed: bool = False,
+    use_tcgen05_ts: bool = False,
 ) -> torch.Tensor | None:
     num_experts = None if zero_point.ndim == 2 else zero_point.size(0)
     if zero_point.dtype.is_floating_point:
+        assert not use_tcgen05_ts, "TS mode requires integer zero points"
         return prepare_humming_weight_scale(zero_point, False)
 
     if packed:
@@ -295,6 +305,12 @@ def prepare_humming_zero_point(
         zero_point = zero_point.squeeze().view(*zero_point.shape)
         zero_point = ops.unpack_weight(zero_point, dtype.num_bits)
         zero_point = zero_point.transpose(-1, -2).contiguous()
+
+    if use_tcgen05_ts:
+        from humming.utils.ts_packing import pack_zero_point_tcgen05_ts
+        return pack_zero_point_tcgen05_ts(
+            zero_point.to(torch.int32), dtype.num_bits
+        )
 
     assert zero_point is not None
     num_zp_bits = 4 if dtype.num_bits <= 4 else 8

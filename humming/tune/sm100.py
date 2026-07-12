@@ -13,9 +13,8 @@ data and `workbook.md` for the rationale of each cutoff.
 """
 
 from humming import dtypes
-from humming.config import GemmType
+from humming.config import GemmType, MmaType
 from humming.tune.sm8x import Sm89Heuristics
-
 
 # B-dtypes opted in for the TCGEN05 path. Each entry maps to a
 # (block_k, num_stages) config in `_tcgen05_config_for_b_dtype`. The
@@ -66,6 +65,32 @@ def _tcgen05_config_for_b_dtype(b_dtype, shape_k_aligned_128):
         return 64, 4
     # Fallback for any future opt-in: BlockK=64 stages=4.
     return 64, 4
+
+
+def supports_tcgen05_ts(meta) -> bool:
+    """M-independent legality of the TS-mode tcgen05 kernel for `meta`
+    (mirrors the static_asserts in `mma/tcgen05_ts_mma.cuh`). TS-mode
+    needs the slot-paired TS weight/scale/zp packing
+    (docs/tcgen05_ts_packing.md), which is NOT interchangeable with the
+    layout mma.sync / SS-tcgen05 read -- so a TS layer runs TS at
+    every M, and the opt-in lives on the meta (mma_type == TCGEN05),
+    not on a per-M crossover.
+    """
+    if meta.num_experts:
+        return False
+    if meta.a_dtype != dtypes.bfloat16 or meta.b_dtype != dtypes.uint4:
+        return False
+    if meta.bs_dtype != dtypes.bfloat16:
+        return False
+    if meta.has_zero_point and meta.is_fp_zero_point:
+        return False
+    # One scale group per BlockK=64 stage (kernel asserts gs >= BlockK).
+    if meta.weight_scale_group_size < 64:
+        return False
+    # BlockN == 128 (exactly one MMA-M tile), BlockK == 64.
+    if meta.shape_n % 128 != 0 or meta.shape_k % 64 != 0:
+        return False
+    return True
 
 
 def _is_tcgen05_eligible(meta, shape_m: int, gemm_type: GemmType) -> bool:
@@ -145,6 +170,10 @@ class Sm100Heuristics(Sm89Heuristics):
     ]
 
     @classmethod
+    def supports_tcgen05_ts(cls, meta) -> bool:
+        return supports_tcgen05_ts(meta)
+
+    @classmethod
     def get_config(
         cls,
         meta,
@@ -153,6 +182,41 @@ class Sm100Heuristics(Sm89Heuristics):
         use_batch_invariant=False,
         gemm_type=GemmType.DENSE,
     ):
+        # TS-mode tcgen05 ("method 2"): explicit opt-in via
+        # meta.mma_type == TCGEN05 because it changes the packed
+        # weight/scale/zp layouts for the whole layer (see
+        # transform_humming_layer). Where legal it is used at EVERY M
+        # (no mma.sync fallback can read TS packing). Measured on B300
+        # GPU0 vs the per-M mma.sync/SS mix of the default path:
+        # ties mma.sync at M <= 64 (0.93-0.96x), loses only at fat-K
+        # M=128 (0.77x), and wins 1.5x+ at M >= 128 fat-N / M >= 256
+        # fat-K; beats closed-form SS BK128 1.01-1.22x everywhere.
+        # Default metas keep the SS/mma.sync behavior below -- TS as
+        # the sm100 default stays gated on the open producer-race
+        # root cause (synthesis round-2 SS2b).
+        if (
+            gemm_type == GemmType.DENSE
+            and meta.mma_type == MmaType.TCGEN05
+            and supports_tcgen05_ts(meta)
+        ):
+            block_m = 128 if shape_m >= 128 else 64
+            return {
+                "block_shape": (block_m, 128, 64),
+                "warp_shape": (block_m, 32, 64),
+                "num_stages": 4,
+                "num_ctas_per_sm": 1,
+                "num_write_splits": 1,
+                "mma_type": "tcgen05",
+                "use_tcgen05": True,
+                "use_tcgen05_ts": True,
+                "use_warp_spec": True,
+                "use_tma": True,
+                "use_cp_async": False,
+                "use_mbarrier": True,
+                "use_tma_bzp": False,
+                "raster_group_m": 1,
+            }
+
         if _is_tcgen05_eligible(meta, shape_m, gemm_type):
             # TCGEN05 config selected per benchmarks/bench_blocksize +
             # bench_blockk_fatk:

@@ -20,6 +20,13 @@ class DeviceHeuristics:
     sm_version: int = 0
 
     @classmethod
+    def supports_tcgen05_ts(cls, meta) -> bool:
+        """Whether the TS-mode tcgen05 kernel (and thus the TS packed
+        weight/scale/zp layouts) is available for `meta` on this
+        device. Overridden by Sm100Heuristics."""
+        return False
+
+    @classmethod
     def get_base_config(
         cls,
         a_dtype: dtypes.DataType,
