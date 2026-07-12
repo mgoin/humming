@@ -76,8 +76,10 @@ def supports_tcgen05_ts(meta) -> bool:
     every M, and the opt-in lives on the meta (mma_type == TCGEN05),
     not on a per-M crossover.
     """
-    if meta.num_experts:
-        return False
+    # MoE (num_experts>0) is TS-legal: grouping lives entirely above the
+    # MMA (scheduler -> g2s loaders -> epilogue); the TS mainloop/drain
+    # are grouping-agnostic (POC-proven contiguous+masked, B300). Only
+    # get_config's GROUPED_* dispatch below decides the grouped block_m.
     if meta.a_dtype != dtypes.bfloat16 or meta.b_dtype != dtypes.uint4:
         return False
     if meta.bs_dtype != dtypes.bfloat16:
@@ -194,12 +196,28 @@ class Sm100Heuristics(Sm89Heuristics):
         # Default metas keep the SS/mma.sync behavior below -- TS as
         # the sm100 default stays gated on the open producer-race
         # root cause (synthesis round-2 SS2b).
+        _TS_GEMM_TYPES = (
+            GemmType.DENSE,
+            GemmType.GROUPED_CONTIGUOUS,
+            GemmType.GROUPED_MASKED,
+        )
         if (
-            gemm_type == GemmType.DENSE
+            gemm_type in _TS_GEMM_TYPES
             and meta.mma_type == MmaType.TCGEN05
             and supports_tcgen05_ts(meta)
         ):
-            block_m = 128 if shape_m >= 128 else 64
+            if gemm_type == GemmType.DENSE:
+                block_m = 128 if shape_m >= 128 else 64
+            else:
+                # Grouped: shape_m is the total/padded token count over
+                # all experts, but the scheduler tiles the MMA per-expert,
+                # so tokens-per-expert (~shape_m/num_experts) is what sets
+                # tile occupancy. Fine-grained experts (few tokens each)
+                # take BlockM=64 to cut per-expert MMA-row waste; the token
+                # tile is pinned to BlockShape::M in {64,128} on TS (see
+                # moe-grouped-gemm.md M3). Both grouped block_m validated.
+                tokens_per_expert = shape_m // max(meta.num_experts, 1)
+                block_m = 128 if tokens_per_expert >= 128 else 64
             return {
                 "block_shape": (block_m, 128, 64),
                 "warp_shape": (block_m, 32, 64),
