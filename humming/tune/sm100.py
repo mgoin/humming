@@ -221,21 +221,25 @@ class Sm100Heuristics(Sm89Heuristics):
                 # Grouped: shape_m is the total/padded token count over
                 # all experts, but the scheduler tiles the MMA per-expert,
                 # so tokens-per-expert (~shape_m/num_experts) is what sets
-                # tile occupancy. The MMA-N (token) tile is pinned to
-                # BlockShape::M, so fine-grained experts (few tokens each)
-                # waste MMA rows: at ~16 tok/expert a BlockM=64 tile fills
-                # only a quarter of its rows. Admit BlockM=32 for the very
-                # fine-grained regime (the M128N32K16 atom is valid; drain
-                # loops kBlockM/32=1) to halve that waste, keeping 64/128
-                # for coarser experts. All three grouped block_m validated
-                # in test_tcgen05_ts_moe.py (see moe-grouped-gemm.md M3).
+                # tile occupancy. Fine-grained experts (few tokens each)
+                # take BlockM=64 to cut per-expert MMA-row waste; the token
+                # tile is pinned to BlockShape::M in {64,128} on TS (see
+                # moe-grouped-gemm.md M3). Both grouped block_m validated.
+                #
+                # BlockM=32 is a valid TS atom (M128N32K16; verified
+                # bit-exact in test_tcgen05_ts_moe.py) but is NOT selected:
+                # benchmarks/bench_ts_moe_blockm32.py (B300) shows it does
+                # NOT recover the fine-grained TS loss. At <=16 tok/expert
+                # (DeepSeek E=256) both 32 and 64 already emit one tile per
+                # expert, so 32 removes no waste (0.99-1.00x vs BlockM=64,
+                # both still 1.24-1.28x slower than mma.sync); at ~32
+                # tok/expert with routing variance (Qwen3 E=128) BlockM=32
+                # splits busy experts into two tiles and regresses 1.44x.
+                # The TS fine-grained cost is per-tile/per-K-iter
+                # r2t+handshake overhead, not MMA-row waste, so shrinking
+                # the token tile cannot help.
                 tokens_per_expert = shape_m // max(meta.num_experts, 1)
-                if tokens_per_expert >= 128:
-                    block_m = 128
-                elif tokens_per_expert >= 32:
-                    block_m = 64
-                else:
-                    block_m = 32
+                block_m = 128 if tokens_per_expert >= 128 else 64
             return {
                 "block_shape": (block_m, 128, 64),
                 "warp_shape": (block_m, 32, 64),

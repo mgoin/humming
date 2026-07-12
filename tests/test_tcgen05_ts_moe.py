@@ -208,9 +208,10 @@ def test_ts_moe_experts(gemm_type, num_experts):
 
 
 # --------------------------------------------------------------------------
-# Fine-grained MoE (E=128/256) is exactly where the heuristic now selects
-# BlockM=32 (few tokens/expert): guard the small-tile drain against the
-# per-expert dequant reference at those expert counts.
+# BlockM=32 is a validated-correct TS atom (M128N32K16) but perf-negative
+# for fine-grained MoE (see benchmarks/bench_ts_moe_blockm32.py), so the
+# heuristic keeps 64. These cells guard the small-tile drain's correctness
+# at fine-grained expert counts so the atom stays trustworthy if revisited.
 # --------------------------------------------------------------------------
 
 
@@ -255,11 +256,13 @@ def test_ts_moe_masked_zeroing(use_tma):
 @pytest.mark.parametrize("gemm_type", ["grouped_contiguous", "grouped_masked"])
 @pytest.mark.parametrize(
     "num_experts,shape_m,expected_block_m",
+    # BlockM=32 is a validated-correct atom but perf-negative (see
+    # sm100.py), so production keeps the fine-grained tile at 64.
     [
         (8, 2048, 128),   # 256 tok/expert -> coarse
         (8, 512, 64),     # 64 tok/expert  -> mid
-        (128, 2048, 32),  # 16 tok/expert  -> fine-grained (Qwen3-MoE-like)
-        (256, 512, 32),   # 2  tok/expert  -> fine-grained (DeepSeek-like)
+        (128, 2048, 64),  # 16 tok/expert  -> fine-grained (Qwen3-MoE-like)
+        (256, 512, 64),   # 2  tok/expert  -> fine-grained (DeepSeek-like)
     ],
 )
 def test_ts_moe_dispatch(gemm_type, num_experts, shape_m, expected_block_m):
