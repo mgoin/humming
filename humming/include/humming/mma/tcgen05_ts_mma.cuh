@@ -35,11 +35,39 @@
 // consistent per-slot counters because they execute run()/transform_b()
 // in identical order.
 
+#include <humming/datatype/dequant_single.cuh>
 #include <humming/epilogue/tmem_ts_drain.cuh>
 #include <humming/utils/all.cuh>
 #include <humming/utils/ptx/barrier.cuh>
 #include <humming/utils/ptx/shared.cuh>
 #include <humming/utils/ptx/tcgen05.cuh>
+
+
+// Per-dtype dequant of one bf16x2 code pair in TS contract order: given a
+// code word right-shifted so the target pair sits at the low kBits of each
+// 16-bit half, return the bf16x2 value (before the per-lane group scale,
+// which the caller applies). Dispatch is compile-time on ElementB; each
+// weight-dtype milestone (see expand-plans/weight-dtypes.md) adds its
+// branch here rather than re-writing transform_b's inline lop3.
+//
+// Integer path (uint{2,4,...} with kBits <= bf16 mantissa): the shared
+// 0x4300 lop3 trick with the per-lane (128 + zp) bias folded in as the
+// subtrahend, so uint_to_f16 emits exactly (code - zp) as bf16x2 -- bit
+// identical to the shipped u4 inline (lop3 0xea + __hsub2(bias2)). The s2r
+// path always fills bias2 (zp, or the symmetric 8 for the no-zp case), so
+// kHasZeroPoint is unconditionally true from uint_to_f16's perspective.
+template <class EB>
+CUDA_INLINE uint32_t ts_dequant_b_pair(uint32_t shifted, uint32_t bias2) {
+  if constexpr (EB::kIsIntegerType && EB::kBits <= BFloat16::kMantissaBits) {
+    return uint_to_f16<EB, BFloat16, /*kHasZeroPoint=*/true,
+                       /*kIsFpZeroPoint=*/false>(shifted, bias2);
+  } else {
+    static_assert(EB::kBits == 0,
+                  "TCGEN05_TS transform_b: weight dtype not wired -- add a "
+                  "ts_dequant_b_pair branch and extend the allowlist");
+    return 0u;
+  }
+}
 
 
 template <class Ctx, class ArithClass>
@@ -62,6 +90,16 @@ public:
   static constexpr bool kUseFusedE8m0Scale = Ctx::kUseFusedE8m0Scale;
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
+
+  // Weight-dtype geometry, all compile-time (dynamic member-array indexing
+  // demotes the object to local memory -- see tcgen05_mma.cuh:291).
+  static constexpr uint32_t kBBits = ElementB::kBits;
+  // Words per row per 16-K chunk (u2:1, u4:2, u8:4).
+  static constexpr uint32_t kWpr = 16u * kBBits / 32u;
+  // Codes per packed word (u2:16, u4:8, u8:4).
+  static constexpr uint32_t kVpw = 32u / kBBits;
+  // bf16x2 pairs produced per word (= kVpw / 2). kWpr * kRegsPerWord == 8.
+  static constexpr uint32_t kRegsPerWord = kVpw / 2u;
 
   // The MMA-M tile: min(BlockN, 128) weight rows. Prototype pins it to
   // exactly one 128-row tile covered by 4 warps of 32 lanes.
@@ -92,9 +130,16 @@ public:
   static_assert(std::is_same<ElementA, BFloat16>::value,
                 "TCGEN05_TS: ElementA must be BFloat16 (kind::f16 idesc "
                 "and the 0x4300 dequant trick are bf16-specific)");
-  static_assert(ElementB::kBits == 4 && !kIsFpZeroPoint,
-                "TCGEN05_TS prototype: ElementB must be uint4 with "
-                "integer (or no) zero point");
+  // TS weight-dtype allowlist: extended one dtype per milestone alongside
+  // the matching ts_dequant_b_pair branch + ts_packing.py guard +
+  // supports_tcgen05_ts clause. Start: {uint4}.
+  static constexpr bool kTsBDtypeSupported =
+      std::is_same<ElementB, UInt4>::value;
+  static_assert(kTsBDtypeSupported,
+                "TCGEN05_TS: ElementB not in the TS weight-dtype allowlist "
+                "(currently {uint4})");
+  static_assert(!kIsFpZeroPoint,
+                "TCGEN05_TS: fp zero-point not yet wired for TS mode");
   static_assert(Ctx::kIsGroupWeightScale,
                 "TCGEN05_TS prototype: group weight scale only");
   static_assert(Ctx::kWeightScaleGroupSize >= BlockShape::K,
@@ -110,9 +155,9 @@ public:
   // Interface parity: never written (activations are read from SMEM by
   // the MMA descriptor; s2r skips loader_a for TCGEN05).
   alignas(16) int4 regs_a[1];
-  // Per-thread quantised codes: one row x 16 K x 4 b = 2 uint32,
-  // double-buffered. Written by the TS branch of s2r_pipeline.
-  alignas(8) uint32_t regs_qb[2][2];
+  // Per-thread quantised codes: one row x 16 K, packed into kWpr uint32
+  // (u4: 2), double-buffered. Written by the TS branch of s2r_pipeline.
+  alignas(8) uint32_t regs_qb[2][kWpr];
   // Per-lane bf16x2 broadcast scale (s, s) and dequant bias
   // bf16x2(128 + zp, 128 + zp), also filled by the s2r TS branch.
   uint32_t regs_bs2_ts[2];
@@ -135,24 +180,20 @@ public:
   void transform_b(uint32_t buffer_id) {
     uint32_t out[8];
     uint32_t bias2 = regs_bias2_ts[buffer_id];
-    uint32_t scale2 = regs_bs2_ts[buffer_id];
+    const __nv_bfloat162 scale =
+        *reinterpret_cast<const __nv_bfloat162 *>(&regs_bs2_ts[buffer_id]);
     PRAGMA_UNROLL
-    for (uint32_t w = 0; w < 2u; w++) {
+    for (uint32_t w = 0; w < kWpr; w++) {
       uint32_t q = regs_qb[buffer_id][w];
       PRAGMA_UNROLL
-      for (uint32_t j = 0; j < 4u; j++) {
-        // Extract nibbles (j, j+4) of q into the lo/hi bf16 halves and
-        // OR in the 0x4300 exponent: bf16(128 + code), exact for
-        // code in [0, 128). Pack order is pre-compensated so this
-        // yields reg r = (K = 2r, K = 2r + 1).
-        uint32_t v;
-        asm volatile("lop3.b32 %0, %1, %2, %3, 0xea;\n"
-                     : "=r"(v)
-                     : "r"(q >> (4u * j)), "n"(0x000f000f), "n"(0x43004300));
+      for (uint32_t r = 0; r < kRegsPerWord; r++) {
+        // Extract the (r, r + kVpw/2) codes of q into the lo/hi bf16
+        // halves and dequant per ElementB; the pack pre-compensates the
+        // slot order so this yields reg = (K = 2*idx, K = 2*idx + 1).
+        uint32_t v = ts_dequant_b_pair<ElementB>(q >> (r * kBBits), bias2);
         __nv_bfloat162 t = *reinterpret_cast<__nv_bfloat162 *>(&v);
-        t = __hsub2(t, *reinterpret_cast<const __nv_bfloat162 *>(&bias2));
-        t = __hmul2(t, *reinterpret_cast<const __nv_bfloat162 *>(&scale2));
-        out[w * 4u + j] = *reinterpret_cast<uint32_t *>(&t);
+        t = __hmul2(t, scale);
+        out[w * kRegsPerWord + r] = *reinterpret_cast<uint32_t *>(&t);
       }
     }
 

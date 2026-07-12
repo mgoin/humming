@@ -67,6 +67,12 @@ def _tcgen05_config_for_b_dtype(b_dtype, shape_k_aligned_128):
     return 64, 4
 
 
+# TS-mode weight-dtype allowlist. Mirrors the ts_dequant_b_pair dispatch +
+# static_assert allowlist in mma/tcgen05_ts_mma.cuh; extended one dtype per
+# weight-dtype milestone. Start: {uint4}.
+_TS_OPTED_IN_B_DTYPES = frozenset({dtypes.uint4})
+
+
 def supports_tcgen05_ts(meta) -> bool:
     """M-independent legality of the TS-mode tcgen05 kernel for `meta`
     (mirrors the static_asserts in `mma/tcgen05_ts_mma.cuh`). TS-mode
@@ -78,7 +84,7 @@ def supports_tcgen05_ts(meta) -> bool:
     """
     if meta.num_experts:
         return False
-    if meta.a_dtype != dtypes.bfloat16 or meta.b_dtype != dtypes.uint4:
+    if meta.a_dtype != dtypes.bfloat16 or meta.b_dtype not in _TS_OPTED_IN_B_DTYPES:
         return False
     if meta.bs_dtype != dtypes.bfloat16:
         return False
