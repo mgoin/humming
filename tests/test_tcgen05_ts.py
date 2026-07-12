@@ -46,9 +46,9 @@ def _run_ts(
     has_bias=False,
     group_size=128,
     use_warp_spec=False,
+    b_dtype=dtypes.uint4,
 ):
     a_dtype = dtypes.bfloat16
-    b_dtype = dtypes.uint4
     c_dtype = dtypes.bfloat16
     bs_dtype = dtypes.bfloat16
 
@@ -155,6 +155,40 @@ def test_ts_512_cubed(has_zero_point):
     outputs, outputs_ref = _run_ts(
         shape_m=512, shape_n=512, shape_k=512,
         has_zero_point=has_zero_point,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# uint2 weight dtype (milestone b): same integer uint_to_f16 path, kWpr=1
+# half-group loader, no-zp midpoint 2 vs int-zp. Reference is the same
+# bf16-rounded-weight dequant GEMM.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("has_zero_point", [False, True])
+def test_ts_uint2_512_cubed(has_zero_point):
+    outputs, outputs_ref = _run_ts(
+        shape_m=512, shape_n=512, shape_k=512,
+        has_zero_point=has_zero_point, b_dtype=dtypes.uint2,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_uint2_block_m128_fatn():
+    """uint2 on a fat-N gate/up slice with BlockM=128, multi-block N/K."""
+    outputs, outputs_ref = _run_ts(
+        shape_m=256, shape_n=1024, shape_k=1024,
+        block_shape=(128, 128, 64), b_dtype=dtypes.uint2,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_uint2_minimal_tile():
+    """N=128 K=64 single minimal tile, no zp."""
+    outputs, outputs_ref = _run_ts(
+        shape_m=128, shape_n=128, shape_k=64,
+        group_size=64, has_zero_point=False, b_dtype=dtypes.uint2,
     )
     _assert_close(outputs, outputs_ref)
 

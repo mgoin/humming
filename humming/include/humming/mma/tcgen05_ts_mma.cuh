@@ -134,10 +134,11 @@ public:
   // the matching ts_dequant_b_pair branch + ts_packing.py guard +
   // supports_tcgen05_ts clause. Start: {uint4}.
   static constexpr bool kTsBDtypeSupported =
-      std::is_same<ElementB, UInt4>::value;
+      std::is_same<ElementB, UInt4>::value ||
+      std::is_same<ElementB, UInt2>::value;
   static_assert(kTsBDtypeSupported,
                 "TCGEN05_TS: ElementB not in the TS weight-dtype allowlist "
-                "(currently {uint4})");
+                "(currently {uint2, uint4})");
   static_assert(!kIsFpZeroPoint,
                 "TCGEN05_TS: fp zero-point not yet wired for TS mode");
   static_assert(Ctx::kIsGroupWeightScale,

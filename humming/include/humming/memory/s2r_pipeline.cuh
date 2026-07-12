@@ -118,7 +118,9 @@ public:
       uint32_t s = bs16[n];
       mma.regs_bs2_ts[buffer_id] = (s << 16) | s;
     }
-    uint32_t zp = 8u;  // no-zp uint4 semantics: symmetric around 8
+    // No-zp: symmetric midpoint 2^(kBits-1) (uint4->8, uint2->2), matching
+    // the reference's quanted - 2^(bits-1) (utils/test.generate_random_weight).
+    uint32_t zp = 1u << (Ctx::ElementB::kBits - 1u);
     if constexpr (kHasZeroPoint) {
       const uint8_t *bzp8 =
           reinterpret_cast<const uint8_t *>(smem.stages[stage_id].bzp);

@@ -70,11 +70,12 @@ def _assert_close(outputs, outputs_ref, label="", atol=0.5):
     torch.testing.assert_close(outputs, outputs_ref, rtol=1e-2, atol=atol)
 
 
-def _build_ts_layer(shape_n, shape_k, group_size, has_zero_point, weight_orig):
+def _build_ts_layer(shape_n, shape_k, group_size, has_zero_point, weight_orig,
+                    b_dtype=dtypes.uint4):
     """Build + load + transform a TS-opted-in HummingLayer from a real
     (unquantized) bf16 weight, exactly as a production caller would."""
     schema = HummingWeightSchema(
-        b_dtype=dtypes.uint4,
+        b_dtype=b_dtype,
         bs_dtype=dtypes.bfloat16,
         weight_scale_group_size=group_size,
         has_zero_point=has_zero_point,
@@ -158,6 +159,52 @@ def test_ts_e2e_uint4_layer(shape_m, shape_n, shape_k, has_zero_point):
     _assert_close(
         outputs, outputs_ref, atol=atol,
         label=f"uint4 gs128 zp={has_zero_point} m{shape_m} n{shape_n} k{shape_k}",
+    )
+
+
+@pytest.mark.parametrize("has_zero_point", [True, False])
+@pytest.mark.parametrize(
+    "shape_m,shape_n,shape_k",
+    [
+        (16, 512, 512),      # decode-ish M (TS runs at every M)
+        (256, 1024, 2048),   # multi-block N/K walk
+    ],
+)
+def test_ts_e2e_uint2_layer(shape_m, shape_n, shape_k, has_zero_point):
+    """uint2 driven through the full HummingLayer path vs the dequant
+    reference. Also pins that the heuristic actually dispatches TS."""
+    group_size = 128
+
+    torch.manual_seed(0xBEEF)
+    (weight_orig, weight_ref, _codes, _scale, _zp, _gs) = generate_random_weight(
+        n=shape_n, k=shape_k, group_size=group_size,
+        dtype=dtypes.uint2, scale_dtype=dtypes.bfloat16,
+        has_zero_point=has_zero_point,
+    )
+
+    layer = _build_ts_layer(
+        shape_n, shape_k, group_size, has_zero_point, weight_orig,
+        b_dtype=dtypes.uint2,
+    )
+    _assert_ts_dispatched(layer, shape_m)
+
+    _, inputs_ref, inputs, _ = generate_random_inputs(
+        m=shape_m, k=shape_k, group_size=0, dtype=dtypes.bfloat16,
+    )
+
+    weight_ref_bf16 = weight_ref.to(torch.bfloat16).float()
+    outputs_ref = inputs_ref.matmul(weight_ref_bf16.T).to(torch.bfloat16)
+    torch.cuda.synchronize()
+
+    outputs = layer.forward(inputs.clone())
+    torch.cuda.synchronize()
+
+    assert outputs.shape == (shape_m, shape_n)
+    assert torch.isfinite(outputs).all()
+    atol = 0.5 if shape_k <= 1024 else 1.5
+    _assert_close(
+        outputs, outputs_ref, atol=atol,
+        label=f"uint2 gs128 zp={has_zero_point} m{shape_m} n{shape_n} k{shape_k}",
     )
 
 

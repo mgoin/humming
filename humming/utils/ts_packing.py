@@ -47,7 +47,9 @@ _ACT_BITS = 16  # bf16 / fp16 activations; kPartMmaShapeK = 256 / 16 = 16
 
 def _check_codes(codes: torch.Tensor, weight_bits: int):
     assert codes.dtype == torch.int32
-    assert weight_bits in (4, 8), "reference packer covers power-of-2 even bits"
+    assert weight_bits in (2, 4, 8), (
+        "reference packer covers 32 % bits == 0 widths {2, 4, 8}"
+    )
     n, k = codes.shape[-2], codes.shape[-1]
     assert n % 64 == 0, "N must be padded to a multiple of 64"
     assert k % 16 == 0, "K must be a multiple of kPartMmaShapeK = 16"
