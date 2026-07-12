@@ -49,14 +49,10 @@
 // 16-bit half, return the bf16x2 value (before the per-lane group scale,
 // which the caller applies). Dispatch is compile-time on ElementB; each
 // weight-dtype milestone (see expand-plans/weight-dtypes.md) adds its
-// branch here rather than re-writing transform_b's inline lop3.
-//
-// Integer path (uint{2,4,...} with kBits <= bf16 mantissa): the shared
-// 0x4300 lop3 trick with the per-lane (128 + zp) bias folded in as the
-// subtrahend, so uint_to_f16 emits exactly (code - zp) as bf16x2 -- bit
-// identical to the shipped u4 inline (lop3 0xea + __hsub2(bias2)). The s2r
-// path always fills bias2 (zp, or the symmetric 8 for the no-zp case), so
-// kHasZeroPoint is unconditionally true from uint_to_f16's perspective.
+// branch here rather than re-writing transform_b's inline lop3. Per-branch
+// dequant/zp/exp-offset details are documented at each case below.
+
+
 // Multiply a bf16x2 by the exact power of two 2^kOff. bf16 tops out at
 // 2^128, so an offset > 127 (uint8's 133) is applied in two steps: the
 // first 2^127 lifts normalized_uint_to_fp's subnormal dequant into normal
