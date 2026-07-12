@@ -1286,3 +1286,47 @@ correctness) are:
 ├── arch/copy_sm100.hpp                                           ← TMEM_LOAD variants
 └── atom/mma_traits_sm80.hpp:78                                   ← m16n8k16 BLayout
 ```
+
+## Round 3 integration — four-way bench
+
+Four-way landscape after merging E's vectorized transposed TS drain
+(`tmem_ts_drain.cuh`) onto integration/round3. GPU 0 (NVIDIA B300 SXM6),
+CUDA 13.0, same-run baselines from `benchmarks/bench_round3_fourway.py`.
+Columns: `mma.sync` reference; `SS-classic` = warp-spec SS-mode tcgen05
+with the element-wise scatter (`kUseClosedFormScatter=false`);
+`SS-closed` = same kernel with F's closed-form scatter (shipped,
+`=true`); `TS` = warp-spec TMEM-staging mainloop with the vectorized
+drain (best of stages {4,6} x ws {on,off}). Times are us/iter.
+SS-classic measured by flipping the compile-time constant and re-running
+(TS/mma columns confirmed unchanged across both runs).
+
+Llama70B-gate (N=28672, K=8192):
+
+| M    | mma    | SS-classic | SS-closed | TS (cfg)             | mma/TS | SSc/TS |
+|-----:|-------:|-----------:|----------:|:---------------------|-------:|-------:|
+| 16   |  160.1 |      262.5 |     229.9 | 165.2 (M64K64s6+ws)  | 0.97x  | 1.39x  |
+| 128  |  317.4 |      261.0 |     233.2 | 168.4 (M128K64s6+ws) | 1.88x  | 1.38x  |
+| 512  | 1023.8 |      899.1 |     801.2 | 575.6 (M128K64s4+ws) | 1.78x  | 1.39x  |
+| 2048 | 3846.7 |     3202.8 |    2852.8 | 2045.4 (M128K64s4+ws)| 1.88x  | 1.39x  |
+
+Llama70B-down (N=8192, K=28672):
+
+| M    | mma    | SS-classic | SS-closed | TS (cfg)             | mma/TS | SSc/TS |
+|-----:|-------:|-----------:|----------:|:---------------------|-------:|-------:|
+| 16   |  267.3 |      447.0 |     395.6 | 281.3 (M64K64s6+ws)  | 0.95x  | 1.41x  |
+| 128  |  268.0 |      452.1 |     399.5 | 284.9 (M128K64s6+ws) | 0.94x  | 1.40x  |
+| 512  | 1058.9 |      902.3 |     798.3 | 564.0 (M128K64s6+ws) | 1.88x  | 1.42x  |
+| 2048 | 3686.7 |     3148.3 |    2785.4 | 1961.5 (M128K64s6+ws)| 1.88x  | 1.42x  |
+
+Headline: **L70B-down M=2048 TS = 1961.5 us** with the vectorized drain
+(was 2400 us with the scalar 2-byte scatter → 1.22x drain-local; 1.42x
+vs shipped SS-closed 2785.4, 1.13x that SS-closed itself buys over
+SS-classic 3148.3). E's standalone measurement (1965.8) reproduces.
+
+mma.sync crossover: mma still wins the single-tile M=16 point (0.95x
+down / 0.97x gate) and, on the down shape, is also faster at M=128
+(0.94x) — the crossover on down sits between M=128 and M=512. On the
+gate shape TS already wins at M=128 (1.88x), so the crossover there is
+below M=128. So the crossover did **not** uniformly fall below M=128:
+it is shape-dependent (below M=128 for gate, between 128 and 512 for
+down).
