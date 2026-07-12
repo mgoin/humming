@@ -208,6 +208,12 @@ class TuningConfig(BaseHummingConfig):
 
         if self.use_tcgen05_ts:
             assert self.use_tcgen05, "use_tcgen05_ts requires use_tcgen05"
+            if self.use_warp_spec:
+                assert self.num_stages >= 3, (
+                    "TS + warp-spec needs num_stages >= 3 (2-stage WS is "
+                    "untested, and TCGEN05_TS_DEFER_STAGE_RELEASE would "
+                    "deadlock the producer handshake at 2 stages)"
+                )
 
         assert self.tcgen05_acc_stages in (1, 2)
         if self.tcgen05_acc_stages > 1:

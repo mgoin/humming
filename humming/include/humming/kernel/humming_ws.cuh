@@ -181,6 +181,45 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       s2r_pipe.load_stage_iter<true>(0, 0);
       mma.transform_b(0);
 
+      // TS mode + the arrive-at-kWarpIters-2 hazard (track A saw real
+      // corruption from it at K=4096 on the SS ws-pipeline): the plain
+      // mainloop is already safe WITHOUT deferring the release, by a
+      // three-link chain that the static_asserts below pin:
+      //   1. The producer overwrites stage T only after the math warps
+      //      release stage T+1 (its loop refills stage
+      //      (s + kNumStages - 1) % kNumStages upon wait_stage(s)).
+      //   2. Each math warp's arrive of stage T+1 at (T+1, kWarpIters-2)
+      //      is program-ordered after its transform_b(slot 1) at
+      //      (T+1, iter 0) -- this needs kWarpIters >= 4.
+      //   3. That transform_b's WAR wait awaited the COMPLETION of the
+      //      tcgen05.commit issued at run(T, kWarpIters-1) -- a batch
+      //      commit, so every MMA reading stage T provably retired.
+      // Define TCGEN05_TS_DEFER_STAGE_RELEASE to instead release stage T
+      // explicitly after transform_b(slot 1) of stage T+1 (track A's
+      // deferral, needed if the geometry ever breaks link 2). Measured
+      // cost on B300: ~3.3% at Llama70B-down M=2048 (2483 vs 2404 us) --
+      // the delayed release stalls the TMA producer.
+      constexpr bool kIsTcgen05Ts = TuningConfig::kUseTcgen05Ts;
+      if constexpr (kIsTcgen05Ts) {
+        static_assert(Ctx::kWarpIters >= 4 && Ctx::kWarpIters % 2 == 0,
+                      "TS stage-release safety: transform_b(slot 1) of "
+                      "stage T+1 must precede the stage-(T+1) arrive, and "
+                      "slot 1 must own each stage's last commit");
+      }
+#if defined(TCGEN05_TS_DEFER_STAGE_RELEASE)
+      constexpr bool kTsDeferredRelease = kIsTcgen05Ts;
+      if constexpr (kTsDeferredRelease) {
+        static_assert(kNumStages >= 3,
+                      "TS deferred G2S release: releasing stage T during "
+                      "stage T+1 deadlocks the producer handshake at 2 "
+                      "stages");
+      }
+#else
+      constexpr bool kTsDeferredRelease = false;
+#endif
+      uint32_t ts_prev_stage = 0;
+      bool ts_has_prev = false;
+
       while (slice_iters) {
         PRAGMA_UNROLL
         for (uint32_t stage_id = 0; stage_id < kNumStages; stage_id++) {
@@ -190,7 +229,12 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
             mma.run(stage_id, warp_iter_id);
             if (warp_iter_id == Ctx::kWarpIters - 2) {
 #if !defined(TCGEN05_DEBUG_DEFER_ARRIVE)
-              consumer.arrive(stage_id);
+              if constexpr (kTsDeferredRelease) {
+                ts_prev_stage = stage_id;
+                ts_has_prev = true;
+              } else {
+                consumer.arrive(stage_id);
+              }
 #else
               // TCGEN05 probe: the SS-mode MMAs read A from this
               // stage's SMEM asynchronously; releasing the stage here
@@ -214,6 +258,12 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 #endif
 
             mma.transform_b((warp_iter_id + 1) % 2);
+            if constexpr (kTsDeferredRelease) {
+              if (warp_iter_id == 0 && ts_has_prev) {
+                consumer.arrive(ts_prev_stage);
+                ts_has_prev = false;
+              }
+            }
           }
 
           slice_iters--;
@@ -295,6 +345,12 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       } else {
         if constexpr (kReduceOverlapLastStageOnly) consumer.arrive(kNumStages);
         epilogue.call(mma.final_regs_c_as_ptr());
+        if constexpr (kTsDeferredRelease) {
+          // The tile's final stage is still pending. Safe to release
+          // now: final_regs_c_as_ptr waited the tcgen05 commit mbar,
+          // so every MMA reading its SMEM has retired.
+          if (ts_has_prev) consumer.arrive(ts_prev_stage);
+        }
         if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
         if constexpr (!kReduceOverlapLastStageOnly) consumer.arrive(kNumStages);
       }

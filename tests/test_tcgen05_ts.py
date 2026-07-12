@@ -190,6 +190,17 @@ def test_ts_warp_spec():
     _assert_close(outputs, outputs_ref)
 
 
+def test_ts_warp_spec_large_k():
+    """Guards the deferred G2S stage release: at large K the TMA
+    producer laps the MMA queue, the regime where releasing a stage at
+    kWarpIters-2 produced real corruption on track A's SS pipeline."""
+    outputs, outputs_ref = _run_ts(
+        shape_m=512, shape_n=1024, shape_k=8192,
+        block_shape=(128, 128, 64), num_stages=4, use_warp_spec=True,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
 def test_ts_prod_shape():
     """Llama70B-gate slice at modest M -- multi-block N/K walk."""
     outputs, outputs_ref = _run_ts(
