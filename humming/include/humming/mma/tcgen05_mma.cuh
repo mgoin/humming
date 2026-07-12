@@ -56,6 +56,9 @@
 // #define TCGEN05_DEBUG_SCATTER_SENTINEL 1
 // #define TCGEN05_DEBUG_REGS_B_SENTINEL 1
 // #define TCGEN05_DEBUG_NO_SCATTER 1
+// #define TCGEN05_DEBUG_DRAIN_PER_ITER 1
+// #define TCGEN05_DEBUG_DEFER_ARRIVE 1
+// #define TCGEN05_DEBUG_SCATTER_PROXY_FENCE 1
 // #define TCGEN05_DEBUG_TMEM_DUMP 1
 
 
@@ -106,6 +109,107 @@ public:
   // 128B-swizzle atom is 8 bf16 K-wide, so 16 bf16 = 2 atoms = 2 uint128_t.
   // Per-K-iter SMEM pointer offset (in int4 / uint128_t units).
   static constexpr uint32_t kKChunkUint128 = 2;
+
+  // B staging geometry, shared by the scatter in run() and the
+  // closed-form validators below. For BlockK > 64 the staging buffer
+  // is section-major (each section = 64 K-bf16 of all N), mirroring
+  // loader_a's treatment of A.
+  static constexpr uint32_t kKPerSectionB =
+      BlockShape::K < 64u ? BlockShape::K : 64u;
+  static constexpr uint32_t kRowBytesB = kKPerSectionB * 2u;
+  static constexpr uint32_t kBSectionSizeBytes = BlockShape::N * kRowBytesB;
+  static constexpr uint32_t kNScatterWarps =
+      MAX(BlockShape::N / WarpShape::N, 1u);
+
+  // ---- closed-form scatter addressing (track f) ----
+  //
+  // Reference formula (element-wise, what run() used to evaluate per
+  // store): for lane t, scatter-warp slice n_base, K-iter `iter`,
+  // fragment coords (i, frag, pair):
+  //   n      = n_base + 16 i + 8 frag + t/4
+  //   k_lo   = 16 iter + 2 (t%4) + 8 pair
+  //   linear = (k_lo/64) * kBSectionSizeBytes + n * 128 + (k_lo%64) * 2
+  //   off    = linear ^ ((((smem_base>>7) + n) & 7) << 4)
+  //
+  // Closed form: every additive term of `linear` occupies a disjoint
+  // bit range (4*(t%4): bits 2-3; 32*(iter%4): 5-6; 16*pair: 4;
+  // (t/4)*128: 7-9; frag*1024: 10; i*2048: 11-12; n_base*128: >= 13;
+  // section offset: >= 13), so + == ^ among them, and the XOR phase
+  // depends only on n's low 3 bits, which (i, frag) can't change
+  // (they add multiples of 8). Hence per (thread, K-iter):
+  //   base0 = ((n0*128 + 4*(t%4)) ^ mask) ^ 32*(iter % 4)
+  //           + (iter / 4) * kBSectionSizeBytes
+  //   mask  = (((smem_base>>7) + n0) & 7) << 4,  n0 = n_base + t/4
+  // and each store lands at base0 ^ 16*pair + i*2048 + frag*1024 --
+  // a compile-time immediate off one of two per-thread registers.
+  static constexpr uint32_t scatter_ref_offset(
+      uint32_t t, uint32_t n_base, uint32_t iter, uint32_t i,
+      uint32_t frag, uint32_t pair, uint32_t base_div128) {
+    uint32_t n = n_base + i * 16u + 8u * frag + t / 4u;
+    uint32_t k_lo = iter * kPartMmaShapeK + 2u * (t % 4u) + 8u * pair;
+    uint32_t k_section = k_lo / kKPerSectionB;
+    uint32_t k_in_section = k_lo % kKPerSectionB;
+    uint32_t linear_in_section = n * kRowBytesB + k_in_section * 2u;
+    uint32_t linear = k_section * kBSectionSizeBytes + linear_in_section;
+    uint32_t xor_shift = (base_div128 + (linear_in_section >> 7)) & 7u;
+    return linear ^ (xor_shift << 4);
+  }
+
+  static constexpr uint32_t kKItersPerSectionB =
+      kKPerSectionB / kPartMmaShapeK;
+
+  static constexpr uint32_t scatter_closed_base0(
+      uint32_t t, uint32_t n_base, uint32_t iter, uint32_t base_div128) {
+    uint32_t n0 = n_base + t / 4u;
+    uint32_t pre = n0 * kRowBytesB + (t % 4u) * 4u;
+    uint32_t mask = ((base_div128 + n0) & 7u) << 4;
+    return ((pre ^ mask) ^ ((iter % kKItersPerSectionB) * kPartMmaShapeK * 2u))
+           + (iter / kKItersPerSectionB) * kBSectionSizeBytes;
+  }
+
+  static constexpr uint32_t scatter_closed_offset(
+      uint32_t t, uint32_t n_base, uint32_t iter, uint32_t i,
+      uint32_t frag, uint32_t pair, uint32_t base_div128) {
+    return (scatter_closed_base0(t, n_base, iter, base_div128)
+            ^ (pair * 16u))
+           + i * 16u * kRowBytesB + frag * 8u * kRowBytesB;
+  }
+
+  static constexpr bool scatter_closed_form_matches() {
+    // Quantify over all lanes, K-iters and fragment coords; sample the
+    // scatter-warp slices and SMEM base phases (the base enters both
+    // formulas identically, additively under &7).
+    constexpr uint32_t bases[3] = {0u, 3u, 7u};
+    for (uint32_t t = 0; t < 32u; t++)
+      for (uint32_t w = 0; w < kNScatterWarps; w++)
+        for (uint32_t iter = 0; iter < BlockShape::K / kPartMmaShapeK; iter++)
+          for (uint32_t b = 0; b < 3u; b++)
+            for (uint32_t i = 0; i < WarpShape::N / 16u; i++)
+              for (uint32_t frag = 0; frag < 2u; frag++)
+                for (uint32_t pair = 0; pair < 2u; pair++)
+                  if (scatter_ref_offset(t, w * WarpShape::N, iter, i,
+                                         frag, pair, bases[b])
+                      != scatter_closed_offset(t, w * WarpShape::N, iter,
+                                               i, frag, pair, bases[b]))
+                    return false;
+    return true;
+  }
+
+  static_assert(scatter_closed_form_matches(),
+                "TCGEN05: closed-form scatter offsets diverge from the "
+                "reference element-wise swizzle formula");
+
+  // Closed-form scatter opt-in. The closed form is address-equivalent
+  // (static_assert above), but its faster stores re-expose a latent
+  // nondeterministic WS+TMA corruption at BlockK=64 prod configs (the
+  // workbook B.37 PROD_WS_KNOWN_BROKEN set: uint4 zp={T,F}, uint8
+  // zp=T at (512,512,4096), block (128,128,64) s3). MMA-drain probes
+  // before every scatter AND before stage release do NOT fix it, so
+  // it is not a simple staging WAR -- root cause open (track-f notes
+  // F.5). BlockK >= 128 (the production heuristic config) shows no
+  // failure across the dtype matrix and the tcgen05 test suite, so
+  // gate on that and keep the element-wise formula for BlockK=64.
+  static constexpr bool kUseClosedFormScatter = BlockShape::K >= 128;
 
   Ctx &ctx;
   SharedStorage &smem;
@@ -307,6 +411,21 @@ public:
   void run(uint32_t stage_id, uint32_t iter_id) {
     uint32_t buffer_id = iter_id % 2;
 
+#ifdef TCGEN05_DEBUG_DRAIN_PER_ITER
+    // Correctness probe: drain ALL previously issued MMAs before the
+    // scatter overwrites a b_dequant ping-pong slot. If this makes a
+    // race-suspect config pass, the WAR window between scatter(T+2)
+    // and the async MMA(T) read of b_dequant[T%2] is the root cause.
+    if (!first_issue_) {
+      if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
+        tcgen05_commit_to_mbarrier(
+            cast_smem_ptr_to_uint(&smem.tcgen05_mbar));
+      }
+      mbarrier_wait(&smem.tcgen05_mbar, mbar_phase_);
+      mbar_phase_ ^= 1u;
+    }
+#endif
+
 #ifdef TCGEN05_DEBUG_CONST_B
     // Debug: ALL threads bulk-fill smem.b_dequant[buffer_id] with bf16(1.0),
     // covering the FULL buffer (BlockN * BlockK bf16). Swizzle is
@@ -348,34 +467,17 @@ public:
     //   n = i*16 + 8*frag_id + (t / 4)
     //   k = k_base + 2*(t%4) + (v_in_frag & 1) + 8 * (v_in_frag >> 1)
     {
-      __nv_bfloat16 *smem_b_bf16 =
-          reinterpret_cast<__nv_bfloat16 *>(&smem.b_dequant[buffer_id][0]);
-      __nv_bfloat16 *regs_b_bf16 =
-          reinterpret_cast<__nv_bfloat16 *>(regs_b_tmp[buffer_id]);
-      // For BlockK > 64 we section-major-ise B in SMEM (same as A in
-      // loader_a -- each section holds 64 K-bf16 of all N) so the
-      // descriptor's `((8, n), 2):((8, SBO_uint128=64), 1)` matches
-      // the SMEM layout regardless of total BlockK. Each section's
-      // row stride is 128 B (= 64 K-bf16 × 2 B), and we step the
-      // descriptor's start address by `section_size = BlockN * 128 B`
-      // when crossing section boundaries.
-      constexpr uint32_t kKPerSectionB =
-          BlockShape::K < 64u ? BlockShape::K : 64u;
-      constexpr uint32_t kRowBytes = kKPerSectionB * sizeof(__nv_bfloat16);
-      constexpr uint32_t kBSectionSizeBytes = BlockShape::N * kRowBytes;
       uint32_t t = threadIdx.x % 32u;
-      uint32_t k_base = iter_id * kPartMmaShapeK;
-      constexpr uint32_t kBf16PerCall = 8;
       constexpr uint32_t kCalls = WarpShape::N / 16u;
-      // Per-warp N-slice base. kNWarps ∈ {1, 2, 4} for BlockN ∈
+      // Per-warp N-slice base. kNScatterWarps ∈ {1, 2, 4} for BlockN ∈
       // {64, 128, 256}; warps with the same `n_warp_id_scatter`
       // write redundantly (the 4 M-warps that share an N-slice all
-      // emit the same bytes). The HW serialises the resulting
-      // 4-way bank conflict cheaper than divergent gating -- a
-      // 1-warp-per-N-slice variant was measured 10% slower.
-      constexpr uint32_t kNWarps = MAX(BlockShape::N / WarpShape::N, 1u);
+      // emit the same bytes -- intra-warp the swizzle makes each
+      // store wavefront conflict-free; the redundancy costs extra
+      // wavefronts, not conflicts). A 1-warp-per-N-slice variant was
+      // measured 10% slower (divergence beats duplication).
       uint32_t warp_id_local = threadIdx.x / 32u;
-      uint32_t n_warp_id_scatter = warp_id_local % kNWarps;
+      uint32_t n_warp_id_scatter = warp_id_local % kNScatterWarps;
       uint32_t n_base = n_warp_id_scatter * WarpShape::N;
       // Hardware Swizzle<3,4,3> applies to the absolute byte address:
       // the descriptor encodes (smem_base >> 4) in its start_address,
@@ -383,42 +485,42 @@ public:
       // *full* abs byte, so smem_base/128 contributes to the XOR
       // amount and must be included here.
       uint32_t smem_base_div_128 =
-          cast_smem_ptr_to_uint(smem_b_bf16) >> 7;
-      // Pack 2 adjacent bf16 into one uint32 store: per PTX Table 32
-      // (mma.m16n8k16.f16 B fragment), v=2p and v=2p+1 share the same
-      // n and k_lo and have k_hi = k_lo + 1 -- so the 2 bf16 land at
-      // 2 adjacent SMEM bytes inside the same swizzle column. The XOR
-      // phase depends on bits [4..7) of the byte address and 2
-      // adjacent bytes differ only in bit 0, so both bf16's of a pair
-      // get the same `xor_shift` -- one uint32 store does both. This
-      // halves the per-K-iter SMEM store count vs the prior per-bf16
-      // loop.
+          cast_smem_ptr_to_uint(&smem.b_dequant[buffer_id][0]) >> 7;
+      // Two address paths, gated by kUseClosedFormScatter (see the
+      // constant's comment):
+      //   * closed form: swizzle XOR phase is a per-thread constant,
+      //     so the 16 stores of a K-iter reduce to two base registers
+      //     (pair 0 / pair 1) plus compile-time immediate offsets.
+      //   * element-wise: the original per-store formula (kept for
+      //     BlockK=64 where the closed form's faster stores re-expose
+      //     a latent WS+TMA race).
+      // Each uint32 store covers the (k, k+1) bf16 pair of one row.
       uint32_t *regs_b_u32_buf =
           reinterpret_cast<uint32_t *>(regs_b_tmp[buffer_id]);
-      uint32_t *smem_b_u32 =
-          reinterpret_cast<uint32_t *>(&smem.b_dequant[buffer_id][0]);
+      char *smem_b_bytes =
+          reinterpret_cast<char *>(&smem.b_dequant[buffer_id][0]);
+      uint32_t base0 = 0, base1 = 0;
+      if constexpr (kUseClosedFormScatter) {
+        base0 = scatter_closed_base0(t, n_base, iter_id, smem_base_div_128);
+        base1 = base0 ^ 16u;
+      }
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kCalls; i++) {
         PRAGMA_UNROLL
         for (uint32_t frag_id = 0; frag_id < 2u; frag_id++) {
-          uint32_t n = n_base + i * 16u + 8u * frag_id + (t / 4u);
+          uint32_t imm = i * 16u * kRowBytesB + frag_id * 8u * kRowBytesB;
           PRAGMA_UNROLL
           for (uint32_t pair_idx = 0; pair_idx < 2u; pair_idx++) {
-            // pair (v_lo=4*frag_id+2*pair_idx, v_hi=v_lo+1) writes
-            // the bf16 pair at (n, k_lo) and (n, k_lo + 1).
-            uint32_t k_lo = k_base + 2u * (t % 4u) + 8u * pair_idx;
-            uint32_t v_lo = frag_id * 4u + pair_idx * 2u;
-            uint32_t reg_index_pair = (i * kBf16PerCall + v_lo) / 2u;
-            uint32_t k_section = k_lo / kKPerSectionB;
-            uint32_t k_in_section = k_lo % kKPerSectionB;
-            uint32_t section_offset_bytes = k_section * kBSectionSizeBytes;
-            uint32_t linear_in_section =
-                n * kRowBytes + k_in_section * sizeof(__nv_bfloat16);
-            uint32_t linear_bytes = section_offset_bytes + linear_in_section;
-            uint32_t xor_shift =
-                (smem_base_div_128 + (linear_in_section >> 7)) & 7u;
-            uint32_t swizzled = linear_bytes ^ (xor_shift << 4);
+            uint32_t reg_index_pair = i * 4u + frag_id * 2u + pair_idx;
+            uint32_t addr;
+            if constexpr (kUseClosedFormScatter) {
+              addr = (pair_idx ? base1 : base0) + imm;
+            } else {
+              addr = scatter_ref_offset(t, n_base, iter_id, i, frag_id,
+                                        pair_idx, smem_base_div_128);
+            }
 #ifdef TCGEN05_DEBUG_SCATTER_SENTINEL
+            uint32_t n = n_base + i * 16u + 8u * frag_id + (t / 4u);
             __nv_bfloat16 lo_bf16 = __float2bfloat16(float(n) + 1.0f);
             __nv_bfloat16 hi_bf16 = __float2bfloat16(float(n) + 1.0f);
             uint32_t packed =
@@ -426,14 +528,23 @@ public:
                      *reinterpret_cast<uint16_t *>(&hi_bf16)) << 16) |
                 static_cast<uint32_t>(
                     *reinterpret_cast<uint16_t *>(&lo_bf16));
-            smem_b_u32[swizzled / sizeof(uint32_t)] = packed;
+            *reinterpret_cast<uint32_t *>(smem_b_bytes + addr) = packed;
 #else
-            smem_b_u32[swizzled / sizeof(uint32_t)] = regs_b_u32_buf[reg_index_pair];
+            *reinterpret_cast<uint32_t *>(smem_b_bytes + addr) =
+                regs_b_u32_buf[reg_index_pair];
 #endif
           }
         }
       }
     }
+#endif
+#ifdef TCGEN05_DEBUG_SCATTER_PROXY_FENCE
+    // Publish the generic-proxy scatter stores to the async proxy
+    // that tcgen05.mma reads B through (PTX ISA: cross-proxy ordering
+    // requires fence.proxy.async; the bar.sync alone gives only
+    // generic-proxy ordering). CUTLASS emits this fence after every
+    // dequant-store batch before UMMA issue.
+    fence_proxy_async_shared_cta();
 #endif
     // The scatter above uses regular SMEM stores (non-async), so the
     // implicit __threadfence_block from the bar.sync/__syncthreads is
@@ -499,6 +610,20 @@ public:
       tcgen05_mma_ss_bf16(smem.tcgen05_tmem_col + accum_col_off(),
                           a_desc, b_desc, idesc, scale_d);
     }
+  }
+
+  // Drain all previously issued tcgen05.mma of this tile: commit the
+  // group to the mbarrier and wait. Callable mid-K-loop (probe /
+  // stage-release fencing) or at tile end (final_regs_c_as_ptr).
+  CUDA_INLINE
+  void drain_mmas() {
+    if (first_issue_) return;
+    if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
+      tcgen05_commit_to_mbarrier(
+          cast_smem_ptr_to_uint(&smem.tcgen05_mbar));
+    }
+    mbarrier_wait(&smem.tcgen05_mbar, mbar_phase_);
+    mbar_phase_ ^= 1u;
   }
 
   // Run the t2r and write the result directly into `smem.reduce` in

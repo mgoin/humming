@@ -186,11 +186,29 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
             s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
             mma.run(stage_id, warp_iter_id);
             if (warp_iter_id == Ctx::kWarpIters - 2) {
+#if !defined(TCGEN05_DEBUG_DEFER_ARRIVE)
               consumer.arrive(stage_id);
+#else
+              // TCGEN05 probe: the SS-mode MMAs read A from this
+              // stage's SMEM asynchronously; releasing the stage here
+              // lets the TMA producer overwrite A while the last two
+              // MMAs may still read it. Defer arrive to after a full
+              // MMA drain at the last warp-iter.
+              if constexpr (Ctx::kMmaType != MmaType::TCGEN05)
+                consumer.arrive(stage_id);
+#endif
               if (slice_iters > 1) {
                 consumer.wait_stage((stage_id + 1) % kNumStages);
               }
             }
+#if defined(TCGEN05_DEBUG_DEFER_ARRIVE)
+            if constexpr (Ctx::kMmaType == MmaType::TCGEN05) {
+              if (warp_iter_id == Ctx::kWarpIters - 1) {
+                mma.drain_mmas();
+                consumer.arrive(stage_id);
+              }
+            }
+#endif
 
             mma.transform_b((warp_iter_id + 1) % 2);
           }

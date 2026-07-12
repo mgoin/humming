@@ -193,6 +193,113 @@ __global__ void kernel_r2s_nobar(int n_iters, uint64_t *out_cycles, uint32_t *si
   if (tid == 0) out_cycles[0] = t1 - t0;
 }
 
+// PATH 1p: r2s with humming's PRODUCTION per-element addressing (the real
+// swizzle formula from tcgen05_mma.cuh::run pre-track-f). Unlike Path 1's
+// synthetic `(tid*16+s+it*7) & 1023` pattern -- which strides 16 words
+// between adjacent lanes and is therefore ~16-way bank conflicted, nothing
+// like the production kernel -- this reproduces the real (n, k) -> swizzled
+// offset math and the real conflict-free access pattern.
+__global__ void kernel_r2s_prod_addr(int n_iters, uint64_t *out_cycles,
+                                     uint32_t *sink) {
+  // One full b_dequant slot: BlockN=128 rows x 64 K-bf16 sections x 2 B.
+  __shared__ uint32_t smem_buf[kBlockN * 64 / 2];  // 16 KiB
+  uint32_t tid = threadIdx.x;
+  uint32_t regs[16];
+  PRAGMA_UNROLL
+  for (int i = 0; i < 16; i++) regs[i] = tid * 16u + i + sink[tid];
+  __syncthreads();
+
+  uint32_t t = tid % 32u;
+  uint32_t n_base = (tid / 32u % 2u) * 64u;  // kNWarps=2 at BlockN=128
+  uint32_t smem_base_div_128 = cast_smem_ptr_to_uint(smem_buf) >> 7;
+
+  uint64_t t0;
+  PRAGMA_UNROLL
+  for (int rep = 0; rep < 2; rep++) {
+    if (rep == 1) asm volatile("mov.u64 %0, %%clock64;" : "=l"(t0));
+    for (int it = 0; it < n_iters; it++) {
+      uint32_t k_base = (it % 4) * kKChunk;  // stay inside one section
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < 4u; i++) {
+        PRAGMA_UNROLL
+        for (uint32_t frag = 0; frag < 2u; frag++) {
+          uint32_t n = n_base + i * 16u + 8u * frag + t / 4u;
+          PRAGMA_UNROLL
+          for (uint32_t pair = 0; pair < 2u; pair++) {
+            uint32_t k_lo = k_base + 2u * (t % 4u) + 8u * pair;
+            uint32_t lin = n * 128u + (k_lo % 64u) * 2u;
+            uint32_t xs = (smem_base_div_128 + (lin >> 7)) & 7u;
+            uint32_t sw = lin ^ (xs << 4);
+            smem_buf[sw / 4u] = regs[i * 4u + frag * 2u + pair] + it;
+          }
+        }
+      }
+      asm volatile("bar.sync 1, %0;" :: "n"(kMathThreads));
+    }
+  }
+  uint64_t t1;
+  asm volatile("mov.u64 %0, %%clock64;" : "=l"(t1));
+
+  uint32_t acc = 0;
+  PRAGMA_UNROLL
+  for (int s = 0; s < 16; s++) acc += smem_buf[(tid * 16 + s) & 4095];
+  sink[tid] = acc;
+  if (tid == 0) out_cycles[0] = t1 - t0;
+}
+
+// PATH 1c: r2s with the track-f CLOSED-FORM addressing -- swizzle XOR phase
+// hoisted to a per-thread constant, all per-store offsets folded into STS
+// immediates off two base registers.
+__global__ void kernel_r2s_closed_form(int n_iters, uint64_t *out_cycles,
+                                       uint32_t *sink) {
+  __shared__ uint32_t smem_buf[kBlockN * 64 / 2];  // 16 KiB
+  uint32_t tid = threadIdx.x;
+  uint32_t regs[16];
+  PRAGMA_UNROLL
+  for (int i = 0; i < 16; i++) regs[i] = tid * 16u + i + sink[tid];
+  __syncthreads();
+
+  uint32_t t = tid % 32u;
+  uint32_t n_base = (tid / 32u % 2u) * 64u;
+  uint32_t n0 = n_base + t / 4u;
+  uint32_t pre = n0 * 128u + (t % 4u) * 4u;
+  uint32_t mask = (((cast_smem_ptr_to_uint(smem_buf) >> 7) + n0) & 7u) << 4;
+  uint32_t base_thread = pre ^ mask;
+  char *smem_bytes = reinterpret_cast<char *>(smem_buf);
+
+  uint64_t t0;
+  PRAGMA_UNROLL
+  for (int rep = 0; rep < 2; rep++) {
+    if (rep == 1) asm volatile("mov.u64 %0, %%clock64;" : "=l"(t0));
+    for (int it = 0; it < n_iters; it++) {
+      uint32_t base0 = base_thread ^ ((it % 4) * 32u);
+      uint32_t base1 = base0 ^ 16u;
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < 4u; i++) {
+        PRAGMA_UNROLL
+        for (uint32_t frag = 0; frag < 2u; frag++) {
+          uint32_t imm = i * 2048u + frag * 1024u;
+          PRAGMA_UNROLL
+          for (uint32_t pair = 0; pair < 2u; pair++) {
+            uint32_t addr = (pair ? base1 : base0) + imm;
+            *reinterpret_cast<uint32_t *>(smem_bytes + addr) =
+                regs[i * 4u + frag * 2u + pair] + it;
+          }
+        }
+      }
+      asm volatile("bar.sync 1, %0;" :: "n"(kMathThreads));
+    }
+  }
+  uint64_t t1;
+  asm volatile("mov.u64 %0, %%clock64;" : "=l"(t1));
+
+  uint32_t acc = 0;
+  PRAGMA_UNROLL
+  for (int s = 0; s < 16; s++) acc += smem_buf[(tid * 16 + s) & 4095];
+  sink[tid] = acc;
+  if (tid == 0) out_cycles[0] = t1 - t0;
+}
+
 // PATH 2 (8-warp): all 8 math warps issue tcgen05.st per K-iter.
 __global__ void kernel_r2t_8warp(int n_iters, uint64_t *out_cycles, uint32_t *sink) {
   __shared__ uint32_t smem_tmem_col;
@@ -354,6 +461,8 @@ int main() {
   printf("Per K-iter cycle cost (1 CTA, 256 math threads, %d iters):\n", n_iters);
   run("Path 1  (r2s + bar.sync, 16 stores/thread):", kernel_r2s);
   run("Path 1' (r2s NO bar -- store cost alone):", kernel_r2s_nobar);
+  run("Path 1p (r2s PROD addressing + bar.sync):", kernel_r2s_prod_addr);
+  run("Path 1c (r2s CLOSED-FORM addr + bar.sync):", kernel_r2s_closed_form);
   run("Path 2a (r2t 8-warp + fence):", kernel_r2t_8warp);
   run("Path 2b (r2t 2-warp + fence + bar.sync):", kernel_r2t_2warp);
 
