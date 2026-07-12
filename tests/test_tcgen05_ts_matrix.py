@@ -16,11 +16,16 @@ axes and provides BOTH reference modes:
 ENABLED today: bf16 A x uint4 B, group scale (gs in {64,128}), int / no zero
 point, DENSE gemm. Those cells run for real and must be green.
 
-FUTURE cells (other tracks landing weight dtypes / MoE) are left as
+LANDED wave 1 (gate-level assertions, no GEMM here -- real-HW correctness lives
+in test_tcgen05_ts.py for the weight dtypes and test_tcgen05_ts_moe.py for the
+grouped modes): the weight-dtype allowlist (uint2/uint8/fp4/fp8) and MoE
+(num_experts>0) gates now accept, so those hooks are plain green assertions.
+
+FUTURE cells (scale/zp track: gs32, channelwise, e8m0 scale, fp zero point) stay
 `xfail(strict=False)` GATE-LEVEL hooks: they assert `supports_tcgen05_ts`
 accepts the future meta. They fail today (gate rejects) and will flip to XPASS
 the moment the owning track lifts the gate -- so `pytest -rX` on this file is a
-live readiness signal for the merge. Cheap (pure-python gate check, no GEMM).
+live readiness signal for wave 2. Cheap (pure-python gate check, no GEMM).
 
 Tolerance: workbook K-scaled convention (rtol=1e-2; atol 0.5 / 1.5 / 2.0 for
 K <= 1024 / <= 2048 / larger). Verified sufficient up to K=28672, where the
@@ -228,14 +233,13 @@ def _gate_accepts(meta) -> bool:
     return get_heuristics_class().supports_tcgen05_ts(meta)
 
 
-# --- weight-dtype axis (track: weight-dtypes) ---
+# --- weight-dtype axis (track: weight-dtypes, LANDED wave 1) ---
 @pytest.mark.parametrize(
     "b_dtype",
-    [dtypes.uint8, dtypes.uint2],
-    ids=["uint8", "uint2"],
+    [dtypes.uint2, dtypes.uint8, dtypes.float4e2m1, dtypes.float8e4m3],
+    ids=["uint2", "uint8", "fp4", "fp8"],
 )
-@pytest.mark.xfail(reason="weight-dtypes track: gate pins b_dtype==uint4", strict=False)
-def test_matrix_future_weight_dtype(b_dtype):
+def test_matrix_weight_dtype(b_dtype):
     assert _gate_accepts(_make_meta(b_dtype=b_dtype))
 
 
@@ -260,10 +264,9 @@ def test_matrix_future_fp_zero_point():
     assert _gate_accepts(_make_meta(has_zero_point=True, is_fp_zero_point=True))
 
 
-# --- MoE axis (track: moe-grouped-gemm) ---
+# --- MoE axis (track: moe-grouped-gemm, LANDED wave 1) ---
 @pytest.mark.parametrize(
     "num_experts", [8, 256], ids=["moe-8", "moe-256"],
 )
-@pytest.mark.xfail(reason="moe track: gate rejects num_experts>0", strict=False)
-def test_matrix_future_moe(num_experts):
+def test_matrix_moe(num_experts):
     assert _gate_accepts(_make_meta(num_experts=num_experts))
