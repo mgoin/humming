@@ -20,6 +20,11 @@ private:
   // tcgen05.mma reads A directly from SMEM via the SS descriptor, so the
   // s2r loader_a into RMEM is dead work for it.
   static constexpr bool kUseTcgen05 = Ctx::kMmaType == MmaType::TCGEN05;
+  // TS mode: codes/scale/zp are packed in the TS register-layout
+  // CONTRACT order (lane = weight row) -- bypass loader_b's fragment
+  // gathers and loader_bs/bzp's fragment ownership entirely.
+  static constexpr bool kUseTcgen05Ts =
+      kUseTcgen05 && Ctx::TuningConfig::kUseTcgen05Ts;
   static constexpr uint32_t kPartMmaShapeK = Ctx::kPartMmaShapeK;
   static constexpr uint32_t kNumStages = Ctx::TuningConfig::kNumStages;
 
@@ -66,6 +71,11 @@ public:
     uint32_t buffer_id = iter_id % 2;
     auto &smem = ctx.smem;
 
+    if constexpr (kUseTcgen05Ts) {
+      load_stage_iter_ts(stage_id, iter_id, buffer_id);
+      return;
+    }
+
     loader_b.load(smem.stages[stage_id].b, mma.regs_qb_as_ptr(buffer_id), iter_id);
     if constexpr (!kUseWgmma && !kUseTcgen05)
       loader_a.load(smem.stages[stage_id].a, mma.regs_a_as_ptr(buffer_id), iter_id, stage_id);
@@ -79,6 +89,46 @@ public:
       else
         loader_bzp.load(smem.stages[stage_id].bzp, mma.arith.regs_zp_as_ptr(buffer_id), iter_id);
     }
+  }
+
+  // TS-mode contract loads. Thread (math warp w, lane l) owns weight
+  // row n = 32*(w%4) + l of the 128-row MMA-M tile:
+  //   * codes: one uint2 (16 uint4 codes, lop3-pre-interleaved) at
+  //     smem.b byte offset iter*BlockN*8 + w*256 + l*8 (256 contiguous
+  //     bytes per warp -- fully coalesced). Layout defined by
+  //     tests/ts_contract_pack.py.
+  //   * scale: bf16 at smem.bs[n] (identity N order, one group per
+  //     stage since group_size >= BlockK), broadcast to bf16x2.
+  //   * zp: uint4 nibble n of smem.bzp's group row, folded into the
+  //     dequant bias bf16x2(128 + zp) = 0x4300 | zp per half.
+  CUDA_INLINE void load_stage_iter_ts(uint32_t stage_id, uint32_t iter_id,
+                                      uint32_t buffer_id) {
+    auto &smem = ctx.smem;
+    uint32_t warp = ctx.warp_id() % 4u;
+    uint32_t lane = ctx.lane_id();
+    uint32_t n = warp * 32u + lane;
+
+    const uint32_t *b32 =
+        reinterpret_cast<const uint32_t *>(smem.stages[stage_id].b);
+    uint32_t idx = iter_id * (BlockShape::N * 2u) + warp * 64u + lane * 2u;
+    *reinterpret_cast<uint2 *>(mma.regs_qb_as_ptr(buffer_id)) =
+        *reinterpret_cast<const uint2 *>(b32 + idx);
+
+    if constexpr (kIsGroupWeightScale) {
+      const uint16_t *bs16 =
+          reinterpret_cast<const uint16_t *>(smem.stages[stage_id].bs);
+      uint32_t s = bs16[n];
+      mma.regs_bs2_ts[buffer_id] = (s << 16) | s;
+    }
+    uint32_t zp = 8u;  // no-zp uint4 semantics: symmetric around 8
+    if constexpr (kHasZeroPoint) {
+      const uint8_t *bzp8 =
+          reinterpret_cast<const uint8_t *>(smem.stages[stage_id].bzp);
+      zp = (bzp8[n >> 1] >> ((n & 1u) * 4u)) & 0xFu;
+    }
+    // bf16(128 + zp) == 0x4300 | zp exactly (mantissa low bits hold
+    // value - 128 for [128, 256)).
+    mma.regs_bias2_ts[buffer_id] = 0x43004300u | (zp << 16) | zp;
   }
 
   CUDA_INLINE void load_channel(uint32_t slice_id) {

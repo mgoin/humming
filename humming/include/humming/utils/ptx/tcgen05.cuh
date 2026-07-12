@@ -389,6 +389,41 @@ CUDA_INLINE void tcgen05_mma_ss_bf16(uint32_t d_tmem,
       : "memory");
 }
 
+// TS-mode variant: A comes from TMEM (bracketed operand), B from SMEM
+// via descriptor. Per CUTLASS `cute/arch/mma_sm100_umma.hpp`
+// (SM100_MMA_F16BF16_TS::fma):
+//
+//   tcgen05.mma.cta_group::1.kind::f16
+//       [d_tmem], [a_tmem], b_desc, idesc, {m0..m3}, p;
+//
+// The {m0..m3} mask operand IS required in TS mode too (Jinzhen's
+// skeleton omitted it -- with SS mode that omission made the
+// instruction parse to a different variant and hang; don't inherit
+// it here).
+//
+// a_tmem's lane field must be 0 (the MMA reads all M lanes); the
+// column field selects the staging slot. A must be K-major in TMEM
+// (2 bf16 per 32-bit cell, ascending K) -- the only layout TS-mode
+// accepts (CUTLASS static_asserts a_major == K).
+CUDA_INLINE void tcgen05_mma_ts_bf16(uint32_t d_tmem,
+                                     uint32_t a_tmem,
+                                     uint64_t b_desc,
+                                     uint32_t idesc,
+                                     bool scale_d) {
+  uint32_t mask[4] = {0u, 0u, 0u, 0u};
+  asm volatile(
+      "{\n\t"
+      "  .reg .pred p;\n\t"
+      "  setp.ne.b32 p, %4, 0;\n\t"
+      "  tcgen05.mma.cta_group::1.kind::f16 "
+      "    [%0], [%1], %2, %3, {%5, %6, %7, %8}, p;\n\t"
+      "}\n"
+      :: "r"(d_tmem), "r"(a_tmem), "l"(b_desc), "r"(idesc),
+         "r"((uint32_t)scale_d),
+         "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
+      : "memory");
+}
+
 // cta_group::2 variant: issued by leader CTA in a 2x cluster. The
 // effective MMA shape is (2 * BlockM, BlockN); the leader writes
 // M=0..BlockM-1 to its TMEM, the peer CTA gets M=BlockM..2*BlockM-1
@@ -460,14 +495,49 @@ CUDA_INLINE void tcgen05_fence_view_async_tmem_store() {
   asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
 }
 
+// Explicitly-named before/after pair for the TS-mode st -> mma
+// handshake (merged from Jinzhen's skeleton). Per PTX, before_thread_sync
+// in the producing warps only takes effect through a REAL thread sync
+// (bar.sync across the cooperating warps) followed by after_thread_sync
+// on the consuming path -- his skeleton emitted only the "before" half,
+// which establishes nothing cross-warp.
+CUDA_INLINE void tcgen05_fence_before_thread_sync() {
+  asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory");
+}
+
+CUDA_INLINE void tcgen05_fence_after_thread_sync() {
+  asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+}
+
+// tcgen05.wait::st -- blocks the warp until its prior tcgen05.st ops
+// complete. `.sync.aligned`: all 32 lanes must execute together.
+CUDA_INLINE void tcgen05_wait_st() {
+  asm volatile("tcgen05.wait::st.sync.aligned;\n" ::: "memory");
+}
+
+// tcgen05.wait::ld -- blocks the warp until its prior tcgen05.ld ops
+// have delivered their registers. tcgen05.ld is ASYNC: its destination
+// registers are undefined until this wait retires. Reading them earlier
+// is UB that happens to be masked by SASS scheduling in some builds --
+// the deferred-epilogue build exposed it as nondeterministic half-tile
+// corruption.
 CUDA_INLINE void tcgen05_wait_ld() {
-  // tcgen05.ld is ASYNC: its destination registers are undefined until
-  // this wait retires. Reading them earlier is UB that happens to be
-  // masked by SASS scheduling in some builds -- the deferred-epilogue
-  // build exposed it as nondeterministic half-tile corruption.
   asm volatile("tcgen05.wait::ld.sync.aligned;\n" ::: "memory");
 }
 
+// r2t: store 8 consecutive TMEM columns (one 32-bit cell per lane per
+// column) starting at taddr's column, into the issuing warp's own
+// sub-partition. reg r -> column (taddr.col + r).
+CUDA_INLINE void tcgen05_st_32x32b_x8(uint32_t tmem_addr,
+                                      const uint32_t (&r)[8]) {
+  asm volatile(
+      "tcgen05.st.sync.aligned.32x32b.x8.b32 [%0], "
+      "{%1, %2, %3, %4, %5, %6, %7, %8};\n"
+      :: "r"(tmem_addr),
+         "r"(r[0]), "r"(r[1]), "r"(r[2]), "r"(r[3]),
+         "r"(r[4]), "r"(r[5]), "r"(r[6]), "r"(r[7])
+      : "memory");
+}
 
 // ============================================================================
 // TMEM→register load (t2r) for the epilogue

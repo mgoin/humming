@@ -102,6 +102,21 @@
 #define HUMMING_TCGEN05_DEDICATED_REDUCE 0
 #endif
 
+// TS-mode tcgen05 (dequant -> tcgen05.st -> TMEM operand). The SS-mode
+// b_dequant SMEM staging buffer is NOT needed; instead two per-slot
+// Transform2Mma mbarriers gate TMEM staging-slot reuse.
+#if HUMMING_USE_TCGEN05 && HUMMING_USE_TCGEN05_TS
+#define IF_USE_TCGEN05_TS(x) x
+#else
+#define IF_USE_TCGEN05_TS(x)
+#endif
+
+#if HUMMING_USE_TCGEN05 && !HUMMING_USE_TCGEN05_TS
+#define IF_USE_TCGEN05_SS(x) x
+#else
+#define IF_USE_TCGEN05_SS(x)
+#endif
+
 // Untested combination: with reduce_overlap_last_stage_only the `reduce`
 // buffer overlays the last stage AND everything after it, including the
 // tcgen05 b_dequant staging buffer. The tcgen05 t2r epilogue writes
@@ -216,7 +231,7 @@ public:
       // absolute byte address, and a non-128B-aligned base shifts the
       // effective pattern in a way that doesn't match a row-major
       // logical layout.
-      IF_USE_TCGEN05(alignas(128) int4 b_dequant[kNumBDequantBuffers][kStageSizeBDequant];)
+      IF_USE_TCGEN05_SS(alignas(128) int4 b_dequant[kNumBDequantBuffers][kStageSizeBDequant];)
     };
 #if !HUMMING_TCGEN05_DEDICATED_REDUCE
     struct {
@@ -250,4 +265,20 @@ public:
   IF_USE_TCGEN05(alignas(16) uint32_t tcgen05_tmem_col;)
   // One commit/drain mbarrier per TMEM accumulator stage.
   IF_USE_TCGEN05(alignas(8) uint64_t tcgen05_mbar[HUMMING_TCGEN05_ACC_STAGES];)
+  // TS mode: per-staging-slot Transform2Mma mbarriers (WAR gate between
+  // the next tcgen05.st and the in-flight MMA reading the slot).
+  IF_USE_TCGEN05_TS(alignas(8) uint64_t tcgen05_ts_mbar[2];)
+
+#if HUMMING_USE_TCGEN05
+  // TMEM columns to allocate. SS mode: 128 accumulator cols per acc
+  // stage. TS mode: 2 x 8 staging cols + BlockM accumulator cols (the
+  // TS accumulator is transposed, MmaN = BlockM), power-of-2 rounded.
+#if HUMMING_USE_TCGEN05_TS
+  static constexpr uint32_t kTcgen05TmemCols =
+      (16u + BlockShape::M) <= 128u ? 128u : 256u;
+#else
+  static constexpr uint32_t kTcgen05TmemCols =
+      HUMMING_TCGEN05_ACC_STAGES > 1 ? 256u : 128u;
+#endif
+#endif
 };
