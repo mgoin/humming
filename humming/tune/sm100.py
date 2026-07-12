@@ -214,6 +214,15 @@ class Sm100Heuristics(Sm89Heuristics):
                 "use_cp_async": False,
                 "use_mbarrier": True,
                 "use_tma_bzp": False,
+                # Stream-K's cross-CTA partial-K reduction is NOT
+                # supported by the TS epilogue (TMA-C store path): it
+                # corrupts outputs whenever K is split across CTAs
+                # (mean|err| ~0.1 at M=256 N=1024 K=2048 vs ~4e-5 with
+                # it off). HummingKernel defaults use_stream_k=True, so
+                # it MUST be pinned False here -- the whole TS
+                # validation suite (tests/test_tcgen05_ts.py,
+                # test_tcgen05_ts_e2e.py) runs with it off.
+                "use_stream_k": False,
                 "raster_group_m": 1,
             }
 
@@ -270,6 +279,15 @@ class Sm100Heuristics(Sm89Heuristics):
                 # humming's `tensor.h:275` assert if use_tma_bzp is
                 # True; keep BZP on cp.async (cheap, BZP is small).
                 "use_tma_bzp": False,
+                # Same stream-K hazard as the TS config above: the
+                # tcgen05 epilogue does not implement stream-K's
+                # cross-CTA partial-K reduction, so leaving the
+                # HummingKernel default (True) corrupts outputs at
+                # large K (mean|err| ~0.03 at M=256 N=512 K=4096 vs
+                # ~4e-6 off). Every tcgen05 test builds kernels with
+                # use_stream_k=False, so this was never exercised
+                # through the heuristic. Pin it off.
+                "use_stream_k": False,
                 # L2 rasterization grouping (tune/raster.py) is tuned
                 # for the mma.sync/wgmma kernels; the tcgen05 configs
                 # were benched without it. Pin 1 to opt out until a

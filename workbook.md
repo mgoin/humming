@@ -1330,3 +1330,67 @@ gate shape TS already wins at M=128 (1.88x), so the crossover there is
 below M=128. So the crossover did **not** uniformly fall below M=128:
 it is shape-dependent (below M=128 for gate, between 128 and 512 for
 down).
+
+## e2e formats — production packer layer-API validation (round 3)
+
+Task: drive the FULL `HummingLayer` path a real caller uses — `mma_type=
+"tcgen05"` opt-in → `load_from_unquantized` (real bf16 weights) →
+`transform()` (D's production slot-paired TS packer, `kUseTcgen05Ts`) →
+heuristic dispatch → TS kernel → output — and check it against the
+`humming.utils.test` dequant reference GEMM (bf16-rounded weights, track
+B's subtlety). Tests: `tests/test_tcgen05_ts_e2e.py`; heuristic-config
+guards in `tests/test_sm100_heuristic.py`.
+
+**Validated end-to-end (green on B300 GPU0):**
+
+| format | group_size | zero-point | shapes (M×N×K) | status |
+|---|---|---|---|---|
+| bf16 A × uint4 | 128 | ON  | 16/128/256/512 × up to 1024×2048 | PASS |
+| bf16 A × uint4 | 128 | OFF | 16/128/256/512 × up to 1024×2048 | PASS |
+
+Each case ASSERTS the heuristic actually returns the TS config
+(`use_tcgen05_ts=True`, `mma_type=tcgen05`) at that M — no silent SS
+fallback — then compares the layer `forward` output vs the dequant
+reference. Residual is pure fp32-accumulation-order noise (mean|err|
+1e-5..6e-5; max|err| ≤0.25 at K≤1024, ≤1.0 at K=2048), NOT loosened atol.
+
+**Bug found + fixed: `use_stream_k` defaulted ON for BOTH sm100 tcgen05
+configs.** The TS config dict and the default SS-tcgen05 config dict in
+`tune/sm100.py::get_config` both omitted `use_stream_k`, so
+`HummingKernel` defaulted it True. The tcgen05 epilogue (TMA-C store
+path) does **not** implement stream-K's cross-CTA partial-K reduction,
+so any K-split silently corrupts the output. Measured on GPU0 through the
+layer `forward`:
+
+| path | shape | stream-K ON | stream-K OFF |
+|---|---|---|---|
+| TS  | M256 N1024 K2048 | mean 0.10, max 2.0 | mean 4e-5, max 1.0 |
+| SS  | M256 N4096 K4096 | mean 0.10, max 4.0 | mean 4e-6, max 0.25 |
+
+Never caught because every tcgen05 test (`test_tcgen05_ts.py`,
+`test_tcgen05_dtypes.py`) builds `HummingKernel` directly with
+`use_stream_k=False` — the heuristic-selected config was never exercised
+through `forward`. Fix: pin `"use_stream_k": False` in both config dicts
+(matches all existing coverage). Regression guards added:
+`test_tcgen05_ts_e2e.py::test_ss_tcgen05_default_path_stream_k_regression`
+(forward-level) + `use_stream_k is False` asserts in
+`test_sm100_heuristic.py::{test_heuristic_returns_tcgen05_config,
+test_ts_opt_in_config}`.
+
+**Deferred (need kernel surgery, out of scope — NOT forced):**
+
+- **uint8** (channelwise + grouped): the TS mainloop hard-asserts
+  `ElementB::kBits == 4` (`mma/tcgen05_ts_mma.cuh:95`) and
+  `supports_tcgen05_ts` gates `b_dtype == uint4`. D's pack *formula*
+  generalizes to uint8 (docs/tcgen05_ts_packing.md §2, V=4) and the SS
+  path supports uint8, but the TS kernel would need a real uint8 dequant
+  path + config-space widening. Channelwise (`group_size=0`) additionally
+  fails the `weight_scale_group_size >= 64` (gs≥BlockK) legality gate.
+  `test_ts_e2e_uint8_deferred` pins that a uint8 TS opt-in fails loudly at
+  `transform()` rather than silently mispacking.
+- **uint2 / uint3**: same `kBits == 4` static_assert. uint2 is even-bit
+  (packs like uint4/uint8) so it's the smaller lift; uint3 is odd-bit and
+  additionally hits the half-group-gather even-bit requirement + the
+  3/5/6/7-bit re-compression crossing the TS row boundary
+  (docs/tcgen05_ts_packing.md §6.3). Both need a dedicated TS loader/dtype
+  path before they can dispatch.

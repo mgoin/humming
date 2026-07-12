@@ -83,6 +83,10 @@ def test_heuristic_returns_tcgen05_config():
     assert cfg["use_warp_spec"] is True
     assert cfg["use_tma"] is True
     assert cfg["use_tma_bzp"] is False  # asserted False by tensor.h
+    # The tcgen05 epilogue does not implement stream-K's cross-CTA
+    # partial-K reduction; the heuristic must pin it off (HummingKernel
+    # defaults it True), else large-K outputs corrupt. Regression guard.
+    assert cfg["use_stream_k"] is False
     assert cfg["block_shape"] == (128, 128, 128)
     assert cfg["warp_shape"] == (32, 64, 128)
     assert cfg["num_stages"] == 4
@@ -202,6 +206,9 @@ def test_ts_opt_in_config(shape_m, block_m):
     assert cfg["block_shape"] == (block_m, 128, 64)
     assert cfg["warp_shape"] == (block_m, 32, 64)
     assert cfg["use_warp_spec"] is True and cfg["use_tma"] is True
+    # TS epilogue (TMA-C store) cannot do stream-K partial-K reduction;
+    # the config must disable it (see test_tcgen05_ts_e2e).
+    assert cfg["use_stream_k"] is False
 
 
 def test_default_meta_never_gets_ts():
