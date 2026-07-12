@@ -183,14 +183,26 @@ def test_supports_tcgen05_ts_legal():
         shape_n=14336, shape_k=4096, a_dtype=dtypes.float8e4m3,
         b_dtype=dtypes.float8e4m3, c_dtype=dtypes.bfloat16, bs_dtype=dtypes.bfloat16,
         weight_scale_group_size=128, has_zero_point=False),
-    # MoE (experts) is not wired into the TS kernel.
+    # Weight dtype outside the TS opt-in allowlist (float8e5m2 has no
+    # transform_b dispatch); a_dtype is still bf16.
     HummingLayerMeta(
-        shape_n=14336, shape_k=4096, num_experts=8, a_dtype=dtypes.bfloat16,
-        b_dtype=dtypes.uint4, c_dtype=dtypes.bfloat16, bs_dtype=dtypes.bfloat16,
-        weight_scale_group_size=128, has_zero_point=True),
+        shape_n=14336, shape_k=4096, a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.float8e5m2, c_dtype=dtypes.bfloat16, bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=128, has_zero_point=False),
 ])
 def test_supports_tcgen05_ts_rejects(meta):
     assert not supports_tcgen05_ts(meta)
+
+
+def test_supports_tcgen05_ts_moe_now_legal():
+    """Wave-1 MoE track: num_experts>0 is TS-legal (grouping lives above
+    the MMA). Previously rejected; the grouped block_m is chosen in
+    get_config, not gated out here."""
+    meta = HummingLayerMeta(
+        shape_n=14336, shape_k=4096, num_experts=8, a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4, c_dtype=dtypes.bfloat16, bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=128, has_zero_point=True)
+    assert supports_tcgen05_ts(meta)
 
 
 @pytest.mark.parametrize("shape_m, block_m", [(64, 64), (128, 128), (2048, 128)])
