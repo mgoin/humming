@@ -241,6 +241,59 @@ xfail set can be reduced by trusting the bench alone.
   the source of truth for "what dtype humming's TCGEN05 path
   supports correctly" -- the prod-WS configs are a strict subset.
 
+### RESOLVED (round 3): corrected root cause -- the EPILOGUE TMA-C read
+
+The "edge case in the dequant scatter math" theory above was **wrong**.
+The nondeterministic corruption at the prod-WS configs (uint4 zp={T,F}
+BK128 s4, and the BK64 closed-form set) was **not** in the producer /
+scatter at all -- it was the **epilogue TMA-C output store** reading
+`smem.reduce` before the drain's stores were published. Two independent
+tracks converged on the same mechanism:
+
+* Track E (bc431ed), via the deferred-TMEM-drain bisection (notes
+  Milestone 4).
+* Track F (9939766 + fd9f1b2), via bit-exact alias probes
+  (`benchmarks/probe_b37_alias.py`): 100% of corrupted C cells (8/8
+  runs) are the stage-0 A activation bytes at the SMEM-union alias
+  (`smem.reduce` aliases `stages[0]`), proving the TMA-C store engine
+  read pre-drain SMEM.
+
+Three latent bugs, all masked in the shipped SS path by scheduling
+luck / a full mainloop between consecutive `smem.reduce` writers, and
+exposed by the faster closed-form stores and back-to-back drains:
+
+1. No `fence.proxy.async.shared::cta` between the drain's generic-proxy
+   `smem.reduce` writes and the `cp.async.bulk.tensor` async-proxy read.
+2. `tma_commit_store_group()` had **zero** call sites, so every
+   `tma_wait_store_group` was a no-op (uncommitted bulk ops belong to
+   no group). The per-thread wait also let non-issuing math warps
+   release the producer early -- fixed with a barrier after the wait.
+3. `tcgen05.ld` is async with no `tcgen05.wait::ld` anywhere; real UB
+   but a *separate* bug (only 3/12 of the B.37 failures cleared with it
+   alone).
+
+Fixes live in `epilogue/gmem_writer.cuh` (fence + commit) and the
+kernels (`humming.cuh`, `humming_ws.cuh`: barrier after the per-thread
+TMA-C wait + CTA-exit drain). With them:
+
+* `kUseClosedFormScatter` is now **unconditional** (the BK>=128 gate was
+  only a workaround for this race at BK64); the closed-form win extends
+  to BK64 (~1.075x vs element-wise at M=2048 4096^2, GPU 0 contended;
+  the headline 1.13x was the BK128 measurement).
+* uint4 zp={T,F} is **un-demoted** back to the tuned BK128 s4 config in
+  `SAFE_PROD_WS_CONFIG`: 20/20 consecutive clean at (512,512,4096)
+  WS+TMA (was 12/12 fail); BK64 closed-form s3/s4 24/24 clean.
+* `compute-sanitizer racecheck` on the previously-failing config: only
+  4 residual hazards remain -- the known mbarrier-pipeline artifact
+  (producer stage-SMEM write vs MMA read, which racecheck cannot model)
+  -- and output is bit-correct (max|err| 2.0, pure bf16 drift).
+
+The separate mainloop proxy fence was also relocated from the end of
+`transform_b` (register-only, SASS-misplaced after the UTCMMA) into
+`run()` between the scatter stores and `sync_math_threads`, where the
+PTX cross-proxy ordering model requires it. Not the B.37 race, but
+formally required.
+
 ## Phase B.36b: bar.sync is structurally load-bearing (not just overhead)
 
 Tried replacing `sync_part_threads` (the per-K-iter `bar.sync 1, 256`)
