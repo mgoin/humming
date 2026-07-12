@@ -1,45 +1,32 @@
-"""Cross-track comparison: track d's reference packer vs track
-b-ts-staging's throwaway packer (both written independently to the same
-register-layout CONTRACT).
-
-Skips unless the b-ts-staging worktree is present. Documents the ONE
-known divergence so it is decided consciously, not discovered in a
-kernel bring-up:
+"""Cross-track comparison: the PRODUCTION slot-paired packer (track d,
+now what the TS kernel reads) vs track b-ts-staging's retired throwaway
+packer (both written independently to the same register-layout
+CONTRACT). RESOLVED at round-3 integration in favor of track d's
+layout: zero loader changes (loader_b half-group gather), file-format
+continuity, bit-exact CUDA repack. B's packer survives only here and
+in tests/test_ts_contract_pack.py as a cross-check.
 
 * scale stream, zero-point stream, nibble interleave, word-pair
   semantics: IDENTICAL.
 * weight word placement within a K-chunk row: DIFFERENT.
     track b: col = (n/32)*64  + (n%32)*2 + j   (band-major flat;
-             needs a NEW TS s2r gather: 8 B per thread at w*256+l*8)
+             would need a NEW TS s2r gather: 8 B/thread at w*256+l*8)
     track d: col = (n/64)*128 + (n%32)*4 + ((n%64)/32)*2 + j
              (slot-paired; byte-compatible with the EXISTING loader_b
              WarpN==32 half-group gather, zero loader changes)
-  This is exactly decision point 2 in docs/tcgen05_ts_packing.md.
+  This was decision point 2 in docs/tcgen05_ts_packing.md.
 """
-
-import sys
-from pathlib import Path
 
 import pytest
 import torch
 
+import ts_contract_pack as b_pack_mod
 from humming.utils import ts_packing as d
-
-B_TESTS = Path("/home/mgoin/code/vllm/.scratch/humming-v2/wt-b-ts-staging/tests")
-
-pytestmark = pytest.mark.skipif(
-    not (B_TESTS / "ts_contract_pack.py").exists(),
-    reason="track b-ts-staging packer not available",
-)
 
 
 @pytest.fixture()
 def b_pack():
-    sys.path.insert(0, str(B_TESTS))
-    import ts_contract_pack
-
-    yield ts_contract_pack
-    sys.path.remove(str(B_TESTS))
+    return b_pack_mod
 
 
 def test_scale_and_zp_streams_identical(b_pack):

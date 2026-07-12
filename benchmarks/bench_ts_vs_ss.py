@@ -6,24 +6,19 @@ BlockM in {64,128}, stages swept where SMEM allows.
 
 Run: CUDA_VISIBLE_DEVICES=1 .venv/bin/python benchmarks/bench_ts_vs_ss.py
 """
-import os
-import sys
 import time
 
 import torch
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tests"))
-from ts_contract_pack import (  # noqa: E402
-    pack_ts_weight,
-    pack_ts_weight_scale,
-    pack_ts_zero_point,
-)
 
 from humming import dtypes, ops  # noqa: E402
 from humming.kernel.humming import HummingKernel  # noqa: E402
 from humming.utils.test import (  # noqa: E402
     generate_random_inputs,
     generate_random_weight,
+)
+from humming.utils.ts_packing import (  # noqa: E402
+    pack_scales_tcgen05_ts,
+    pack_zero_point_tcgen05_ts,
 )
 from humming.utils.weight import (  # noqa: E402
     prepare_humming_weight,
@@ -76,10 +71,12 @@ def build_launcher(shape_m, shape_n, shape_k, mode, block_m=128,
         shape_m, shape_n, shape_k)
 
     if mode == "ts":
-        weight_p = pack_ts_weight(weight_codes.cpu().to(torch.int32)).cuda()
-        weight_scale_p = pack_ts_weight_scale(weight_scale).cuda()
-        zero_point_p = pack_ts_zero_point(
-            zero_point.cpu().to(torch.int32)).cuda()
+        weight_p = prepare_humming_weight(
+            weight_codes, B_DTYPE, A_DTYPE, zero_point=zero_point,
+            use_wgmma=False, use_tcgen05_ts=True)
+        weight_scale_p = pack_scales_tcgen05_ts(weight_scale).cuda()
+        zero_point_p = pack_zero_point_tcgen05_ts(
+            zero_point.to(torch.int32), B_DTYPE.num_bits).cuda()
         block_shape = (block_m, 128, 64)
         warp_shape = (block_m, 32, 64)
     else:

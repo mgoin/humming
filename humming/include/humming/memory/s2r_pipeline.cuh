@@ -93,10 +93,11 @@ public:
 
   // TS-mode contract loads. Thread (math warp w, lane l) owns weight
   // row n = 32*(w%4) + l of the 128-row MMA-M tile:
-  //   * codes: one uint2 (16 uint4 codes, lop3-pre-interleaved) at
-  //     smem.b byte offset iter*BlockN*8 + w*256 + l*8 (256 contiguous
-  //     bytes per warp -- fully coalesced). Layout defined by
-  //     tests/ts_contract_pack.py.
+  //   * codes: the production slot-paired layout (docs/
+  //     tcgen05_ts_packing.md, humming_pack_weight with kUseTcgen05Ts)
+  //     is byte-compatible with loader_b's WarpN==32 half-group gather,
+  //     which delivers row n's uint2 (16 uint4 codes, lop3
+  //     pre-interleaved) with zero loader changes.
   //   * scale: bf16 at smem.bs[n] (identity N order, one group per
   //     stage since group_size >= BlockK), broadcast to bf16x2.
   //   * zp: uint4 nibble n of smem.bzp's group row, folded into the
@@ -108,11 +109,8 @@ public:
     uint32_t lane = ctx.lane_id();
     uint32_t n = warp * 32u + lane;
 
-    const uint32_t *b32 =
-        reinterpret_cast<const uint32_t *>(smem.stages[stage_id].b);
-    uint32_t idx = iter_id * (BlockShape::N * 2u) + warp * 64u + lane * 2u;
-    *reinterpret_cast<uint2 *>(mma.regs_qb_as_ptr(buffer_id)) =
-        *reinterpret_cast<const uint2 *>(b32 + idx);
+    loader_b.load(smem.stages[stage_id].b, mma.regs_qb_as_ptr(buffer_id),
+                  iter_id);
 
     if constexpr (kIsGroupWeightScale) {
       const uint16_t *bs16 =

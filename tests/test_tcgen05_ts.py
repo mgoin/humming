@@ -2,8 +2,12 @@
 
 TS mode = dequant to registers, tcgen05.st into double-buffered TMEM
 staging, A<->B-swapped TS-mode tcgen05.mma ([d_tmem], [w_tmem],
-act_smem_desc). Weights/scales/zp use the TS register-layout CONTRACT
-pack (tests/ts_contract_pack.py), NOT prepare_humming_weight.
+act_smem_desc). Weights use the PRODUCTION slot-paired TS layout
+(docs/tcgen05_ts_packing.md) via the real repack path:
+prepare_humming_weight(use_tcgen05_ts=True) -> kUseTcgen05Ts CUDA
+repack -> loader_b half-group gather. Scale/zp streams come from
+humming.utils.ts_packing (bit-identical to the retired throwaway
+packer's streams -- pinned by tests/test_ts_packing_cross_track.py).
 
 Prototype config space (asserted in mma/tcgen05_ts_mma.cuh):
   BlockN == 128, WarpN == 32, WarpM == BlockM in {64, 128},
@@ -15,15 +19,14 @@ from __future__ import annotations
 import pytest
 import torch
 
-from ts_contract_pack import (
-    pack_ts_weight,
-    pack_ts_weight_scale,
-    pack_ts_zero_point,
-)
-
 from humming import dtypes
 from humming.kernel.humming import HummingKernel
 from humming.utils.test import generate_random_inputs, generate_random_weight
+from humming.utils.ts_packing import (
+    pack_scales_tcgen05_ts,
+    pack_zero_point_tcgen05_ts,
+)
+from humming.utils.weight import prepare_humming_weight
 
 
 def _is_blackwell() -> bool:
@@ -57,12 +60,15 @@ def _run_ts(
     )
     _, weight_ref, weight_codes, weight_scale, zero_point, _ = random_weight
 
-    weight = pack_ts_weight(weight_codes.cpu().to(torch.int32)).cuda()
-    weight_scale_p = pack_ts_weight_scale(weight_scale).cuda()
+    weight = prepare_humming_weight(
+        weight_codes, b_dtype, a_dtype, zero_point=zero_point,
+        use_wgmma=False, use_tcgen05_ts=True,
+    )
+    weight_scale_p = pack_scales_tcgen05_ts(weight_scale).cuda()
     zero_point_p = None
     if has_zero_point:
-        zero_point_p = pack_ts_zero_point(
-            zero_point.cpu().to(torch.int32)).cuda()
+        zero_point_p = pack_zero_point_tcgen05_ts(
+            zero_point.to(torch.int32), b_dtype.num_bits).cuda()
 
     _, inputs_ref, inputs, _ = generate_random_inputs(
         m=shape_m, k=shape_k, group_size=0, dtype=a_dtype,
