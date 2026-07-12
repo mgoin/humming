@@ -63,6 +63,22 @@ public:
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
 
+  // Commit batching: commit the MMA batch to the shared ts_mbar[0]
+  // only on slot-1 issues (every 2nd K-iter). Arrival j proves BOTH
+  // MMAs of pair j retired, so transform_b's WAR gate needs
+  // pair_waits_ >= arrivals_[slot] consumed arrivals. Halves the
+  // tcgen05.commit issue rate and the mbar spins (round-2 NCU: 39% of
+  // TS stall samples were mbarrier spin BRAs) at the price of a
+  // stronger wait (slot-0 stores also wait on the pair's slot-1 MMA).
+  // MEASURED NEGATIVE (GPU 3, L70B-down M=2048, vectorized drain):
+  // s4 1966 -> 2213 us, s6 1965 -> 2278 -- the extra serialization
+  // costs ~12%, more than the halved commit/spin saves. Default OFF;
+  // kept as the recorded experiment.
+#ifndef HUMMING_TS_COMMIT_BATCH
+#define HUMMING_TS_COMMIT_BATCH 0
+#endif
+  static constexpr bool kCommitBatch = HUMMING_TS_COMMIT_BATCH != 0;
+
   // The MMA-M tile: min(BlockN, 128) weight rows. Prototype pins it to
   // exactly one 128-row tile covered by 4 warps of 32 lanes.
   static constexpr uint32_t kMmaM = 128;
@@ -157,9 +173,16 @@ public:
     }
 
     // WAR gate: the slot may still be read by an in-flight MMA from
-    // two iterations ago. arrivals_/waits_ differ by at most 1.
+    // two iterations ago.
     uint32_t slot = buffer_id;
-    if (arrivals_[slot] > waits_[slot]) {
+    if constexpr (kCommitBatch) {
+      // Consume pair arrivals until every MMA issued on this slot is
+      // proven retired (arrivals_/pair_waits_ differ by at most 1).
+      while (pair_waits_ < arrivals_[slot]) {
+        mbarrier_wait(&smem.tcgen05_ts_mbar[0], pair_waits_ & 1u);
+        pair_waits_++;
+      }
+    } else if (arrivals_[slot] > waits_[slot]) {
       mbarrier_wait(&smem.tcgen05_ts_mbar[slot], waits_[slot] & 1u);
       waits_[slot]++;
     }
@@ -199,10 +222,12 @@ public:
       tcgen05_mma_ts_bf16(tmem_base + kDColOffset,
                           tmem_base + slot * kTsSlotCols,
                           b_desc, idesc, scale_d);
-      // Commit the batch (all MMAs so far) to this slot's mbar; the
-      // arrival transitively proves the slot's reader retired.
-      tcgen05_commit_to_mbarrier(
-          cast_smem_ptr_to_uint(&smem.tcgen05_ts_mbar[slot]));
+      // Commit the batch (all MMAs so far); the arrival transitively
+      // proves the slot's reader retired. Batched: once per pair.
+      if (!kCommitBatch || slot == 1u) {
+        tcgen05_commit_to_mbarrier(cast_smem_ptr_to_uint(
+            &smem.tcgen05_ts_mbar[kCommitBatch ? 0u : slot]));
+      }
     }
     arrivals_[slot]++;
   }
@@ -273,4 +298,6 @@ private:
   // math threads by construction).
   uint32_t arrivals_[kNumTsSlots] = {0, 0};
   uint32_t waits_[kNumTsSlots] = {0, 0};
+  // Pair-arrival counter for kCommitBatch (ts_mbar[0] phases consumed).
+  uint32_t pair_waits_ = 0;
 };
