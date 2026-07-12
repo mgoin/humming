@@ -243,25 +243,23 @@ def test_matrix_weight_dtype(b_dtype):
     assert _gate_accepts(_make_meta(b_dtype=b_dtype))
 
 
-# --- scale-type axis (track: scale/zp validation) ---
-@pytest.mark.xfail(reason="scale track: gate pins gs>=64", strict=False)
-def test_matrix_future_gs32():
+# --- scale-type axis (track: scalar-formats, LANDED wave 2) ---
+def test_matrix_gs32():
     assert _gate_accepts(_make_meta(weight_scale_group_size=32))
 
 
-@pytest.mark.xfail(reason="scale track: gate pins group scale (gs>0)", strict=False)
-def test_matrix_future_channelwise():
+def test_matrix_channelwise():
     assert _gate_accepts(_make_meta(weight_scale_group_size=0))
 
 
+def test_matrix_fp_zero_point():
+    assert _gate_accepts(_make_meta(has_zero_point=True, is_fp_zero_point=True))
+
+
+# --- scale-type axis (FUTURE: not in any landed track) ---
 @pytest.mark.xfail(reason="scale track: gate pins bs_dtype==bfloat16", strict=False)
 def test_matrix_future_e8m0_scale():
     assert _gate_accepts(_make_meta(bs_dtype=dtypes.float8e8m0))
-
-
-@pytest.mark.xfail(reason="scale track: gate rejects fp zero point", strict=False)
-def test_matrix_future_fp_zero_point():
-    assert _gate_accepts(_make_meta(has_zero_point=True, is_fp_zero_point=True))
 
 
 # --- MoE axis (track: moe-grouped-gemm, LANDED wave 1) ---

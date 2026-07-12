@@ -167,17 +167,27 @@ def test_supports_tcgen05_ts_legal():
     assert Sm100Heuristics.supports_tcgen05_ts(_make_meta(512, 512))
 
 
+def test_supports_tcgen05_ts_gs32_legal():
+    """scalar-formats M3: sub-stage weight-scale groups gs in {16, 32}
+    (gs % 16 == 0 and 64 % gs == 0) are now TS-legal; channelwise gs=0 too."""
+    assert supports_tcgen05_ts(_make_meta(512, 512, weight_scale_group_size=32))
+    assert supports_tcgen05_ts(_make_meta(512, 512, weight_scale_group_size=16))
+    assert supports_tcgen05_ts(_make_meta(512, 512, weight_scale_group_size=0))
+
+
 @pytest.mark.parametrize("meta", [
     # N not a multiple of 128 (only 64).
     HummingLayerMeta(
         shape_n=192, shape_k=4096, a_dtype=dtypes.bfloat16, b_dtype=dtypes.uint4,
         c_dtype=dtypes.bfloat16, bs_dtype=dtypes.bfloat16,
         weight_scale_group_size=128, has_zero_point=True),
-    # Scale group smaller than a BlockK=64 stage.
+    # Sub-stage scale group that a 16-K MMA iter cannot stay within:
+    # gs=48 is < BlockK=64 and 64 % 48 != 0 (gs=32/gs=16 are now accepted,
+    # see test_supports_tcgen05_ts_gs32_legal).
     HummingLayerMeta(
         shape_n=512, shape_k=512, a_dtype=dtypes.bfloat16, b_dtype=dtypes.uint4,
         c_dtype=dtypes.bfloat16, bs_dtype=dtypes.bfloat16,
-        weight_scale_group_size=32, has_zero_point=True),
+        weight_scale_group_size=48, has_zero_point=True),
     # fp8 activations: not the bf16 x uint4 TS shape.
     HummingLayerMeta(
         shape_n=14336, shape_k=4096, a_dtype=dtypes.float8e4m3,
