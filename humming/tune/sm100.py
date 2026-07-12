@@ -70,7 +70,10 @@ def _tcgen05_config_for_b_dtype(b_dtype, shape_k_aligned_128):
 # TS-mode weight-dtype allowlist. Mirrors the ts_dequant_b_pair dispatch +
 # static_assert allowlist in mma/tcgen05_ts_mma.cuh; extended one dtype per
 # weight-dtype milestone. Start: {uint4}.
-_TS_OPTED_IN_B_DTYPES = frozenset({dtypes.uint2, dtypes.uint4, dtypes.float4e2m1})
+_TS_OPTED_IN_B_DTYPES = frozenset({
+    dtypes.uint2, dtypes.uint4, dtypes.uint8,
+    dtypes.float4e2m1, dtypes.float8e4m3,
+})
 
 
 def supports_tcgen05_ts(meta) -> bool:

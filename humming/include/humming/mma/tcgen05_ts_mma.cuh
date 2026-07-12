@@ -57,24 +57,58 @@
 // identical to the shipped u4 inline (lop3 0xea + __hsub2(bias2)). The s2r
 // path always fills bias2 (zp, or the symmetric 8 for the no-zp case), so
 // kHasZeroPoint is unconditionally true from uint_to_f16's perspective.
-template <class EB>
+// Multiply a bf16x2 by the exact power of two 2^kOff. bf16 tops out at
+// 2^128, so an offset > 127 (uint8's 133) is applied in two steps: the
+// first 2^127 lifts normalized_uint_to_fp's subnormal dequant into normal
+// range, the residual then finishes it -- each factor is a pure power of
+// two (mantissa preserved, no rounding), mirroring SS's mainloop 2^127 +
+// epilogue 2^6 split but folded entirely into transform_b.
+template <uint32_t kOff>
+CUDA_INLINE __nv_bfloat162 ts_mul_pow2(__nv_bfloat162 t) {
+  if constexpr (kOff == 0u) {
+    return t;
+  } else {
+    constexpr uint32_t kW = kOff > 127u ? 127u : kOff;
+    const nv_bfloat162 f0 = prepare_exp_scale_factor<nv_bfloat162, kW>();
+    t = __hmul2(t, *reinterpret_cast<const __nv_bfloat162 *>(&f0));
+    if constexpr (kOff > kW) {
+      const nv_bfloat162 f1 = prepare_exp_scale_factor<nv_bfloat162, kOff - kW>();
+      t = __hmul2(t, *reinterpret_cast<const __nv_bfloat162 *>(&f1));
+    }
+    return t;
+  }
+}
+
+template <class EB, bool kHasZeroPoint>
 CUDA_INLINE uint32_t ts_dequant_b_pair(uint32_t shifted, uint32_t bias2) {
   if constexpr (EB::kIsIntegerType && EB::kBits <= BFloat16::kMantissaBits) {
+    // uint{2,4}: bias2 is the folded bf16(128 + zp) subtrahend, so
+    // uint_to_f16 (kHasZeroPoint=true) always emits (code - zp); the
+    // no-zp midpoint is baked into bias2 by s2r. No exp offset (kOff==0).
     return uint_to_f16<EB, BFloat16, /*kHasZeroPoint=*/true,
                        /*kIsFpZeroPoint=*/false>(shifted, bias2);
+  } else if constexpr (EB::kIsIntegerType) {
+    // uint8: 8 > bf16 mantissa, so the 0x4300 trick breaks; route to
+    // normalized_uint_to_fp with the RAW integer zp (bias2, broadcast
+    // internally; its no-zp branch applies the symmetric midpoint). The
+    // result is a subnormal ~(code-zp)*2^-133, corrected by 2^kOff (133).
+    static_assert(EB::kBits == 8, "TS integer dtypes: {uint2, uint4, uint8}");
+    constexpr uint32_t kOff =
+        get_dtype_dequant_exp_offset<BFloat16, EB, kHasZeroPoint>();
+    uint32_t v = normalized_uint_to_fp<EB, BFloat16, kHasZeroPoint,
+                                       /*kIsFpZeroPoint=*/false>(shifted, bias2);
+    __nv_bfloat162 t = ts_mul_pow2<kOff>(*reinterpret_cast<__nv_bfloat162 *>(&v));
+    return *reinterpret_cast<uint32_t *>(&t);
   } else if constexpr (EB::kIsFloatingPointType && EB::kBits <= 8u) {
     // Software fp -> bf16: relocate each code to the top of its 16-bit
     // half, decode via fp_to_fp (exponent bits copied, NOT rebiased),
-    // then multiply by the constant 2^kOff to correct the bias. kOff is
-    // a pure power of two so this bf16 mul is exact; for bf16 A the whole
-    // fp4/fp8 offset lives in the mainloop weight
+    // then multiply by 2^kOff to correct the bias. For bf16 A the whole
+    // fp4/fp8 offset (126/120 <= 127) lives in the mainloop weight
     // (get_epilogue_exp_offset == 0), so the caller's per-lane group-scale
     // hmul2 needs NO epilogue exp-offset plumbing (cf SS kEpilogueExpOffset).
     constexpr uint32_t kOff = get_dtype_dequant_exp_offset<BFloat16, EB>();
     uint32_t v = fp_to_fp<EB, BFloat16>(shifted << (BFloat16::kBits - EB::kBits));
-    __nv_bfloat162 t = *reinterpret_cast<__nv_bfloat162 *>(&v);
-    const nv_bfloat162 f = prepare_exp_scale_factor<nv_bfloat162, kOff>();
-    t = __hmul2(t, *reinterpret_cast<const __nv_bfloat162 *>(&f));
+    __nv_bfloat162 t = ts_mul_pow2<kOff>(*reinterpret_cast<__nv_bfloat162 *>(&v));
     return *reinterpret_cast<uint32_t *>(&t);
   } else {
     static_assert(EB::kBits == 0,
@@ -151,10 +185,12 @@ public:
   static constexpr bool kTsBDtypeSupported =
       std::is_same<ElementB, UInt4>::value ||
       std::is_same<ElementB, UInt2>::value ||
-      std::is_same<ElementB, Float4E2M1>::value;
+      std::is_same<ElementB, UInt8>::value ||
+      std::is_same<ElementB, Float4E2M1>::value ||
+      std::is_same<ElementB, Float8E4M3>::value;
   static_assert(kTsBDtypeSupported,
                 "TCGEN05_TS: ElementB not in the TS weight-dtype allowlist "
-                "(currently {uint2, uint4, float4e2m1})");
+                "(currently {uint2, uint4, uint8, float4e2m1, float8e4m3})");
   static_assert(!kIsFpZeroPoint,
                 "TCGEN05_TS: fp zero-point not yet wired for TS mode");
   static_assert(Ctx::kIsGroupWeightScale,
@@ -173,8 +209,9 @@ public:
   // the MMA descriptor; s2r skips loader_a for TCGEN05).
   alignas(16) int4 regs_a[1];
   // Per-thread quantised codes: one row x 16 K, packed into kWpr uint32
-  // (u4: 2), double-buffered. Written by the TS branch of s2r_pipeline.
-  alignas(8) uint32_t regs_qb[2][kWpr];
+  // (u2:1, u4:2, u8:4), double-buffered. Written by the TS branch of
+  // s2r_pipeline. alignas(16): loader_b vectorizes the u8 gather as int4.
+  alignas(16) uint32_t regs_qb[2][kWpr];
   // Per-lane bf16x2 broadcast scale (s, s) and dequant bias
   // bf16x2(128 + zp, 128 + zp), also filled by the s2r TS branch.
   uint32_t regs_bs2_ts[2];
@@ -207,7 +244,8 @@ public:
         // Extract the (r, r + kVpw/2) codes of q into the lo/hi bf16
         // halves and dequant per ElementB; the pack pre-compensates the
         // slot order so this yields reg = (K = 2*idx, K = 2*idx + 1).
-        uint32_t v = ts_dequant_b_pair<ElementB>(q >> (r * kBBits), bias2);
+        uint32_t v = ts_dequant_b_pair<ElementB, kHasZeroPoint>(
+            q >> (r * kBBits), bias2);
         __nv_bfloat162 t = *reinterpret_cast<__nv_bfloat162 *>(&v);
         t = __hmul2(t, scale);
         out[w * kRegsPerWord + r] = *reinterpret_cast<uint32_t *>(&t);

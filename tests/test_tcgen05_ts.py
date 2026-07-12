@@ -225,6 +225,66 @@ def test_ts_fp4_prod_shape():
     _assert_close(outputs, outputs_ref, atol=2.0)
 
 
+# ---------------------------------------------------------------------------
+# uint8 (milestone d): normalized_uint_to_fp (8 > bf16 mantissa) + a split
+# 2^133 exp offset (2^127 lifts the subnormal dequant to normal range, then
+# 2^6), 8-bit zp byte-extract, regs_qb[2][4] int4 load. SMEM fits at
+# BlockK=64 stages=4.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("has_zero_point", [False, True])
+def test_ts_uint8_512_cubed(has_zero_point):
+    outputs, outputs_ref = _run_ts(
+        shape_m=512, shape_n=512, shape_k=512,
+        has_zero_point=has_zero_point, b_dtype=dtypes.uint8,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_uint8_block_m128():
+    outputs, outputs_ref = _run_ts(
+        shape_m=256, shape_n=1024, shape_k=1024,
+        block_shape=(128, 128, 64), b_dtype=dtypes.uint8,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_uint8_prod_shape():
+    outputs, outputs_ref = _run_ts(
+        shape_m=128, shape_n=1024, shape_k=8192,
+        block_shape=(128, 128, 64), num_stages=4, b_dtype=dtypes.uint8,
+    )
+    _assert_close(outputs, outputs_ref, atol=2.0)
+
+
+# ---------------------------------------------------------------------------
+# float8e4m3 (milestone d): fp_to_fp decode + a single 2^120 exp offset
+# (<=127, fully in the mainloop weight); no zp; regs_qb[2][4].
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "shape_m,shape_n,shape_k", [(512, 512, 512), (256, 1024, 1024)],
+)
+def test_ts_fp8_shapes(shape_m, shape_n, shape_k):
+    outputs, outputs_ref = _run_ts(
+        shape_m=shape_m, shape_n=shape_n, shape_k=shape_k,
+        has_zero_point=False, b_dtype=dtypes.float8e4m3,
+        block_shape=(128, 128, 64) if shape_m >= 128 else (64, 128, 64),
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_fp8_prod_shape():
+    outputs, outputs_ref = _run_ts(
+        shape_m=128, shape_n=1024, shape_k=8192,
+        block_shape=(128, 128, 64), num_stages=4,
+        has_zero_point=False, b_dtype=dtypes.float8e4m3,
+    )
+    _assert_close(outputs, outputs_ref, atol=2.0)
+
+
 @pytest.mark.parametrize("num_stages", [2, 3, 4])
 def test_ts_stages(num_stages):
     outputs, outputs_ref = _run_ts(

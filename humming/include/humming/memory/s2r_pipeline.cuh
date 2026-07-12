@@ -118,17 +118,32 @@ public:
       uint32_t s = bs16[n];
       mma.regs_bs2_ts[buffer_id] = (s << 16) | s;
     }
-    // No-zp: symmetric midpoint 2^(kBits-1) (uint4->8, uint2->2), matching
-    // the reference's quanted - 2^(bits-1) (utils/test.generate_random_weight).
-    uint32_t zp = 1u << (Ctx::ElementB::kBits - 1u);
-    if constexpr (kHasZeroPoint) {
-      const uint8_t *bzp8 =
-          reinterpret_cast<const uint8_t *>(smem.stages[stage_id].bzp);
-      zp = (bzp8[n >> 1] >> ((n & 1u) * 4u)) & 0xFu;
+    // The zp operand format is per weight-dtype (transform_b's
+    // ts_dequant_b_pair consumes it accordingly):
+    //   * kBits <= 4 (uint2/4, fp4): 4-bit zp nibble folded into the bf16
+    //     subtrahend bf16(128 + zp) == 0x4300 | zp; no-zp uses the
+    //     symmetric midpoint 2^(kBits-1) (matches the reference's
+    //     quanted - 2^(bits-1), utils/test.generate_random_weight).
+    //   * kBits == 8 (uint8/fp8): the RAW integer zp byte (normalized_
+    //     uint_to_fp broadcasts it); fp8 has no zp.
+    constexpr uint32_t kBBits = Ctx::ElementB::kBits;
+    if constexpr (kBBits <= 4) {
+      uint32_t zp = 1u << (kBBits - 1u);
+      if constexpr (kHasZeroPoint) {
+        const uint8_t *bzp8 =
+            reinterpret_cast<const uint8_t *>(smem.stages[stage_id].bzp);
+        zp = (bzp8[n >> 1] >> ((n & 1u) * 4u)) & 0xFu;
+      }
+      mma.regs_bias2_ts[buffer_id] = 0x43004300u | (zp << 16) | zp;
+    } else {
+      uint32_t zp = 0u;
+      if constexpr (kHasZeroPoint) {
+        const uint8_t *bzp8 =
+            reinterpret_cast<const uint8_t *>(smem.stages[stage_id].bzp);
+        zp = bzp8[n];
+      }
+      mma.regs_bias2_ts[buffer_id] = zp;
     }
-    // bf16(128 + zp) == 0x4300 | zp exactly (mantissa low bits hold
-    // value - 128 for [128, 256)).
-    mma.regs_bias2_ts[buffer_id] = 0x43004300u | (zp << 16) | zp;
   }
 
   CUDA_INLINE void load_channel(uint32_t slice_id) {
