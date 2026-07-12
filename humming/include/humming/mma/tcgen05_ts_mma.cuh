@@ -35,6 +35,7 @@
 // consistent per-slot counters because they execute run()/transform_b()
 // in identical order.
 
+#include <humming/epilogue/tmem_ts_drain.cuh>
 #include <humming/utils/all.cuh>
 #include <humming/utils/ptx/barrier.cuh>
 #include <humming/utils/ptx/shared.cuh>
@@ -230,32 +231,14 @@ public:
       bias_val = __bfloat162float(smem_bias[n]);
     }
 
-    uint16_t *red16 = reinterpret_cast<uint16_t *>(smem.reduce);
     uint32_t smem_reduce_base = offsetof(SharedStorage, reduce) / 128u % 8u;
     uint32_t d_base = smem.tcgen05_tmem_col + kDColOffset;
-    uint32_t section_row_base = (n / 64u) * BlockShape::M;
-    uint32_t section_col = (n / 8u) % 8u;
-
-    PRAGMA_UNROLL
-    for (uint32_t chunk = 0; chunk < BlockShape::M / 32u; chunk++) {
-      uint32_t tmp[32];
-      tcgen05_ld_32x32b_x32(d_base + chunk * 32u, tmp);
-      tcgen05_wait_ld();
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < 32u; i++) {
-        uint32_t m = chunk * 32u + i;
-        float f = *reinterpret_cast<float *>(&tmp[i]) + bias_val;
-        // gmem_writer layout: smem_row = (n/64)*BlockM + m; the int4
-        // col (n/8)%8 is XOR-swizzled by the row phase; the bf16 sits
-        // at sub-index n%8 of that int4. Scalar 2-byte stores --
-        // correctness first, track e-epilogue-tmem owns the real one.
-        uint32_t smem_row = section_row_base + m;
-        uint32_t col = section_col ^ ((smem_row + smem_reduce_base) % 8u);
-        __nv_bfloat16 fb = __float2bfloat16(f);
-        red16[(smem_row * 8u + col) * 8u + (n % 8u)] =
-            *reinterpret_cast<uint16_t *>(&fb);
-      }
-    }
+    // Vectorized drain (tmem_ts_drain.cuh): 8x8 register transpose +
+    // four swizzled 128-bit stores per lane per 32-m chunk, replacing
+    // the scalar 2-byte scatter. Standalone-tested against a Python
+    // model of the gmem_writer layout in tests/test_tmem_ts_drain.py.
+    tmem_ts_drain_transposed<BlockShape::M>(
+        d_base, n, smem.reduce, smem_reduce_base, bias_val);
     ctx.sync_math_threads();
     return nullptr;
   }
