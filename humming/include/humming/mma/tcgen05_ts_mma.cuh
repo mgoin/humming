@@ -35,6 +35,7 @@
 // consistent per-slot counters because they execute run()/transform_b()
 // in identical order.
 
+#include <humming/arith/exp_offset.cuh>
 #include <humming/datatype/dequant_single.cuh>
 #include <humming/epilogue/tmem_ts_drain.cuh>
 #include <humming/utils/all.cuh>
@@ -61,6 +62,20 @@ CUDA_INLINE uint32_t ts_dequant_b_pair(uint32_t shifted, uint32_t bias2) {
   if constexpr (EB::kIsIntegerType && EB::kBits <= BFloat16::kMantissaBits) {
     return uint_to_f16<EB, BFloat16, /*kHasZeroPoint=*/true,
                        /*kIsFpZeroPoint=*/false>(shifted, bias2);
+  } else if constexpr (EB::kIsFloatingPointType && EB::kBits <= 8u) {
+    // Software fp -> bf16: relocate each code to the top of its 16-bit
+    // half, decode via fp_to_fp (exponent bits copied, NOT rebiased),
+    // then multiply by the constant 2^kOff to correct the bias. kOff is
+    // a pure power of two so this bf16 mul is exact; for bf16 A the whole
+    // fp4/fp8 offset lives in the mainloop weight
+    // (get_epilogue_exp_offset == 0), so the caller's per-lane group-scale
+    // hmul2 needs NO epilogue exp-offset plumbing (cf SS kEpilogueExpOffset).
+    constexpr uint32_t kOff = get_dtype_dequant_exp_offset<BFloat16, EB>();
+    uint32_t v = fp_to_fp<EB, BFloat16>(shifted << (BFloat16::kBits - EB::kBits));
+    __nv_bfloat162 t = *reinterpret_cast<__nv_bfloat162 *>(&v);
+    const nv_bfloat162 f = prepare_exp_scale_factor<nv_bfloat162, kOff>();
+    t = __hmul2(t, *reinterpret_cast<const __nv_bfloat162 *>(&f));
+    return *reinterpret_cast<uint32_t *>(&t);
   } else {
     static_assert(EB::kBits == 0,
                   "TCGEN05_TS transform_b: weight dtype not wired -- add a "
@@ -135,10 +150,11 @@ public:
   // supports_tcgen05_ts clause. Start: {uint4}.
   static constexpr bool kTsBDtypeSupported =
       std::is_same<ElementB, UInt4>::value ||
-      std::is_same<ElementB, UInt2>::value;
+      std::is_same<ElementB, UInt2>::value ||
+      std::is_same<ElementB, Float4E2M1>::value;
   static_assert(kTsBDtypeSupported,
                 "TCGEN05_TS: ElementB not in the TS weight-dtype allowlist "
-                "(currently {uint2, uint4})");
+                "(currently {uint2, uint4, float4e2m1})");
   static_assert(!kIsFpZeroPoint,
                 "TCGEN05_TS: fp zero-point not yet wired for TS mode");
   static_assert(Ctx::kIsGroupWeightScale,

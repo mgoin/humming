@@ -133,16 +133,16 @@ def _run_ts(
     return outputs, outputs_ref
 
 
-def _assert_close(outputs, outputs_ref):
+def _assert_close(outputs, outputs_ref, atol=0.5):
     abs_err = (outputs.float() - outputs_ref.float()).abs()
     ref_abs = outputs_ref.float().abs()
     print(
         f"\n  max|err|={abs_err.max().item():.3e} "
         f"mean|err|={abs_err.mean().item():.3e} "
         f"|ref|.mean={ref_abs.mean().item():.3e} "
-        f"|ref|.max={ref_abs.max().item():.3e}"
+        f"|ref|.max={ref_abs.max().item():.3e} atol={atol}"
     )
-    torch.testing.assert_close(outputs, outputs_ref, rtol=1e-2, atol=0.5)
+    torch.testing.assert_close(outputs, outputs_ref, rtol=1e-2, atol=atol)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +191,38 @@ def test_ts_uint2_minimal_tile():
         group_size=64, has_zero_point=False, b_dtype=dtypes.uint2,
     )
     _assert_close(outputs, outputs_ref)
+
+
+# ---------------------------------------------------------------------------
+# float4e2m1 weight dtype (milestone c, headline production dtype): fp_to_fp
+# decode + a constant 2^126 (get_dtype_dequant_exp_offset<bf16,fp4>) weight
+# mul; no zero point, no epilogue exp-offset. The group-scale hmul2 in
+# transform_b applies unchanged. Reference: same bf16-rounded dequant GEMM.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "shape_m,shape_n,shape_k",
+    [(512, 512, 512), (128, 1024, 1024), (128, 128, 64)],
+)
+def test_ts_fp4_shapes(shape_m, shape_n, shape_k):
+    gs = 64 if shape_k == 64 else 128
+    outputs, outputs_ref = _run_ts(
+        shape_m=shape_m, shape_n=shape_n, shape_k=shape_k,
+        group_size=gs, has_zero_point=False, b_dtype=dtypes.float4e2m1,
+        block_shape=(128, 128, 64) if shape_m >= 128 else (64, 128, 64),
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_fp4_prod_shape():
+    """Llama70B-gate slice, fat-N/K walk at large K (bf16-accum tail)."""
+    outputs, outputs_ref = _run_ts(
+        shape_m=128, shape_n=1024, shape_k=8192,
+        block_shape=(128, 128, 64), num_stages=4,
+        has_zero_point=False, b_dtype=dtypes.float4e2m1,
+    )
+    _assert_close(outputs, outputs_ref, atol=2.0)
 
 
 @pytest.mark.parametrize("num_stages", [2, 3, 4])
