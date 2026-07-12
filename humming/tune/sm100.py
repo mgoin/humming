@@ -103,7 +103,11 @@ def supports_tcgen05_ts(meta) -> bool:
         return False
     gs = meta.weight_scale_group_size
     if gs != 0 and gs < 64:
-        return False
+        # Sub-stage groups (gs < BlockK=64): each 16-K MMA iter must stay
+        # within a single group, so gs must be a multiple of 16 and divide
+        # BlockK. gs=32 (and gs=16) qualify; gs=48 does not.
+        if gs % 16 != 0 or 64 % gs != 0:
+            return False
     # BlockN == 128 (exactly one MMA-M tile), BlockK == 64.
     if meta.shape_n % 128 != 0 or meta.shape_k % 64 != 0:
         return False

@@ -217,6 +217,36 @@ def test_ts_fp16_uint4_prod_shape():
 
 
 # ---------------------------------------------------------------------------
+# gs=32 SUB-STAGE weight scale (milestone 3, scalar-formats): a BlockK=64
+# stage spans two 32-K groups. Each 16-K MMA iter stays within one group
+# (16 | 32), so the scale is still folded per-code in transform_b -- only
+# the per-iter group index changes (iter/2). Reference is the standard
+# per-element (code-zp)*scale bf16-rounded-weight GEMM (matches).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shape_m", [16, 128, 256], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("has_zero_point", [False, True])
+def test_ts_gs32_uint4(has_zero_point, shape_m):
+    block_m = 128 if shape_m >= 128 else 64
+    outputs, outputs_ref = _run_ts(
+        shape_m=shape_m, shape_n=512, shape_k=512,
+        block_shape=(block_m, 128, 64),
+        group_size=32, has_zero_point=has_zero_point,
+    )
+    _assert_close(outputs, outputs_ref)
+
+
+def test_ts_gs32_uint4_prod_shape():
+    outputs, outputs_ref = _run_ts(
+        shape_m=128, shape_n=1024, shape_k=8192,
+        block_shape=(128, 128, 64), num_stages=4,
+        group_size=32, has_zero_point=True,
+    )
+    _assert_close(outputs, outputs_ref, atol=2.0)
+
+
+# ---------------------------------------------------------------------------
 # CHANNELWISE weight scale (milestone 2, scalar-formats): group_size=0, one
 # bf16 scale per output row over all K. Applied via epilogue-fold in the TS
 # drain (commutes with the K-sum) rather than per-code in transform_b. zp is

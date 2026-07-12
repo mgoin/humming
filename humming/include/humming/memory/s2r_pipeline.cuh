@@ -112,10 +112,22 @@ public:
     loader_b.load(smem.stages[stage_id].b, mma.regs_qb_as_ptr(buffer_id),
                   iter_id);
 
+    // Sub-stage group index within the stage. gs >= BlockK: one group
+    // per stage (bs_group == 0). gs < BlockK (a multiple of the 16-K
+    // iter): this iter lies entirely in group (iter*kPartMmaShapeK)/gs.
+    // Scale AND zp share this granularity, so the same index drives both.
+    uint32_t bs_group = 0;
+    if constexpr (kIsGroupWeightScale &&
+                  Ctx::kWeightScaleGroupSize < BlockShape::K) {
+      bs_group = (iter_id * kPartMmaShapeK) / Ctx::kWeightScaleGroupSize;
+    }
+
     if constexpr (kIsGroupWeightScale) {
+      // g2s stages kNumGroups scale rows contiguously at bf16 stride
+      // BlockN, so row n of group g is bs16[g * BlockN + n].
       const uint16_t *bs16 =
           reinterpret_cast<const uint16_t *>(smem.stages[stage_id].bs);
-      uint32_t s = bs16[n];
+      uint32_t s = bs16[bs_group * BlockShape::N + n];
       mma.regs_bs2_ts[buffer_id] = (s << 16) | s;
     }
     // The zp operand format is per weight-dtype (transform_b's
@@ -140,20 +152,26 @@ public:
         // K-invariant, staged once in bzp_c by the channel g2s load.
         // Both use the identical nibble packing (row n -> byte n/2,
         // nibble n%2), so only the base pointer differs.
+        // Nibble zp group stride = BlockN * kNumZPBits(=4) / 8 = BlockN/2
+        // bytes. Sub-stage groups pick group bs_group, matching the scale.
         const uint8_t *bzp8;
+        uint32_t byte = n >> 1;
         if constexpr (kIsChannelWeightScale)
           bzp8 = reinterpret_cast<const uint8_t *>(smem.bzp_c);
-        else
+        else {
           bzp8 = reinterpret_cast<const uint8_t *>(smem.stages[stage_id].bzp);
-        zp = (bzp8[n >> 1] >> ((n & 1u) * 4u)) & 0xFu;
+          byte += bs_group * (BlockShape::N / 2u);
+        }
+        zp = (bzp8[byte] >> ((n & 1u) * 4u)) & 0xFu;
       }
       mma.regs_bias2_ts[buffer_id] = kBiasBase | (zp << 16) | zp;
     } else {
+      // uint8 byte zp: group stride = BlockN * kNumZPBits(=8) / 8 = BlockN.
       uint32_t zp = 0u;
       if constexpr (kHasZeroPoint) {
         const uint8_t *bzp8 =
             reinterpret_cast<const uint8_t *>(smem.stages[stage_id].bzp);
-        zp = bzp8[n];
+        zp = bzp8[bs_group * BlockShape::N + n];
       }
       mma.regs_bias2_ts[buffer_id] = zp;
     }

@@ -205,9 +205,12 @@ public:
                 "TCGEN05_TS: group or channelwise weight scale (block/mx "
                 "unsupported)");
   static_assert(!Ctx::kIsGroupWeightScale ||
-                    Ctx::kWeightScaleGroupSize >= BlockShape::K,
-                "TCGEN05_TS prototype: one group-scale group per stage "
-                "(group_size >= BlockK); gs < BlockK is a separate milestone");
+                    Ctx::kWeightScaleGroupSize >= BlockShape::K ||
+                    (BlockShape::K % Ctx::kWeightScaleGroupSize == 0 &&
+                     Ctx::kWeightScaleGroupSize % kPartMmaShapeK == 0),
+                "TCGEN05_TS group scale: gs >= BlockK (one group per stage), "
+                "OR gs divides BlockK and is a multiple of the 16-K iter so "
+                "each iter stays within a single group (no intra-iter split)");
   static_assert(!Ctx::kReduceOverlapLastStageOnly,
                 "TCGEN05_TS: reduce_overlap_last_stage_only unsupported");
 
