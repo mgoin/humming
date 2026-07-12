@@ -169,9 +169,11 @@ public:
   static_assert(BlockShape::K == 64,
                 "TCGEN05_TS prototype: BlockK must be 64 bf16 (single "
                 "64-K section; BlockK > 64 needs section-major staging)");
-  static_assert(BlockShape::M == 64 || BlockShape::M == 128,
-                "TCGEN05_TS: BlockM (= MMA-N) must be 64 or 128 "
-                "(M=128 atom requires N % 16 == 0, N <= 256)");
+  static_assert(BlockShape::M == 32 || BlockShape::M == 64 ||
+                    BlockShape::M == 128,
+                "TCGEN05_TS: BlockM (= MMA-N) must be 32, 64 or 128 "
+                "(M=128 atom requires N % 16 == 0, N <= 256; the drain "
+                "loops kBlockM/32 so BlockM must be a multiple of 32)");
   static_assert(std::is_same<ElementA, BFloat16>::value,
                 "TCGEN05_TS: ElementA must be BFloat16 (kind::f16 idesc "
                 "and the 0x4300 dequant trick are bf16-specific)");

@@ -181,7 +181,7 @@ def _assert_close(outputs, ref):
 
 @pytest.mark.parametrize("gemm_type", ["grouped_contiguous", "grouped_masked"])
 @pytest.mark.parametrize("has_zero_point", [False, True])
-@pytest.mark.parametrize("block_m", [64, 128])
+@pytest.mark.parametrize("block_m", [32, 64, 128])
 @pytest.mark.parametrize("use_tma", [True, False])
 def test_ts_moe_matrix(gemm_type, has_zero_point, block_m, use_tma):
     outputs, ref, _, _ = _run_ts_moe(
@@ -202,6 +202,23 @@ def test_ts_moe_matrix(gemm_type, has_zero_point, block_m, use_tma):
 def test_ts_moe_experts(gemm_type, num_experts):
     outputs, ref, _, _ = _run_ts_moe(
         gemm_type, num_experts=num_experts, block_m=64,
+        use_tma=True, has_zero_point=True,
+    )
+    _assert_close(outputs, ref)
+
+
+# --------------------------------------------------------------------------
+# Fine-grained MoE (E=128/256) is exactly where the heuristic now selects
+# BlockM=32 (few tokens/expert): guard the small-tile drain against the
+# per-expert dequant reference at those expert counts.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("gemm_type", ["grouped_contiguous", "grouped_masked"])
+@pytest.mark.parametrize("num_experts", [128, 256])
+def test_ts_moe_experts_blockm32(gemm_type, num_experts):
+    outputs, ref, _, _ = _run_ts_moe(
+        gemm_type, num_experts=num_experts, block_m=32,
         use_tma=True, has_zero_point=True,
     )
     _assert_close(outputs, ref)
@@ -238,7 +255,12 @@ def test_ts_moe_masked_zeroing(use_tma):
 @pytest.mark.parametrize("gemm_type", ["grouped_contiguous", "grouped_masked"])
 @pytest.mark.parametrize(
     "num_experts,shape_m,expected_block_m",
-    [(8, 2048, 128), (128, 2048, 64), (256, 512, 64)],
+    [
+        (8, 2048, 128),   # 256 tok/expert -> coarse
+        (8, 512, 64),     # 64 tok/expert  -> mid
+        (128, 2048, 32),  # 16 tok/expert  -> fine-grained (Qwen3-MoE-like)
+        (256, 512, 32),   # 2  tok/expert  -> fine-grained (DeepSeek-like)
+    ],
 )
 def test_ts_moe_dispatch(gemm_type, num_experts, shape_m, expected_block_m):
     meta = HummingLayerMeta(
