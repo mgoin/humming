@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from ts_contract_pack import (
     pack_ts_weight,
     pack_ts_weight_scale,

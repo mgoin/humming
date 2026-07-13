@@ -32,11 +32,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from humming import dtypes
-from humming.layer import HummingLayer
-from humming.schema.humming import HummingWeightSchema
-from humming.utils.test import generate_random_inputs, generate_random_weight
-
 # Reuse the shipped-path harness so this suite exercises the EXACT helpers the
 # green e2e suite does (tests/ is on sys.path under pytest prepend import mode;
 # no __init__.py, so a bare module import resolves to the sibling test file).
@@ -46,6 +41,11 @@ from test_tcgen05_ts_e2e import (
     _build_ts_layer,
     _is_blackwell,
 )
+
+from humming import dtypes
+from humming.layer import HummingLayer
+from humming.schema.humming import HummingWeightSchema
+from humming.utils.test import generate_random_inputs, generate_random_weight
 
 pytestmark = pytest.mark.skipif(
     not _is_blackwell(), reason="TS-mode tcgen05 needs sm_100+"

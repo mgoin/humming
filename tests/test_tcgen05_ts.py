@@ -10,7 +10,7 @@ humming.utils.ts_packing (bit-identical to the retired throwaway
 packer's streams -- pinned by tests/test_ts_packing_cross_track.py).
 
 Prototype config space (asserted in mma/tcgen05_ts_mma.cuh):
-  BlockN == 128, WarpN == 32, WarpM == BlockM in {64, 128},
+  BlockN == 128, WarpN == 32, WarpM == BlockM in {32, 64, 128},
   WarpK == BlockK == 64, bf16 x uint4, group scale (gs >= BlockK).
 """
 

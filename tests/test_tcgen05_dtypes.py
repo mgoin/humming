@@ -211,9 +211,9 @@ PROD_PROBE_SHAPE = (512, 512, 4096)
 #
 # Note: uint4 was originally demoted to BlockK=64 here by the
 # workbook-B.37 WS+TMA corruption at BlockK=128 s4. B.37 was
-# root-caused (track-e bc431ed + track-f round 3,
-# benchmarks/probe_b37_alias.py) to the un-fenced/un-awaited TMA-C
-# epilogue read of smem.reduce and fixed in gmem_writer.cuh + the
+# root-caused (track-e bc431ed + track-f round 3) to the
+# un-fenced/un-awaited TMA-C epilogue read of smem.reduce and
+# fixed in gmem_writer.cuh + the
 # kernels; uint4 is back on the tuned BlockK=128 s4 config the sm100
 # heuristic ships.
 SAFE_PROD_WS_CONFIG = {

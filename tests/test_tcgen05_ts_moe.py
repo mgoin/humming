@@ -29,8 +29,8 @@ import torch
 
 from humming import dtypes, ops
 from humming.kernel.humming import HummingKernel
-from humming.tune import get_heuristics_config
 from humming.layer import HummingLayerMeta
+from humming.tune import get_heuristics_config
 from humming.utils.test import (
     generate_random_inputs,
     generate_random_moe_tensors,
@@ -209,7 +209,7 @@ def test_ts_moe_experts(gemm_type, num_experts):
 
 # --------------------------------------------------------------------------
 # BlockM=32 is a validated-correct TS atom (M128N32K16) but perf-negative
-# for fine-grained MoE (see benchmarks/bench_ts_moe_blockm32.py), so the
+# for fine-grained MoE (perf-negative on a B300 BlockM=32 sweep), so the
 # heuristic keeps 64. These cells guard the small-tile drain's correctness
 # at fine-grained expert counts so the atom stays trustworthy if revisited.
 # --------------------------------------------------------------------------

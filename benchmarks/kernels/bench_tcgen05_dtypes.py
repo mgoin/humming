@@ -16,8 +16,6 @@ Run with:
     CUDA_VISIBLE_DEVICES=<idle GPU> \\
         ~/venvs/vllm-rel/bin/python benchmarks/bench_tcgen05_dtypes.py
 """
-import os
-import sys
 import time
 
 import torch
@@ -30,7 +28,6 @@ from humming.utils.weight import (
     prepare_humming_weight_scale,
     prepare_humming_zero_point,
 )
-
 
 A_DTYPE = dtypes.bfloat16
 C_DTYPE = dtypes.bfloat16

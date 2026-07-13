@@ -40,6 +40,11 @@ from __future__ import annotations
 
 import pytest
 import torch
+from test_tcgen05_ts_e2e import _assert_close, _is_blackwell
+
+# Reuse the shipped-path runner (builds + asserts-TS-dispatched + dequant-ref
+# compare) and the K-scaled tolerance from the Milestone-1 edge suite.
+from test_tcgen05_ts_edge import _atol_for_k, _run_e2e_case
 
 from humming import dtypes
 from humming.config import GemmType, MmaType
@@ -47,12 +52,6 @@ from humming.config.config import LayerConfig
 from humming.layer import HummingLayer
 from humming.schema.humming import HummingWeightSchema
 from humming.tune import get_heuristics_class
-from humming.utils.test import generate_random_inputs, generate_random_weight
-
-# Reuse the shipped-path runner (builds + asserts-TS-dispatched + dequant-ref
-# compare) and the K-scaled tolerance from the Milestone-1 edge suite.
-from test_tcgen05_ts_edge import _atol_for_k, _run_e2e_case
-from test_tcgen05_ts_e2e import _assert_close, _is_blackwell
 
 pytestmark = pytest.mark.skipif(
     not _is_blackwell(), reason="TS-mode tcgen05 needs sm_100+"

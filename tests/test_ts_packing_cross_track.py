@@ -19,8 +19,8 @@ in tests/test_ts_contract_pack.py as a cross-check.
 
 import pytest
 import torch
-
 import ts_contract_pack as b_pack_mod
+
 from humming.utils import ts_packing as d
 
 

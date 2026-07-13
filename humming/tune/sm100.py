@@ -242,7 +242,7 @@ class Sm100Heuristics(Sm89Heuristics):
                 #
                 # BlockM=32 is a valid TS atom (M128N32K16; verified
                 # bit-exact in test_tcgen05_ts_moe.py) but is NOT selected:
-                # benchmarks/bench_ts_moe_blockm32.py (B300) shows it does
+                # a B300 BlockM=32 sweep shows it does
                 # NOT recover the fine-grained TS loss. At <=16 tok/expert
                 # (DeepSeek E=256) both 32 and 64 already emit one tile per
                 # expert, so 32 removes no waste (0.99-1.00x vs BlockM=64,

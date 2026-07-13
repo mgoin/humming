@@ -128,13 +128,16 @@ def _run(gemm_type, N, K, num_experts, top_k, m, use_ts):
     wr = wref.to(torch.bfloat16).float()
     for e in range(num_experts):
         if gemm_type == "grouped_contiguous":
-            o1 = int(layout[e]); o2 = m_new if e == num_experts - 1 else int(layout[e + 1])
+            o1 = int(layout[e])
+            o2 = m_new if e == num_experts - 1 else int(layout[e + 1])
         else:
-            o1 = emt * e; o2 = o1 + int(layout[e])
+            o1 = emt * e
+            o2 = o1 + int(layout[e])
         if o2 > o1:
             ref[o1:o2] = iref[o1:o2].matmul(wr[e].T).to(TORCH_DTYPE)
     err = (res.float() - ref.float()).abs()
-    ok = torch.isfinite(res).all().item() and err.max().item() <= 0.5 + 1e-2 * ref.float().abs().max().item()
+    tol = 0.5 + 1e-2 * ref.float().abs().max().item()
+    ok = torch.isfinite(res).all().item() and err.max().item() <= tol
 
     us = time_kernel(launch)
     return us, block_m, ok, err.max().item()
@@ -158,7 +161,8 @@ def main():
                           f"{bm:>4}{ts_us:>10.1f}{mma_us:>10.1f}{ratio:>8.2f}"
                           f"{'Y' if ts_ok and mma_ok else 'N':>4}")
                 except Exception as e:
-                    print(f"{label:<26}{gemm_type.split('_')[1]:<12}{ne:>4}{tk:>3}{m:>6}  ERR {str(e)[:40]}")
+                    print(f"{label:<26}{gemm_type.split('_')[1]:<12}{ne:>4}"
+                          f"{tk:>3}{m:>6}  ERR {str(e)[:40]}")
         print()
 
 

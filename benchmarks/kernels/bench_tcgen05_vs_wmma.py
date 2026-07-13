@@ -12,7 +12,6 @@ and M=256 for fat-K layers.
 
 Run with: ~/venvs/vllm-rel/bin/python benchmarks/bench_tcgen05_vs_wmma.py
 """
-import sys
 import time
 
 import torch
@@ -25,7 +24,6 @@ from humming.utils.weight import (
     prepare_humming_weight_scale,
     prepare_humming_zero_point,
 )
-
 
 A_DTYPE = dtypes.bfloat16
 B_DTYPE = dtypes.uint4

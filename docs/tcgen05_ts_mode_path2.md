@@ -167,7 +167,7 @@ TS-mode A descriptor.
 
 ## Microbench evidence
 
-`benchmarks/bench_r2s_vs_r2t.cu` -- isolates the per-K-iter "move
+An r2s-vs-r2t microbench isolates the per-K-iter "move
 4 KiB of dequant'd B from RMEM to staging area" primitive. B300
 sm_103a, 10000 iters:
 

@@ -14,7 +14,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from humming import dtypes
 from humming.layer import HummingLayer
 from humming.tune import get_heuristics_class
 
