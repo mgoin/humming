@@ -18,9 +18,7 @@ import humming.utils.jit as jit_utils
 
 def popen_and_reap(cmd, **kwargs):
     proc = subprocess.Popen(cmd, **kwargs)
-    threading.Thread(
-        target=proc.wait, name="humming-bg-build-reaper", daemon=True
-    ).start()
+    threading.Thread(target=proc.wait, name="humming-bg-build-reaper", daemon=True).start()
     return proc
 
 
@@ -43,6 +41,34 @@ def read_symbol_value(filename, symbol_name, default_value=None):
         symbol_value = struct.unpack("<i", raw_data)[0]
 
     return symbol_value
+
+
+def find_kernel_name_in_cubin_cached(filename, func_keyword):
+    # Pure-python ELF symbol iteration takes seconds per cubin and holds the
+    # GIL, so warm-cache kernel loading is slower than cold compilation when
+    # many kernels load concurrently. Persist the resolved name next to the
+    # cubin and reuse it on later runs.
+    cache_filename = filename + ".name"
+    try:
+        with open(cache_filename) as f:
+            cached = f.read().strip()
+    except OSError:
+        cached = ""
+    if cached and re.match(f"^_Z\\d+{func_keyword}", cached):
+        return cached
+
+    kernel_name = find_kernel_name_in_cubin(filename, func_keyword)
+    tmp_filename = f"{cache_filename}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp_filename, "w") as f:
+            f.write(kernel_name)
+        os.replace(tmp_filename, cache_filename)
+    except OSError:
+        try:
+            os.remove(tmp_filename)
+        except OSError:
+            pass
+    return kernel_name
 
 
 def find_kernel_name_in_cubin(filename, func_keyword):

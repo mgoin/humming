@@ -7,6 +7,7 @@ class MmaType(enum.Enum):
     # Blackwell tcgen05.mma -- accumulator in TMEM, both operands in SMEM.
     # Wired up for sm_100+; see kernel/tcgen05_mma.cuh.
     TCGEN05 = "tcgen05"
+    MXMMA = "mxmma"
 
 
 class WeightScaleType(enum.Enum):

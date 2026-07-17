@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from humming import ops
 from humming.ops import quant_input
 from humming.ops.hadamard import hadamard_quant_input, hadamard_transform
 
@@ -20,10 +21,20 @@ def _unpack_int4(q: torch.Tensor) -> torch.Tensor:
 def _to_float(q: torch.Tensor, quant_dtype: str) -> torch.Tensor:
     if quant_dtype == "int4":
         return _unpack_int4(q).to(torch.float32)
+    if quant_dtype == "float8e3m4":
+        codes = q.view(torch.uint8).to(torch.int32).contiguous()
+        return ops.dequant_weight(codes, 3, 4, True)
+    if quant_dtype == "float4e0m3":
+        codes = ops.unpack_weight(q.view(torch.int32), 4)
+        mag = (codes & 0x7).float()
+        return torch.where((codes & 0x8) != 0, -mag, mag)
     return q.to(torch.float32)
 
 
-@pytest.mark.parametrize("quant_dtype", ["int8", "int4", "float8e4m3", "float8e5m2"])
+@pytest.mark.parametrize(
+    "quant_dtype",
+    ["int8", "int4", "float8e4m3", "float8e3m4", "float8e5m2", "float4e0m3"],
+)
 @pytest.mark.parametrize("block_size", [64, 128, 256, 512, 1024])
 @pytest.mark.parametrize("group_size_ratio", [1, 2])
 def test_fused_matches_unfused_fp32(quant_dtype, block_size, group_size_ratio):
@@ -86,7 +97,9 @@ def test_fused_lower_dtype_shape_and_scale(quant_dtype, dtype):
     block_size = 128
     x = torch.randn((4, block_size * 4), device=("cuda"), dtype=dtype) * 0.4
 
-    q_fused, s_fused = hadamard_quant_input(x, block_size=block_size, quant_dtype=quant_dtype)
+    q_fused, s_fused = hadamard_quant_input(
+        x, block_size=block_size, quant_dtype=quant_dtype, group_size=block_size
+    )
     y_ref = hadamard_transform(x, block_size=block_size)
     q_ref, s_ref = quant_input(y_ref, quant_dtype, group_size=block_size)
 
@@ -103,7 +116,7 @@ def test_fused_extra_scale(quant_dtype):
     x = torch.randn((4, block_size * 3), device="cuda", dtype=torch.float32) * 0.3
     scale = 2.0
     q_fused, s_fused = hadamard_quant_input(
-        x, block_size=block_size, quant_dtype=quant_dtype, scale=scale
+        x, block_size=block_size, quant_dtype=quant_dtype, scale=scale, group_size=block_size
     )
     y_ref = hadamard_transform(x, block_size=block_size, scale=scale)
     q_ref, s_ref = quant_input(y_ref, quant_dtype, group_size=block_size)

@@ -8,11 +8,28 @@ import torch
 
 from humming import dtypes
 from humming.jit.runtime import KernelRuntime
-from humming.kernel.hadamard import _pick_launch_params, _TORCH_TO_CPP_TYPE
+from humming.kernel.hadamard import _TORCH_TO_CPP_TYPE, _pick_launch_params
 
 CODE_TEMPLATE = jinja2.Template("""
 #include <humming/kernel/hadamard_quant.cuh>
 """)
+
+_SCALE_DTYPE_CODE = {"float32": 0, "float8e4m3": 1, "float8e8m0": 2}
+_SCALE_DTYPE_TORCH = {
+    "float32": torch.float32,
+    "float8e4m3": torch.float8_e4m3fn,
+    "float8e8m0": torch.uint8,
+}
+
+
+def _cvt_patch_mode(target_dtype):
+    # Hidden formats are emitted as their base PTX cvt, then the cubin's SASS is
+    # patched to the real format (see humming/utils/cubin.py).
+    if target_dtype == dtypes.float8e3m4:
+        return "cvt_e3m4"
+    if target_dtype == dtypes.float4e0m3:
+        return "cvt_e0m3"
+    return None
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -24,11 +41,11 @@ class HadamardQuantInputKernel(KernelRuntime):
     group_size: int
     has_extra_scale: bool = False
     m_major: bool = False
+    scale_dtype: str = "float32"
+    has_global_scale: bool = False
 
     def init_kernel(self):
-        assert self.block_size % self.group_size == 0, (
-            "group_size must divide block_size"
-        )
+        assert self.block_size % self.group_size == 0, "group_size must divide block_size"
         cpp_source = _TORCH_TO_CPP_TYPE[self.source_torch_dtype]
         cpp_target = self.target_dtype.to_cpp_str()
         threads_per_tile, tiles_per_block = _pick_launch_params(self.block_size)
@@ -59,7 +76,9 @@ class HadamardQuantInputKernel(KernelRuntime):
             f"    {threads_per_tile},\n"
             f"    {tiles_per_block},\n"
             f"    {int(self.has_extra_scale)},\n"
-            f"    {int(self.m_major)}>"
+            f"    {int(self.m_major)},\n"
+            f"    {_SCALE_DTYPE_CODE[self.scale_dtype]},\n"
+            f"    {int(self.has_global_scale)}>"
         )
         self.arg_types = (
             ctypes.c_void_p,
@@ -69,8 +88,16 @@ class HadamardQuantInputKernel(KernelRuntime):
             ctypes.c_uint32,
             ctypes.c_uint32,
             ctypes.c_uint32,
+            ctypes.c_void_p,
         )
         self.prepare()
+
+    def postprocess_cubin(self, cubin_path: str):
+        mode = _cvt_patch_mode(self.target_dtype)
+        if mode:
+            from humming.utils.cubin import patch_cubin
+
+            patch_cubin(cubin_path=cubin_path, mode=mode)
 
     def __call__(
         self,
@@ -78,12 +105,14 @@ class HadamardQuantInputKernel(KernelRuntime):
         outputs: torch.Tensor,
         scales: torch.Tensor,
         extra_scale: float = 1.0,
+        global_scale: torch.Tensor | None = None,
     ):
         self.check_context()
         assert inputs.is_contiguous() and outputs.is_contiguous() and scales.is_contiguous()
         assert inputs.size(-1) % self.block_size == 0
         assert inputs.dtype == self.source_torch_dtype
-        assert scales.dtype == torch.float32
+        assert scales.dtype == _SCALE_DTYPE_TORCH[self.scale_dtype]
+        assert (global_scale is not None) == self.has_global_scale
 
         num_tiles = inputs.numel() // self.block_size
         shape_m = inputs.numel() // inputs.size(-1)
@@ -109,6 +138,7 @@ class HadamardQuantInputKernel(KernelRuntime):
             num_tiles,
             shape_m,
             groups_per_row,
+            global_scale.data_ptr() if global_scale is not None else 0,
         )
 
         cbd.cuLaunchKernelEx(config, self.kernel, (arg_values, self.arg_types), 0)

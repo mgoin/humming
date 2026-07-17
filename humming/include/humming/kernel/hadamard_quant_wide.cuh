@@ -31,15 +31,18 @@ template <
     uint32_t kThreadsPerTile,
     uint32_t kTilesPerThread,
     bool kHasExtraScale,
-    bool kMMajor = false>
+    bool kMMajor = false,
+    uint32_t kScaleStore = kScaleStoreF32,
+    bool kHasGlobalScale = false>
 __global__ void hadamard_quant_input_wide(
     const SourceType *__restrict__ in_ptr,
     void *__restrict__ out_ptr,
-    float *__restrict__ scales_ptr,
+    void *__restrict__ scales_ptr,
     float extra_scale,
     uint32_t num_groups,
     uint32_t shape_m = 0,
-    uint32_t groups_per_row = 0) {
+    uint32_t groups_per_row = 0,
+    const float *__restrict__ global_scale_ptr = nullptr) {
 
   static_assert((kBlockSize & (kBlockSize - 1)) == 0);
   static_assert(kGroupSize > kBlockSize);
@@ -221,19 +224,36 @@ __global__ void hadamard_quant_input_wide(
     float dtype_max = fp_target_max_value<TargetType>();
     scale = fmaxf(local_absmax / dtype_max, 1e-30f);
   }
-  float inv_scale = 1.f / scale;
 
-  if (tid == 0) {
-    uint32_t scale_idx;
-    if constexpr (kMMajor) {
-      // M-major scale [num_groups_total, M]: scale_idx = group_in_row * M + row.
-      uint32_t row = group_idx / groups_per_row;
-      uint32_t group_in_row = group_idx - row * groups_per_row;
-      scale_idx = group_in_row * shape_m + row;
+  uint32_t scale_idx;
+  if constexpr (kMMajor) {
+    uint32_t row = group_idx / groups_per_row;
+    uint32_t group_in_row = group_idx - row * groups_per_row;
+    if constexpr (kScaleStore == kScaleStoreE8M0) {
+      scale_idx = (group_in_row / 4) * (shape_m * 4) + row * 4 + (group_in_row % 4);
     } else {
-      scale_idx = group_idx;
+      scale_idx = group_in_row * shape_m + row;
     }
-    scales_ptr[scale_idx] = scale;
+  } else {
+    scale_idx = group_idx;
+  }
+
+  float inv_scale;
+  if constexpr (kScaleStore == kScaleStoreF32 && !kHasGlobalScale) {
+    // Default path: bit-identical to the original f32-scale kernel.
+    inv_scale = 1.f / scale;
+    if (tid == 0) reinterpret_cast<float *>(scales_ptr)[scale_idx] = scale;
+  } else {
+    float gs = 1.f, inv_gs = 1.f;
+    if constexpr (kHasGlobalScale) {
+      gs = __ldg(global_scale_ptr);
+      inv_gs = 1.f / gs;
+    }
+    // Reg is already normalized in this kernel, so the effective stored scale
+    // is the full quantization divisor.
+    float eff_scale = finalize_scale<kScaleStore>(
+        scale, gs, inv_gs, scales_ptr, scale_idx, tid == 0);
+    inv_scale = 1.f / eff_scale;
   }
 
   // ---- Quantize + store ----
@@ -247,6 +267,7 @@ __global__ void hadamard_quant_input_wide(
     uint8_t bytes[kElemsPerThread];
     constexpr bool kIsFp8 =
         std::is_same<TargetType, Float8E4M3>::value ||
+        std::is_same<TargetType, Float8E3M4>::value ||
         std::is_same<TargetType, Float8E5M2>::value;
     if constexpr (kIsFp8) {
       static_assert(kElemsPerThread % 2 == 0,
@@ -338,7 +359,8 @@ __global__ void hadamard_quant_input_wide(
   } else if constexpr (kBits == 4) {
     // Pair adjacent elements within each tile, then write per-tile.
     static_assert(E_lane >= 2 && E_lane % 2 == 0);
-    constexpr bool kIsFp4 = std::is_same<TargetType, Float4E2M1>::value;
+    constexpr bool kIsFp4 = std::is_same<TargetType, Float4E2M1>::value ||
+                            std::is_same<TargetType, Float4E0M3>::value;
     uint8_t bytes[kElemsPerThread / 2];
     PRAGMA_UNROLL
     for (uint32_t m = 0; m < kTilesPerThread; m++) {

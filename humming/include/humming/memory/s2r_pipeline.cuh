@@ -25,6 +25,7 @@ private:
   // gathers and loader_bs/bzp's fragment ownership entirely.
   static constexpr bool kUseTcgen05Ts =
       kUseTcgen05 && Ctx::TuningConfig::kUseTcgen05Ts;
+  static constexpr bool kUseMxmma = Ctx::kUseMxmma;
   static constexpr uint32_t kPartMmaShapeK = Ctx::kPartMmaShapeK;
   static constexpr uint32_t kNumStages = Ctx::TuningConfig::kNumStages;
 
@@ -80,10 +81,17 @@ public:
     loader_b.load(smem.stages[stage_id].b, mma.regs_qb_as_ptr(buffer_id), iter_id);
     if constexpr (!kUseWgmma && !kUseTcgen05)
       loader_a.load(smem.stages[stage_id].a, mma.regs_a_as_ptr(buffer_id), iter_id, stage_id);
-    if constexpr (kIsGroupInputScale)
-      loader_as.load(smem.stages[stage_id].as, mma.arith.regs_as_as_ptr(buffer_id), iter_id);
-    if constexpr (kIsGroupOrBlockWeightScale)
-      loader_bs.load(smem.stages[stage_id].bs, mma.arith.regs_bs_as_ptr(buffer_id), iter_id);
+    if constexpr (kUseMxmma) {
+      if constexpr (kIsGroupInputScale)
+        loader_as.load_sf(smem.stages[stage_id].as, mma.regs_sfa_as_ptr(buffer_id), iter_id);
+      if constexpr (kIsGroupOrBlockWeightScale)
+        loader_bs.load_sf(smem.stages[stage_id].bs, mma.regs_sfb_as_ptr(buffer_id), iter_id);
+    } else {
+      if constexpr (kIsGroupInputScale)
+        loader_as.load(smem.stages[stage_id].as, mma.arith.regs_as_as_ptr(buffer_id), iter_id);
+      if constexpr (kIsGroupOrBlockWeightScale)
+        loader_bs.load(smem.stages[stage_id].bs, mma.arith.regs_bs_as_ptr(buffer_id), iter_id);
+    }
     if constexpr (kHasZeroPoint && (kIsGroupOrBlockWeightScale || kIsFirst)) {
       if constexpr (kIsChannelWeightScale)
         loader_bzp.load(smem.bzp_c, mma.arith.regs_zp_as_ptr(buffer_id), iter_id);

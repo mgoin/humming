@@ -6,7 +6,7 @@ import triton
 from tqdm import tqdm
 
 from humming import dtypes, ops
-from humming.config import GemmType
+from humming.config import GemmType, MmaType
 from humming.layer import HummingLayer
 from humming.tune import get_heuristics_config
 from humming.utils.test import (
@@ -30,6 +30,7 @@ def bench_humming(
     has_zero_point: bool = False,
     is_fp_zero_point: bool = False,
     use_f16_accum: bool = False,
+    use_m_major_input_scale: bool = False,
     is_moe_down: bool = False,
     balanced: bool = False,
     expert_max_tokens: int | None = None,
@@ -73,15 +74,23 @@ def bench_humming(
         inputs = torch.randn((actual_shape_m, shape_k), dtype=torch_dtype, device="cuda:0")
         input_scale: torch.Tensor | None = None
         if a_dtype not in ["float16", "bfloat16"]:
+            is_mxmma = meta.mma_type == MmaType.MXMMA
+            m_major = use_m_major_input_scale and not meta.use_fused_e8m0_scale
+            scale_dtype = bs_dtype if is_mxmma else "float32"
             inputs, input_scale = ops.quant_input(
                 inputs,
                 a_dtype,
                 group_size=input_scale_group_size,
+                scale_dtype=scale_dtype,
+                m_major_scale=m_major,
             )
+            if is_mxmma and not m_major:
+                input_scale = input_scale.view(torch.int32).contiguous()
 
         tuning_config = get_heuristics_config(
             meta=meta,
             use_f16_accum=use_f16_accum,
+            use_m_major_input_scale=use_m_major_input_scale,
             gemm_type=gemm_type,
         )
 
@@ -115,7 +124,8 @@ def bench_humming(
         def run():
             valid_shape_m = 0
             if gemm_type == GemmType.GROUPED_MASKED:
-                valid_shape_m = shape_m * top_k
+                valid_shape_m = shape_m * top_k  # noqa
+
             return layer(
                 inputs=inputs,  # noqa
                 input_scale=input_scale,  # noqa
@@ -127,6 +137,7 @@ def bench_humming(
                 compute_config=json.dumps(
                     {
                         "use_f16_accum": use_f16_accum,
+                        "use_m_major_input_scale": use_m_major_input_scale,
                         "gemm_type": gemm_type.value,
                     }
                 ),
@@ -180,6 +191,8 @@ def main():
         "float8e4m3",
         "float8e5m2",
         "float4e2m1",
+        "float8e3m4",
+        "float4e0m3",
         "int8",
         "int4",
     ]
@@ -194,6 +207,7 @@ def main():
     parser.add_argument("--zero_point", default=False, action="store_true")
     parser.add_argument("--use_fp_zero_point", default=False, action="store_true")
     parser.add_argument("--use_f16_accum", default=False, action="store_true")
+    parser.add_argument("--use_m_major_input_scale", default=False, action="store_true")
     parser.add_argument("--num_experts", type=int, default=0)
     parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--is_moe_down", default=False, action="store_true")
@@ -223,6 +237,7 @@ def main():
         has_zero_point=args.zero_point or args.use_fp_zero_point,
         is_fp_zero_point=args.use_fp_zero_point,
         use_f16_accum=args.use_f16_accum,
+        use_m_major_input_scale=args.use_m_major_input_scale,
         shape_m_list=args.shape_m_list,
         is_moe_down=args.is_moe_down,
         balanced=args.balanced,

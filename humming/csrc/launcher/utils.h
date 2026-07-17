@@ -82,6 +82,7 @@ struct KernelData {
   uint32_t multi_cast_size_a;
   uint32_t multi_cast_size_b;
   uint32_t gemm_type_id;
+  uint32_t mma_type_id;
 
   bool use_stream_k;
   bool is_fp_zero_point;
@@ -99,6 +100,7 @@ struct KernelData {
   bool use_tma_bs;
   bool use_tma_bzp;
   bool use_tma_bias;
+  bool use_packed_k_layout;
 };
 
 struct KernelLaunchData {

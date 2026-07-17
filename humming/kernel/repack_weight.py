@@ -26,6 +26,7 @@ class RepackWeightKernel(KernelRuntime):
     use_wgmma: bool = False
     use_fused_e8m0_scale: bool = False
     group_size_zp: int = 0
+    use_packed_k_layout: bool = False
     use_tcgen05_ts: bool = False
 
     def init_kernel(self):
@@ -55,6 +56,7 @@ class RepackWeightKernel(KernelRuntime):
             f"    {int(self.should_preprocess_with_zp)},\n"
             f"    {int(should_transpose_mini_block)},\n"
             f"    {self.group_size_zp},\n"
+            f"    {int(self.use_packed_k_layout)},\n"
             f"    {int(self.use_tcgen05_ts)}>"
         )
         self.arg_types = (

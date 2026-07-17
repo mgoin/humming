@@ -110,31 +110,6 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         LayerConfig.__post_init__(self)
         ComputeConfig.__post_init__(self)
         TuningConfig.__post_init__(self)
-
-        # NOTE: these flag overrides must run BEFORE KernelRuntime.__post_init__,
-        # which generates the kernel code / cubin (USE_TMA_AS etc.). Overriding
-        # afterwards would leave the cubin metadata out of sync with the launcher.
-
-        # Channel-wise input scale is a [M] vector (inherently M-contiguous), so it
-        # is always M-major; this lets use_tma_as be enabled for it as well.
-        if self.has_input_scale and self.input_scale_group_size == 0:
-            self.use_m_major_input_scale = True
-
-        # AS TMA needs the M-innermost start coord (the expert token offset) to be
-        # 16B-aligned. dense/grouped satisfy this (grouped pads every expert's token
-        # count to a multiple of 4); indexed gemm gathers rows and cannot, so it
-        # falls back to the cp.async M-major path.
-        if self.use_tma_as and self.is_indexed_gemm:
-            self.use_tma_as = False
-            self.use_m_major_input_scale = True
-
-        # TMA loads of the input scale require it to be M-major ([num_groups, M]).
-        if self.use_tma_as:
-            assert self.use_m_major_input_scale, (
-                "use_tma_as requires use_m_major_input_scale=True "
-                "(input scale must be stored M-major [num_groups, M])"
-            )
-
         KernelRuntime.__post_init__(self)
 
     def init_kernel(self) -> None:
@@ -200,7 +175,54 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         module = jit_utils.make_humming_module("get_kernel_id", self.kernel_id)
         self.get_kernel_id = module.get_kernel_id
 
+    def postprocess_cubin(self, cubin_path: str):
+        mode = ""
+        if dtypes.float8e3m4 in (self.mma_a_dtype, self.mma_b_dtype):
+            if self.mma_a_dtype != dtypes.float8e3m4:
+                mode = "mma_e3m4_b"
+            elif self.mma_b_dtype != dtypes.float8e3m4:
+                mode = "mma_e3m4_a"
+            else:
+                mode = "mma_e3m4_ab"
+        elif dtypes.float4e0m3 in (self.mma_a_dtype, self.mma_b_dtype):
+            if self.mma_a_dtype != dtypes.float4e0m3:
+                mode = "mma_e0m3_b"
+            elif self.mma_b_dtype != dtypes.float4e0m3:
+                mode = "mma_e0m3_a"
+            else:
+                mode = "mma_e0m3_ab"
+
+        if mode:
+            from humming.utils.cubin import patch_cubin
+
+            patch_cubin(cubin_path=cubin_path, mode=mode)
+
     def select_mma_op_class(self):
+        self.mma_a_dtype = self.a_dtype
+        self.mma_b_dtype = self.a_dtype
+        if self.mma_type == MmaType.MXMMA:
+            mma_shape_m, mma_shape_n = 16, 8
+            mma_shape_k = 256 // self.a_dtype.num_bits
+            assert self.warp_shape[0] % mma_shape_m == 0
+            assert self.warp_shape[1] % mma_shape_n == 0
+            assert self.warp_shape[2] % mma_shape_k == 0
+            group = self.weight_scale_group_size or mma_shape_k
+            assert mma_shape_k % group == 0
+            scale_vec = mma_shape_k // group
+
+            self.mma_b_dtype = self.b_dtype if self.mxmma_native_mixed else self.a_dtype
+            return MmaOpClass.from_config(
+                self.mma_type,
+                mma_shape_m,
+                mma_shape_n,
+                mma_shape_k,
+                self.mma_a_dtype,
+                self.mma_b_dtype,
+                dtypes.float32,
+                sf_dtype=self.bs_dtype,
+                scale_vec=scale_vec,
+            )
+
         if self.a_dtype in [dtypes.int4, dtypes.int8]:
             mma_cd_dtype = dtypes.int32
         elif self.use_f16_accum:
@@ -241,13 +263,22 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert self.warp_shape[1] % mma_shape_n == 0
         assert self.warp_shape[2] % mma_shape_k == 0
 
+        mma_native_mixed = (
+            self.mma_type == MmaType.MMA
+            and self.sm_version // 10 == 12
+            and mma_shape_m == 16
+            and self.a_dtype in (dtypes.float8e4m3, dtypes.float8e5m2, dtypes.float8e3m4)
+            and self.b_dtype in (dtypes.float4e2m1, dtypes.float6e3m2, dtypes.float6e2m3)
+        )
+        self.mma_b_dtype = self.b_dtype if mma_native_mixed else self.a_dtype
+
         return MmaOpClass.from_config(
             self.mma_type,
             mma_shape_m,
             mma_shape_n,
             mma_shape_k,
-            self.a_dtype,
-            self.a_dtype,
+            self.mma_a_dtype,
+            self.mma_b_dtype,
             mma_cd_dtype,
             warp_shape=self.warp_shape,
         )
@@ -284,6 +315,16 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert self.warp_shape[2] >= 128
 
     def check_scale(self):
+        if self.mma_type == MmaType.MXMMA:
+            mma_k = 256 // self.a_dtype.num_bits
+            for gs in (self.input_scale_group_size, self.weight_scale_group_size):
+                if gs > 0:
+                    assert mma_k % gs == 0
+                    assert mma_k // gs in (1, 2, 4)
+            if self.input_scale_group_size > 0 and self.weight_scale_group_size > 0:
+                assert self.input_scale_group_size == self.weight_scale_group_size
+            return
+
         if self.input_scale_group_size > 0:
             assert self.input_scale_group_size >= 256 // self.a_dtype.num_bits
         if self.weight_scale_group_size > 0:
@@ -303,7 +344,9 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         dtype_map = {
             dtypes.int4: 80,
             dtypes.int8: 75,
+            dtypes.float4e0m3: 120,
             dtypes.float4e2m1: 120,
+            dtypes.float8e3m4: 120,
             dtypes.float8e4m3: 89,
             dtypes.float8e5m2: 89,
             dtypes.bfloat16: 80,
@@ -328,7 +371,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert self.b_dtype.is_signed
             assert self.b_dtype.exponent_bits <= self.a_dtype.exponent_bits
             assert self.b_dtype.mantissa_bits <= self.a_dtype.mantissa_bits
-            assert self.b_dtype.exponent_bits >= 1
+            assert self.a_dtype.exponent_bits == 0 or self.b_dtype.exponent_bits >= 1
         elif self.b_dtype.is_floating_point_type and self.a_dtype.is_integer_type:
             assert self.use_fused_e8m0_scale
             raise NotImplementedError
@@ -353,6 +396,21 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.gemm_type is None and self.num_experts == 0:
             self.gemm_type = GemmType.DENSE
         assert self.gemm_type is not None, "gemm_type must be specify for MoE GEMM"
+
+        if self.has_input_scale and self.input_scale_group_size == 0:
+            self.use_m_major_input_scale = True
+
+        if self.use_tma_as and self.is_indexed_gemm:
+            self.use_tma_as = False
+            self.use_m_major_input_scale = True
+
+        if self.use_tma_as:
+            assert self.use_m_major_input_scale, "use_tma_as requires use_m_major_input_scale=True"
+
+        if self.use_packed_k_layout:
+            warp_k = self.warp_shape[2]
+            for gs in (self.input_scale_group_size, self.weight_scale_group_size):
+                assert gs == 0 or gs >= warp_k
 
     def __call__(self):
         msg = (
@@ -423,11 +481,6 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
 
         res = []
         if os.environ.get("HUMMING_DISABLE_PARALLEL_BUILD", "0") != "1":
-            # Parallelize kernel compilation using multiple threads,
-            # but ensure kernel loading occurs in the main thread to prevent CUDA context issues.
-            # (KernelRuntime would skip loading when running in child thread).
-            # Capture the current CUDA device so worker threads use the correct GPU;
-            # CUDA device is thread-local and new threads default to GPU 0.
             _current_device = torch.cuda.current_device()
             with ThreadPoolExecutor(
                 max_workers=16,

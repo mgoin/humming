@@ -13,6 +13,7 @@ def quantize_weight(
     has_global_scale: bool = False,
     is_fp_zero_point: bool = False,
     pack: bool = False,
+    allow_negative_scale: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert weight.dtype in [torch.float16, torch.bfloat16, torch.float32]
     assert weight.ndim in [2, 3]
@@ -49,6 +50,7 @@ def quantize_weight(
         has_scale=scale_dtype is not None or has_global_scale,
         has_zero_point=has_zero_point,
         is_fp_zero_point=is_fp_zero_point,
+        allow_negative_scale=allow_negative_scale,
     )
 
     if zero_point.dtype == torch.float32:
@@ -182,6 +184,7 @@ def prepare_humming_weight(
     padded_shape_n: int | None = None,
     padded_shape_k: int | None = None,
     interleave_mode: int = 3,
+    use_packed_k_layout: bool = False,
     use_tcgen05_ts: bool = False,
 ) -> torch.Tensor:
     is_moe = weight.ndim == 3
@@ -236,6 +239,11 @@ def prepare_humming_weight(
         assert zero_point is not None
         group_size_zp = shape_k // zero_point.size(-1)
 
+    if use_packed_k_layout:
+        assert use_wgmma, "use_packed_k_layout requires wgmma"
+        assert a_dtype.num_bits == 8, "use_packed_k_layout requires 8-bit (fp8/int8) activation"
+        assert not use_fused_e8m0_scale, "use_packed_k_layout is incompatible with fused-e8m0 scale"
+
     repacked_weight = ops.repack_weight(
         inputs=weight,
         zero_point=zero_point,
@@ -248,6 +256,7 @@ def prepare_humming_weight(
         interleave_mode=interleave_mode,
         use_fused_e8m0_scale=use_fused_e8m0_scale,
         group_size_zp=group_size_zp,
+        use_packed_k_layout=use_packed_k_layout,
         use_tcgen05_ts=use_tcgen05_ts,
     )
 
@@ -259,6 +268,8 @@ def prepare_humming_weight_scale(
     to_apply_on_c: bool = False,
     is_blockwise: bool = False,
     use_tcgen05_ts: bool = False,
+    is_mxmma: bool = False,
+    mxmma_scale_vec: int = 4,
 ) -> torch.Tensor:
     if use_tcgen05_ts:
         # TS-mode lane = row ownership: natural [K/gs, N] order, no
@@ -269,6 +280,20 @@ def prepare_humming_weight_scale(
 
     if is_blockwise:
         return weight_scale.transpose(-1, -2).contiguous()
+
+    if is_mxmma:
+        if mxmma_scale_vec == 1:
+            ws = weight_scale.view(torch.uint8)
+            lead = ws.shape[:-2]
+            n, g = ws.shape[-2:]
+            ws = ws.reshape(*lead, n // 16, 2, 8, g // 2, 2)
+            ndim = len(lead)
+            perm = (*range(ndim), ndim + 3, ndim + 0, ndim + 2, ndim + 1, ndim + 4)
+            ws = ws.permute(*perm).contiguous()
+            ws = ws.reshape(*lead, g // 2, n // 2, 4)
+            return ws.view(torch.int32).squeeze(-1).contiguous()
+
+        return weight_scale.view(torch.int32).transpose(-1, -2).contiguous()
 
     if to_apply_on_c:
         perm = [0, 1, 8, 9, 16, 17, 24, 25]

@@ -62,6 +62,7 @@ def quant_weight(
     use_e8m0_scale: bool,
     has_zero_point: bool,
     is_fp_zero_point: bool,
+    allow_negative_scale: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     group_size = inputs.size(-1) if group_size <= 0 else group_size
     source_dtype = dtypes.DataType.from_str(source_dtype_str)
@@ -94,6 +95,7 @@ def quant_weight(
             has_zero_point=has_zero_point,
             use_e8m0_scale=use_e8m0_scale,
             is_fp_zero_point=is_fp_zero_point,
+            allow_negative_scale=allow_negative_scale,
         )
         kernel(inputs=inputs, outputs=outputs, scales=scales, zero_point=zero_point)
 
@@ -114,6 +116,7 @@ def repack_weight(
     padded_shape_n: int | None = None,
     padded_shape_k: int | None = None,
     zero_point: torch.Tensor | None = None,
+    use_packed_k_layout: bool = False,
     use_tcgen05_ts: bool = False,
 ) -> torch.Tensor:
     assert inputs.ndim in [2, 3]
@@ -140,7 +143,7 @@ def repack_weight(
 
         assert zero_point.shape == zero_point_shape
 
-    pack_size_k = 256 // activation_bits
+    pack_size_k = 64 if use_packed_k_layout else 256 // activation_bits
     output_shape: tuple[int, ...] = (
         shape_k // pack_size_k,
         shape_n * pack_size_k * weight_bits // 32,
@@ -160,6 +163,7 @@ def repack_weight(
             use_wgmma=use_wgmma,
             use_fused_e8m0_scale=use_fused_e8m0_scale,
             group_size_zp=group_size_zp,
+            use_packed_k_layout=use_packed_k_layout,
             use_tcgen05_ts=use_tcgen05_ts,
         )
 

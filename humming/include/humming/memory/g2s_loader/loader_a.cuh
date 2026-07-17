@@ -24,6 +24,7 @@ private:
   static constexpr uint32_t kSmemStride = BlockShape::K * ElementA::kBits / 32 / 4;
   static constexpr uint32_t kGmemStride = (ProblemShape::K - PadShape::K) * ElementA::kBits / 32 / 4;
   static constexpr uint32_t kNumInt4s = kSmemStride * BlockShape::M;
+  static constexpr uint32_t kColOffsetToElem = MAX(ElementA::kBits, 8) / ElementA::kBits;
 
   static_assert(BlockShape::K * ElementA::kBits >= 512);
   static constexpr uint32_t kSwizzleBytes = BlockShape::K * ElementA::kBits == 512 ? 64 : 128;
@@ -113,7 +114,7 @@ public:
       uint32_t gmem_row = kIsIndexedGemm ? load_row_index[i] : (smem_row % BlockShape::M);
       uint32_t gmem_offset = gmem_row * kGmemStride + gmem_col;
 
-      bool pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset) < (ProblemShape::K - PadShape::K);
+      bool pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset * kColOffsetToElem) < (ProblemShape::K - PadShape::K);
       bool pred1 = kNumInt4s % kNumLoadThreads == 0 || i != kLoadIters - 1 || smem_offset < kNumInt4s;
       bool pred2 = gmem_row < (kIsIndexedGemm ? shape_m : block_shape_m);
 
@@ -145,7 +146,7 @@ public:
       uint32_t gmem_col = smem_col % 4;
       uint32_t gmem_offset = gmem_row * kGmemStride + gmem_col;
 
-      bool pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset) < (ProblemShape::K - PadShape::K);
+      bool pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset * kColOffsetToElem) < (ProblemShape::K - PadShape::K);
       bool pred1 = kNumInt4s % kNumLoadThreads == 0 || i != kLoadIters - 1 || smem_offset < kNumInt4s;
       bool pred2 = gmem_row < (kIsIndexedGemm ? shape_m : block_shape_m);
       if constexpr (PadShape::K == 0) {
@@ -158,7 +159,7 @@ public:
 
   CUDA_INLINE
   void advance() {
-    col_offset += BlockShape::K;
+    col_offset += BlockShape::K * ElementA::kBits / MAX(ElementA::kBits, 8);
     gmem_ptr += kSmemStride;
   }
 
@@ -170,7 +171,7 @@ public:
     } else {
       row_offset = m_block_id * BlockShape::M;
     }
-    col_offset = k_block_id * BlockShape::K;
+    col_offset = k_block_id * (BlockShape::K * ElementA::kBits / MAX(ElementA::kBits, 8));
     block_shape_m = MIN(shape_m - row_offset, BlockShape::M);
 
     uint32_t gmem_offset = k_block_id * kSmemStride;
