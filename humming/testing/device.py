@@ -47,6 +47,8 @@ def skip_if_unsupported(
         pytest.skip(f"wgmma requires SM90, current SM is {sm}")
     if mma_type == "mxmma" and sm // 10 != 12:
         pytest.skip(f"mxmma requires SM12x, current SM is {sm}")
+    if mma_type == "tcgen05" and sm // 10 != 10:
+        pytest.skip(f"tcgen05 requires SM10x, current SM is {sm}")
 
     a_dtype = _coerce_dtype(a_dtype)
     if mma_type == "wgmma" and a_dtype == dtypes.int4:
