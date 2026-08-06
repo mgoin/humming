@@ -415,7 +415,11 @@ def transform_humming_zero_point(
     return zero_point.view(*leading_shape, num_groups, shape_n * num_zp_bits // 32)
 
 
-def transform_humming_bias(bias: torch.Tensor) -> torch.Tensor:
+def transform_humming_bias(bias: torch.Tensor, use_tcgen05_ts: bool = False) -> torch.Tensor:
+    if use_tcgen05_ts:
+        # The TS drain reads the bias per weight row, so it keeps its natural
+        # order instead of the C-fragment permutation.
+        return bias.contiguous()
     return transform_humming_weight_scale(bias.unsqueeze(-1), True).squeeze(-2)
 
 
@@ -516,7 +520,7 @@ def transform_humming_tensors(
         )
 
     if bias is not None:
-        bias = transform_humming_bias(bias)
+        bias = transform_humming_bias(bias, use_tcgen05_ts=use_tcgen05_ts)
 
     if config.weight_scale_2_type == WeightScale2Type.CHANNEL:
         assert weight_scale_2 is not None
