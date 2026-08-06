@@ -1,0 +1,437 @@
+#pragma once
+//
+// TCGEN05 TS-mode MMA class for Blackwell sm_100+. Selected instead of
+// the SS-mode TCGEN05 class when TuningConfig::kUseTcgen05Ts is set.
+//
+// Data flow (vs the SS class in tcgen05_mma.cuh):
+//   * Dequantised weights are staged in TMEM via tcgen05.st (r2t), not
+//     scattered to smem.b_dequant (r2s). The per-K-iter 2052-cycle SMEM
+//     scatter and its 256-thread bar.sync disappear; a 128-thread
+//     bar.sync + tcgen05 fences remain for st->mma visibility.
+//   * The MMA is A<->B swapped: MMA-A = weights from TMEM (MmaM =
+//     BlockN = 128 rows = TMEM lanes), MMA-B = activations from SMEM
+//     via the same Swizzle<3,4,3> descriptor the SS kernel used for its
+//     A operand (MmaN = BlockM). TMEM D is transposed: D[lane = weight
+//     row n][col = activation m].
+//   * Weights arrive in the TS register-layout CONTRACT order (produced
+//     by humming/utils/ts_packing.py; spec in
+//     docs/tcgen05_ts_packing.md): thread (warp w, lane l) owns weight
+//     row n = 32w + l; per K-iter it holds the row's 16-K chunk as
+//     2 uint32 of pre-interleaved uint4 codes; the lop3 dequant below
+//     emits reg r = bf16 pair (K=2r, K=2r+1), the only TMEM-A layout
+//     TS-mode accepts. Scale/zp are per-lane (lane = row ownership),
+//     loaded by the TS branch in s2r_pipeline.cuh. Humming's
+//     fragment-ownership dequant/arith path is bypassed entirely.
+//
+// TMEM column map (single alloc of SharedStorage::kTcgen05TmemCols):
+//   base + 0  .. 8            W staging slot 0 (16 K bf16, 2/cell)
+//   base + 8  .. 16           W staging slot 1
+//   base + 16 .. 16 + BlockM  D accumulator (f32, MmaN = BlockM cols)
+//
+// Transform2Mma handshake (WAR on the staging slots):
+// per-slot mbarriers smem.tcgen05_ts_mbar[2]; run() commits the MMA
+// batch to its slot's mbar; transform_b() waits on the slot's mbar
+// before re-storing when arrivals_ > waits_. All math threads keep
+// consistent per-slot counters because they execute run()/transform_b()
+// in identical order.
+
+#include <humming/arith/exp_offset.cuh>
+#include <humming/datatype/dequant_single.cuh>
+#include <humming/epilogue/tmem_ts_drain.cuh>
+#include <humming/utils/all.cuh>
+#include <humming/utils/ptx/barrier.cuh>
+#include <humming/utils/ptx/shared.cuh>
+#include <humming/utils/ptx/tcgen05.cuh>
+
+
+// Per-dtype dequant of one bf16x2 code pair in TS contract order: given a
+// code word right-shifted so the target pair sits at the low kBits of each
+// 16-bit half, return the bf16x2 value (before the per-lane group scale,
+// which the caller applies). Dispatch is compile-time on ElementB; a new
+// weight dtype adds a branch here rather than re-writing transform_b's
+// inline lop3. Per-branch dequant/zp/exp-offset details are documented at
+// each case below.
+
+
+// Multiply a bf16x2 by the exact power of two 2^kOff. bf16 tops out at
+// 2^128, so an offset > 127 (uint8's 133) is applied in two steps: the
+// first 2^127 lifts normalized_uint_to_fp's subnormal dequant into normal
+// range, the residual then finishes it -- each factor is a pure power of
+// two (mantissa preserved, no rounding), mirroring SS's mainloop 2^127 +
+// epilogue 2^6 split but folded entirely into transform_b.
+template <uint32_t kOff, class EA = BFloat16>
+CUDA_INLINE typename F16Conversion<EA>::scalar_t2 ts_mul_pow2(
+    typename F16Conversion<EA>::scalar_t2 t) {
+  using Scalar2 = typename F16Conversion<EA>::scalar_t2;
+  if constexpr (kOff == 0u) {
+    return t;
+  } else {
+    constexpr uint32_t kW = kOff > 127u ? 127u : kOff;
+    const Scalar2 f0 = prepare_exp_scale_factor<Scalar2, kW>();
+    t = __hmul2(t, f0);
+    if constexpr (kOff > kW) {
+      const Scalar2 f1 = prepare_exp_scale_factor<Scalar2, kOff - kW>();
+      t = __hmul2(t, f1);
+    }
+    return t;
+  }
+}
+
+// Dequant one 16-bit-format code pair to ElementA (bf16 or fp16). EA drives
+// the dequant magic (bf16 0x4300 vs fp16 0x6400 base, via uint_to_f16 /
+// fp_to_fp / normalized_uint_to_fp) and the exp-offset element type. bf16 is
+// the shipped path (EA defaults to BFloat16, bit-exact).
+template <class EB, class EA, bool kHasZeroPoint, bool kIsFpZeroPoint = false>
+CUDA_INLINE uint32_t ts_dequant_b_pair(uint32_t shifted, uint32_t bias2) {
+  using Scalar2 = typename F16Conversion<EA>::scalar_t2;
+  if constexpr (EB::kIsIntegerType && EB::kBits <= EA::kMantissaBits) {
+    // uint{2,4}: with an integer zp, bias2 is the folded EA(2^(k-1) + zp)
+    // subtrahend so uint_to_f16 emits (code - zp) (no-zp midpoint baked
+    // in by s2r). With an fp zp, uint_to_f16 subtracts only the base and
+    // returns the RAW code as EA; the caller subtracts the per-lane bf16
+    // zp post-dequant, pre-scale. No exp offset (kOff==0) either way.
+    return uint_to_f16<EB, EA, /*kHasZeroPoint=*/true, kIsFpZeroPoint>(
+        shifted, bias2);
+  } else if constexpr (EB::kIsIntegerType) {
+    // uint8: 8 > bf16 mantissa, so the 0x4300 trick breaks; route to
+    // normalized_uint_to_fp with the RAW integer zp (bias2, broadcast
+    // internally; its no-zp branch applies the symmetric midpoint). The
+    // result is a subnormal ~(code-zp)*2^-133, corrected by 2^kOff (133).
+    static_assert(EB::kBits == 8, "TS integer dtypes: {uint2, uint4, uint8}");
+    constexpr uint32_t kOff =
+        get_dtype_dequant_exp_offset<EA, EB, kHasZeroPoint>();
+    uint32_t v = normalized_uint_to_fp<EB, EA, kHasZeroPoint,
+                                       /*kIsFpZeroPoint=*/false>(shifted, bias2);
+    Scalar2 t = ts_mul_pow2<kOff, EA>(*reinterpret_cast<Scalar2 *>(&v));
+    return *reinterpret_cast<uint32_t *>(&t);
+  } else if constexpr (EB::kIsFloatingPointType && EB::kBits <= 8u) {
+    // Software fp -> EA: relocate each code to the top of its 16-bit
+    // half, decode via fp_to_fp (exponent bits copied, NOT rebiased),
+    // then multiply by 2^kOff to correct the bias. For bf16 A the whole
+    // fp4/fp8 offset (126/120 <= 127) lives in the mainloop weight
+    // (get_epilogue_exp_offset == 0), so the caller's per-lane group-scale
+    // hmul2 needs NO epilogue exp-offset plumbing (cf SS kEpilogueExpOffset).
+    constexpr uint32_t kOff = get_dtype_dequant_exp_offset<EA, EB>();
+    uint32_t v = fp_to_fp<EB, EA>(shifted << (EA::kBits - EB::kBits));
+    Scalar2 t = ts_mul_pow2<kOff, EA>(*reinterpret_cast<Scalar2 *>(&v));
+    return *reinterpret_cast<uint32_t *>(&t);
+  } else {
+    static_assert(EB::kBits == 0,
+                  "TCGEN05_TS transform_b: weight dtype not wired -- add a "
+                  "ts_dequant_b_pair branch and extend the allowlist");
+    return 0u;
+  }
+}
+
+
+template <class Ctx, class ArithClass>
+struct TCGEN05_TS {
+public:
+  using MmaOpClass = typename Ctx::MmaOpClass;
+  using MmaShape = typename Ctx::MmaShape;
+  using SharedStorage = typename Ctx::SharedStorage;
+  using BlockShape = typename Ctx::BlockShape;
+  using WarpShape = typename Ctx::WarpShape;
+  using ElementA = typename Ctx::ElementA;
+  using ElementB = typename Ctx::ElementB;
+  using ElementC = typename Ctx::ElementC;
+  using CRegistersType = typename MmaOpClass::CRegisters;
+  // Never used on this path (K_WARPS == 1 so smem_reducer is dead and
+  // smem_writer is bypassed); any well-formed shape works.
+  using CRegistersArrayType = CRegistersType[1][1];
+
+  static constexpr bool kHasZeroPoint = Ctx::kHasZeroPoint;
+  static constexpr bool kIsFpZeroPoint = Ctx::kIsFpZeroPoint;
+  static constexpr bool kUseFusedE8m0Scale = Ctx::kUseFusedE8m0Scale;
+  static constexpr bool kIsGroupWeightScale = Ctx::kIsGroupWeightScale;
+  static constexpr bool kIsChannelWeightScale = Ctx::kIsChannelWeightScale;
+
+  static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
+
+  // Weight-dtype geometry, all compile-time (runtime-indexed member arrays
+  // demote the object from registers to a local-memory stack frame).
+  static constexpr uint32_t kBBits = ElementB::kBits;
+  // Words per row per 16-K chunk (u2:1, u4:2, u8:4).
+  static constexpr uint32_t kWpr = 16u * kBBits / 32u;
+  // Codes per packed word (u2:16, u4:8, u8:4).
+  static constexpr uint32_t kVpw = 32u / kBBits;
+  // bf16x2 pairs produced per word (= kVpw / 2). kWpr * kRegsPerWord == 8.
+  static constexpr uint32_t kRegsPerWord = kVpw / 2u;
+
+  // The MMA-M tile: exactly one 128-row weight tile covered by 4 warps
+  // of 32 lanes.
+  static constexpr uint32_t kMmaM = 128;
+  static constexpr uint32_t kTsSlotCols = kPartMmaShapeK * 16u / 32u;  // 8
+  static constexpr uint32_t kNumTsSlots = 2;
+  static constexpr uint32_t kDColOffset = kNumTsSlots * kTsSlotCols;   // 16
+
+  static_assert(BlockShape::N == 128,
+                "TCGEN05_TS: BlockN must be 128 (exactly one 128-row "
+                "MMA-M tile; multi-tile BlockN=256 is not wired up)");
+  static_assert(WarpShape::N == 32,
+                "TCGEN05_TS: WarpN must be 32 (contract: warp w owns "
+                "rows (w%4)*32 + lane; a warp can only tcgen05.st its "
+                "own TMEM sub-partition)");
+  static_assert(WarpShape::M == BlockShape::M,
+                "TCGEN05_TS: M_WARPS must be 1 (TMEM D is CTA-level; "
+                "multiple M-warps would need sequential m-passes)");
+  static_assert(WarpShape::K == BlockShape::K,
+                "TCGEN05_TS: K_WARPS must be 1 (K accumulates in TMEM D)");
+  static_assert(BlockShape::K == 64,
+                "TCGEN05_TS: BlockK must be 64 bf16 (single 64-K "
+                "section; BlockK > 64 needs section-major staging)");
+  static_assert(BlockShape::M == 32 || BlockShape::M == 64 ||
+                    BlockShape::M == 128,
+                "TCGEN05_TS: BlockM (= MMA-N) must be 32, 64 or 128 "
+                "(M=128 atom requires N % 16 == 0, N <= 256; the drain "
+                "loops kBlockM/32 so BlockM must be a multiple of 32)");
+  static_assert(std::is_same<ElementA, BFloat16>::value ||
+                    std::is_same<ElementA, Float16>::value,
+                "TCGEN05_TS: ElementA must be BFloat16 or Float16 (both issue "
+                "kind::f16; the dequant base is chosen per ElementA -- bf16 "
+                "0x4300 vs fp16 0x6400)");
+  // TS weight-dtype allowlist. Extending it requires, in lockstep: a
+  // ts_dequant_b_pair branch, a ts_packing.py guard, and a
+  // supports_tcgen05_ts clause.
+  static constexpr bool kTsBDtypeSupported =
+      std::is_same<ElementB, UInt4>::value ||
+      std::is_same<ElementB, UInt2>::value ||
+      std::is_same<ElementB, UInt8>::value ||
+      std::is_same<ElementB, Float4E2M1>::value ||
+      std::is_same<ElementB, Float8E4M3>::value;
+  static_assert(kTsBDtypeSupported,
+                "TCGEN05_TS: ElementB not in the TS weight-dtype allowlist "
+                "(currently {uint2, uint4, uint8, float4e2m1, float8e4m3})");
+  static_assert(!kIsFpZeroPoint || (ElementB::kIsIntegerType &&
+                                    ElementB::kBits <= ElementA::kMantissaBits),
+                "TCGEN05_TS fp zero-point: only the uint_to_f16 weight dtypes "
+                "(kBits <= mantissa, e.g. uint2/uint4); uint8's normalized "
+                "path does not carry the post-scale fp subtract");
+  static_assert(Ctx::kIsGroupWeightScale || Ctx::kIsChannelWeightScale,
+                "TCGEN05_TS: group or channelwise weight scale (block/mx "
+                "unsupported)");
+  static_assert(!Ctx::kIsGroupWeightScale ||
+                    Ctx::kWeightScaleGroupSize >= BlockShape::K ||
+                    (BlockShape::K % Ctx::kWeightScaleGroupSize == 0 &&
+                     Ctx::kWeightScaleGroupSize % kPartMmaShapeK == 0),
+                "TCGEN05_TS group scale: gs >= BlockK (one group per stage), "
+                "OR gs divides BlockK and is a multiple of the 16-K iter so "
+                "each iter stays within a single group (no intra-iter split)");
+  static_assert(!Ctx::kReduceOverlapLastStageOnly,
+                "TCGEN05_TS: reduce_overlap_last_stage_only unsupported");
+
+  Ctx &ctx;
+  SharedStorage &smem;
+  ArithClass &arith;
+
+  // Interface parity: never written (activations are read from SMEM by
+  // the MMA descriptor; s2r skips loader_a for TCGEN05).
+  alignas(16) int4 regs_a[1];
+  // Per-thread quantised codes: one row x 16 K, packed into kWpr uint32
+  // (u2:1, u4:2, u8:4), double-buffered. Written by the TS branch of
+  // s2r_pipeline. alignas(16): loader_b vectorizes the u8 gather as int4.
+  alignas(16) uint32_t regs_qb[2][kWpr];
+  // Per-lane bf16x2 broadcast scale (s, s) and dequant bias
+  // bf16x2(128 + zp, 128 + zp), also filled by the s2r TS branch.
+  uint32_t regs_bs2_ts[2];
+  uint32_t regs_bias2_ts[2];
+  // Per-lane bf16x2 broadcast fp zero-point (kIsFpZeroPoint only): a real
+  // bf16 subtracted post-dequant / pre-scale to give (code - zp_fp) * scale.
+  // Filled by the s2r TS branch from the [K/gs, N] bf16 zp stream. Unused
+  // (never written) on the integer-zp path.
+  uint32_t regs_zpfp2_ts[2];
+
+  CUDA_INLINE
+  TCGEN05_TS(Ctx &ctx_, ArithClass &arith_)
+      : ctx(ctx_), smem(ctx_.smem), arith(arith_) {}
+
+  CUDA_INLINE
+  void zero_accum() {
+    // First MMA of the tile overwrites D via scale_d = false. The
+    // slot counters must NOT reset here -- mbar phases persist across
+    // tiles.
+    first_issue_ = true;
+  }
+
+  // Dequant (contract order) + WAR-gated r2t into the slot. `iter_id` is
+  // unused: the staging slot is selected by buffer_id, and the per-lane
+  // scale/zp registers are refreshed per K-iter by the s2r TS branch.
+  CUDA_INLINE
+  void transform_b(uint32_t buffer_id, uint32_t iter_id) {
+    using Scalar2 = typename F16Conversion<ElementA>::scalar_t2;
+    uint32_t out[8];
+    uint32_t bias2 = regs_bias2_ts[buffer_id];
+    const Scalar2 scale =
+        *reinterpret_cast<const Scalar2 *>(&regs_bs2_ts[buffer_id]);
+    PRAGMA_UNROLL
+    for (uint32_t w = 0; w < kWpr; w++) {
+      uint32_t q = regs_qb[buffer_id][w];
+      PRAGMA_UNROLL
+      for (uint32_t r = 0; r < kRegsPerWord; r++) {
+        // Extract the (r, r + kVpw/2) codes of q into the lo/hi ElementA
+        // halves and dequant per ElementB; the pack pre-compensates the
+        // slot order so this yields reg = (K = 2*idx, K = 2*idx + 1).
+        uint32_t v =
+            ts_dequant_b_pair<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint>(
+                q >> (r * kBBits), bias2);
+        Scalar2 t = *reinterpret_cast<Scalar2 *>(&v);
+        // FP zero point: ts_dequant returned the raw code as EA, so the
+        // zp is a real bf16 subtracted here, BEFORE the scale, matching
+        // the SS order (code - zp_fp) * scale. Integer zp is already
+        // folded into the code by uint_to_f16 (nothing to do here).
+        if constexpr (kIsFpZeroPoint) {
+          const Scalar2 zpfp =
+              *reinterpret_cast<const Scalar2 *>(&regs_zpfp2_ts[buffer_id]);
+          t = __hsub2(t, zpfp);
+        }
+        // Group scale folds here (per-lane, per-stage). Channelwise scale
+        // is K-invariant and commutes with the K-sum, so it is deferred
+        // to the drain (epilogue-fold) and NOT applied per code here.
+        if constexpr (kIsGroupWeightScale) t = __hmul2(t, scale);
+        out[w * kRegsPerWord + r] = *reinterpret_cast<uint32_t *>(&t);
+      }
+    }
+
+    // WAR gate: the slot may still be read by an in-flight MMA from
+    // two iterations ago. arrivals_/waits_ differ by at most 1.
+    uint32_t slot = buffer_id;
+    if (arrivals_[slot] > waits_[slot]) {
+      mbarrier_wait(&smem.tcgen05_ts_mbar[slot], waits_[slot] & 1u);
+      waits_[slot]++;
+    }
+
+    // r2t: warp w writes rows 32w..32w+31 (its own sub-partition).
+    uint32_t warp = threadIdx.x / 32u;
+    uint32_t addr = (smem.tcgen05_tmem_col + slot * kTsSlotCols)
+                    | ((warp % 4u) * 32u << 16);
+    tcgen05_st_32x32b_x8(addr, out);
+    tcgen05_wait_st();
+    tcgen05_fence_before_thread_sync();
+  }
+
+  CUDA_INLINE
+  void run(uint32_t stage_id, uint32_t iter_id) {
+    // Publish all 4 warps' tcgen05.st to the MMA-issuing thread:
+    // before_thread_sync (end of transform_b) -> REAL thread sync ->
+    // after_thread_sync. All three links are required for cross-warp
+    // ordering.
+    ctx.sync_math_threads();
+    tcgen05_fence_after_thread_sync();
+
+    uint32_t slot = iter_id % 2u;
+    // Activation descriptor: same canonical Swizzle<3,4,3> K-major
+    // layout + 16-K-per-issue advance the SS kernel uses for A.
+    // BlockK == 64 -> single section, advance is iter_id * 2 uint128.
+    int4 *act_ptr = &smem.stages[stage_id].a[0] + iter_id * 2u;
+    uint64_t b_desc = tcgen05_smem_desc<128, BlockShape::K>(act_ptr);
+    // A<->B swap: idesc M = weight rows (128), N = activation MmaN. Weights
+    // are dequanted to ElementA, so both operand formats follow ElementA
+    // (fp16 -> F16, bf16 -> BF16); the MMA kind stays f16 for both.
+    constexpr uint32_t kFmt = std::is_same<ElementA, Float16>::value
+                                  ? tcgen05_fmt::F16
+                                  : tcgen05_fmt::BF16;
+    uint32_t idesc =
+        tcgen05_instr_desc_f16fam_f32<kFmt, kFmt>(kMmaM, BlockShape::M);
+
+    bool scale_d = !first_issue_;
+    first_issue_ = false;
+
+    uint32_t tmem_base = smem.tcgen05_tmem_col;
+    if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
+      tcgen05_mma_ts_bf16(tmem_base + kDColOffset,
+                          tmem_base + slot * kTsSlotCols,
+                          b_desc, idesc, scale_d);
+      // Commit the batch (all MMAs so far) to this slot's mbar; the
+      // arrival transitively proves the slot's reader retired.
+      tcgen05_commit_to_mbarrier(
+          cast_smem_ptr_to_uint(&smem.tcgen05_ts_mbar[slot]));
+    }
+    arrivals_[slot]++;
+  }
+
+  // Drain TMEM D (transposed: lane = weight row n, col = activation m)
+  // directly into smem.reduce in gmem_writer's sectioned XOR-swizzled
+  // layout, bypassing smem_writer (EpiloguePipeline already skips it
+  // for kMmaType == TCGEN05). Returns nullptr as the sentinel.
+  template <class T = uint32_t>
+  CUDA_INLINE T *final_regs_c_as_ptr() {
+    if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
+      tcgen05_commit_to_mbarrier(cast_smem_ptr_to_uint(&smem.tcgen05_mbar));
+    }
+    mbarrier_wait(&smem.tcgen05_mbar, mbar_phase_);
+    mbar_phase_ ^= 1u;
+    tcgen05_fence_view_async_tmem_store();
+
+    uint32_t warp = threadIdx.x / 32u;
+    uint32_t lane = threadIdx.x % 32u;
+    uint32_t n = (warp % 4u) * 32u + lane;  // this thread's weight row
+
+    float bias_val = 0.0f;
+    if constexpr (Ctx::kHasBias) {
+      using ScalarC = typename F16Conversion<ElementC>::scalar_t;
+      const ScalarC *smem_bias =
+          reinterpret_cast<const ScalarC *>(&smem.bias[0]);
+      bias_val = F16Conversion<ElementC>::num22float2(
+                     F16Conversion<ElementC>::num2num2(smem_bias[n]))
+                     .x;
+    }
+
+    // Channelwise weight scale: one bf16 scalar per output row n, staged
+    // in smem.bs_c by the channel g2s load. It commutes with the K-sum,
+    // so we fold it here (the group path folds its scale in transform_b
+    // instead). Read in natural n order -- the g2s copies the CTA's
+    // 128-row N slice contiguously, matching the bias read above.
+    float scale_val = 1.0f;
+    if constexpr (kIsChannelWeightScale) {
+      using ScalarBS = typename F16Conversion<
+          typename Ctx::ElementBS>::scalar_t;
+      const ScalarBS *smem_bs =
+          reinterpret_cast<const ScalarBS *>(&smem.bs_c[0]);
+      scale_val = F16Conversion<typename Ctx::ElementBS>::num22float2(
+                      F16Conversion<typename Ctx::ElementBS>::num2num2(
+                          smem_bs[n]))
+                      .x;
+    }
+
+    uint32_t smem_reduce_base = offsetof(SharedStorage, reduce) / 128u % 8u;
+    uint32_t d_base = smem.tcgen05_tmem_col + kDColOffset;
+    // Vectorized drain (tmem_ts_drain.cuh): 8x8 register transpose +
+    // four swizzled 128-bit stores per lane per 32-m chunk, replacing
+    // the scalar 2-byte scatter.
+    tmem_ts_drain_transposed<BlockShape::M, ElementC, kIsChannelWeightScale>(
+        d_base, n, smem.reduce, smem_reduce_base, bias_val, scale_val);
+    ctx.sync_math_threads();
+    return nullptr;
+  }
+
+  // s2r pipeline interface parity.
+  template <class T = uint32_t>
+  CUDA_INLINE T *regs_a_as_ptr(uint32_t buffer_id) {
+    return reinterpret_cast<T *>(regs_a);
+  }
+
+  template <class T = uint32_t>
+  CUDA_INLINE T *regs_qb_as_ptr(uint32_t buffer_id) {
+    return reinterpret_cast<T *>(regs_qb[buffer_id]);
+  }
+
+  template <class T = uint32_t>
+  CUDA_INLINE T *regs_b_as_ptr() {
+    return reinterpret_cast<T *>(regs_qb);
+  }
+
+  template <class T = uint32_t>
+  CUDA_INLINE T *regs_c_as_ptr(uint32_t buffer_id = 0) {
+    // No RMEM accumulator on this path; the accumulator lives in TMEM
+    // until final_regs_c_as_ptr drains it.
+    return reinterpret_cast<T *>(regs_a);
+  }
+
+private:
+  bool first_issue_ = true;
+  uint32_t mbar_phase_ = 0;
+  // Per-slot Transform2Mma handshake counters (consistent across all
+  // math threads by construction).
+  uint32_t arrivals_[kNumTsSlots] = {0, 0};
+  uint32_t waits_[kNumTsSlots] = {0, 0};
+};
