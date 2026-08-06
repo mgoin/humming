@@ -20,6 +20,7 @@ venv/
 
 # Local files
 /tmp/
+.humming-tmp/
 *.ipynb
 .ipynb_checkpoints/
 
