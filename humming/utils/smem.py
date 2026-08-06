@@ -83,6 +83,8 @@ def estimate_smem_size_layer(
     use_warp_spec: bool = False,
     num_write_splits: int = 1,
     mma_accum_bits: int = 32,
+    use_tcgen05: bool = False,
+    use_tcgen05_ts: bool = False,
 ) -> int:
     block_m, block_n, block_k = block_shape
     is_mxmma = layer_config.mma_type == MmaType.MXMMA
@@ -99,6 +101,10 @@ def estimate_smem_size_layer(
     bias_bytes = (block_n * 2) if layer_config.has_bias else 0
     channel_as_bytes = (block_m * 4) if (a_bits != 16 and layer_config.input_scale_group_size == 0) else 0
 
+    # SS-mode tcgen05 stages the dequantised B operand in two BlockN x BlockK
+    # ElementA buffers that live inside the stage union.
+    b_dequant_bytes = 2 * block_n * block_k * a_bits // 8 if (use_tcgen05 and not use_tcgen05_ts) else 0
+
     struct_a = _struct_size(
         [
             (channel_zp_bytes, 128),
@@ -107,6 +113,7 @@ def estimate_smem_size_layer(
             (bias_bytes, 128),
             (channel_as_bytes, 128),
             (stage_bytes * num_stages, 1024),
+            (b_dequant_bytes, 128),
         ],
         1024,
     )
@@ -157,6 +164,11 @@ def estimate_smem_size_layer(
         if reduce_overlap_last_stage_only and num_stages == 2:
             num_math_mbarriers += 1
         add(num_math_mbarriers * 8, 8)  # math_mbar
+    if use_tcgen05:
+        add(4, 16)  # tcgen05_tmem_col
+        add(8, 8)  # tcgen05_mbar
+        if use_tcgen05_ts:
+            add(2 * 8, 8)  # tcgen05_ts_mbar
 
     return _align_up(offset, 1024)
 
@@ -183,4 +195,6 @@ def estimate_smem_size_config(
         use_warp_spec=bool(tuning_config.use_warp_spec),
         num_write_splits=tuning_config.num_write_splits,
         mma_accum_bits=16 if compute_config.use_f16_accum else 32,
+        use_tcgen05=bool(tuning_config.use_tcgen05),
+        use_tcgen05_ts=bool(tuning_config.use_tcgen05_ts),
     )

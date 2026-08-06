@@ -55,10 +55,17 @@ public:
       static_assert(!Ctx::kUseTmaC);
     }
 
+    // The TCGEN05 drain already wrote bf16 into smem.reduce in the layout
+    // gmem_writer expects and returned nullptr as the sentinel, so skip
+    // smem_writer (which would read regs_c in the m16n8 fragment layout).
+    // The fence and the barrier below stay outside the guard: they are what
+    // publish those generic-proxy stores to the TMA-C engine.
+    constexpr bool kIsTcgen05 = Ctx::kMmaType == MmaType::TCGEN05;
+
     if (slice_count > 1) acquire_gmem_barrier();
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < kNumWriteSplits; i++) {
-      smem_writer.write(regs_c_ptr, slice_count, i);
+      if constexpr (!kIsTcgen05) smem_writer.write(regs_c_ptr, slice_count, i);
       if constexpr (Ctx::kUseTmaC) {
         if (ctx.is_math_thread()) tma_fence_async_shared();
       }

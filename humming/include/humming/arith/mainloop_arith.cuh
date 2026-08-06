@@ -53,6 +53,19 @@ private:
       kIsGroupOrBlockWeightScale && !kUseFusedE8m0Scale,
       MmaOpClass::kNativeMixed>();
 
+public:
+  // Residual exponent offset left over after the mainloop applies
+  // kExpOffset.x; it has to be applied when the result is written to SMEM.
+  // The WMMA / WGMMA paths read it through EpilogueArithmetic::kExpOffset in
+  // smem_writer, but the TCGEN05 path bypasses smem_writer and reads it here.
+  // Mirrors EpilogueArithmetic::kExpOffset exactly.
+  static constexpr uint2 kEpilogueExpOffset = get_epilogue_exp_offset<
+      ElementA, ElementB, ElementC, ElementBS, kHasZeroPoint,
+      kIsF16Accum, kIsGroupInputScale,
+      kIsGroupOrBlockWeightScale && !kUseFusedE8m0Scale,
+      MmaOpClass::kNativeMixed>();
+
+private:
   static constexpr uint32_t kDequantBSBits = (ElementA::kBits < 16 && !kIsF16Accum) ? 32 : 16;
   static constexpr uint32_t kNumSubBlocksM = CEIL_DIV(WarpShape::M, 16);
   static constexpr uint32_t kNumSubBlocksN = WarpShape::N / 16;
@@ -62,11 +75,14 @@ private:
   static constexpr uint32_t kNumBSPerGroup = kNumSubBlocksN * kNumBSPerSubBlock;
 
 public:
-  uint32_t as[2][kNumASPerGroup];
-  uint32_t q_as[kNumASPerGroup];
-  uint32_t bs[2][MAX(kNumBSPerGroup, 8) * ElementBS::kBits / 32];
-  uint32_t dq_bs[MAX(kNumBSPerGroup, 8) * kDequantBSBits / 32];
-  uint32_t zp[2][(kIsFpZeroPoint ? 4 : CEIL_DIV(ElementB::kBits, 4)) * kNumZPGroupsPerMma];
+  // alignas(16): these are read and written through vectorized int4 accesses;
+  // without it the compiler can spill them to local memory at unaligned
+  // offsets and silently drop bytes.
+  alignas(16) uint32_t as[2][kNumASPerGroup];
+  alignas(16) uint32_t q_as[kNumASPerGroup];
+  alignas(16) uint32_t bs[2][MAX(kNumBSPerGroup, 8) * ElementBS::kBits / 32];
+  alignas(16) uint32_t dq_bs[MAX(kNumBSPerGroup, 8) * kDequantBSBits / 32];
+  alignas(16) uint32_t zp[2][(kIsFpZeroPoint ? 4 : CEIL_DIV(ElementB::kBits, 4)) * kNumZPGroupsPerMma];
 
   uint32_t _dummy;
 

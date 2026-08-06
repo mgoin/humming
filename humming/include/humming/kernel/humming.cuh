@@ -2,6 +2,7 @@
 
 #include <humming/scheduler.cuh>
 #include <humming/utils/all.cuh>
+#include <humming/utils/ptx/tcgen05.cuh>
 
 #include <humming/arith/epilogue_arith.cuh>
 #include <humming/arith/mainloop_arith.cuh>
@@ -71,6 +72,24 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
   extern __shared__ int4 shared_memory[];
   auto &smem = *reinterpret_cast<SharedStorage *>(shared_memory);
+
+  // TMEM alloc at kernel entry (see humming_ws.cuh): the driver sizes the
+  // per-CTA TMEM reservation from the cubin's at-entry fragment, so a buried
+  // alloc reserves all 512 columns and pins occupancy to one CTA per SM.
+  // tcgen05.alloc is .sync.aligned, hence all 32 threads of warp 0.
+  // mbarrier_init_sync() below publishes the column index and the mbarriers.
+  if constexpr (Ctx::kMmaType == MmaType::TCGEN05) {
+    if (threadIdx.x < 32) {
+      tcgen05_alloc<SharedStorage::kTcgen05TmemCols>(cast_smem_ptr_to_uint(&smem.tcgen05_tmem_col));
+    }
+    if (threadIdx.x == 0) {
+      __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
+      if constexpr (TuningConfig::kUseTcgen05Ts) {
+        __mbarrier_init(&smem.tcgen05_ts_mbar[0], /*expected_count=*/1);
+        __mbarrier_init(&smem.tcgen05_ts_mbar[1], /*expected_count=*/1);
+      }
+    }
+  }
 
   const KernelParams params{
       shape_m, top_k, use_int64_expert_layout,
@@ -160,6 +179,17 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     s2r_pipe.load_channel(scheduler.slice_id);
     __syncthreads();
     epilogue.call(mma.final_regs_c_as_ptr());
+  }
+
+  // tcgen05.{relinquish_alloc_permit, dealloc} are .sync.aligned, so all 32
+  // threads of warp 0 issue them together, after a CTA-wide sync that retires
+  // every t2r.
+  if constexpr (Ctx::kMmaType == MmaType::TCGEN05) {
+    __syncthreads();
+    if (threadIdx.x < 32) {
+      tcgen05_relinquish_alloc_permit();
+      tcgen05_dealloc<SharedStorage::kTcgen05TmemCols>(smem.tcgen05_tmem_col);
+    }
   }
 
   __syncthreads();

@@ -2,6 +2,7 @@
 
 #include <humming/scheduler.cuh>
 #include <humming/utils/all.cuh>
+#include <humming/utils/ptx/tcgen05.cuh>
 
 #include <humming/arith/epilogue_arith.cuh>
 #include <humming/arith/mainloop_arith.cuh>
@@ -72,8 +73,52 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   constexpr bool kUseTwoStageReduceBarrier = SharedStorage::kUseTwoStageReduceBarrier;
   static_assert(Ctx::kWarpIters >= 2, "warp-specialized mainloop requires at least two warp iterations");
 
+  if constexpr (TuningConfig::kUseTcgen05Ts) {
+    // Stage-release safety. `consumer.arrive(T)` at warp iter kWarpIters - 2
+    // is what lets the producer overwrite stage T - 1, and every math thread
+    // must arrive before the mbarrier flips. TS-mode UMMAs read stage SMEM
+    // asynchronously until they retire, so each thread's arrive has to be
+    // program-ordered after a WAR wait covering every issue over stage T - 1:
+    //   * transform_b at warp iter j waits the slot-(j + 1) % 2 mbarrier,
+    //     whose most recent commit was issued by run(., j - 1), and a commit
+    //     covers the whole batch of MMAs issued so far;
+    //   * the last wait completed before the arrive is the one at iter
+    //     kWarpIters - 3, covering every issue up to run(T, kWarpIters - 4),
+    //     which reaches past run(T - 1, kWarpIters - 1) only for
+    //     kWarpIters >= 4;
+    //   * run consumes slot iter % 2 and transform_b prepares slot
+    //     (iter + 1) % 2, so the ping-pong survives a stage boundary only
+    //     when kWarpIters is even.
+    static_assert(Ctx::kWarpIters >= 4 && Ctx::kWarpIters % 2 == 0,
+                  "TS stage release needs kWarpIters >= 4 and even");
+    // At two stages the producer refills the very stage the arrive released,
+    // while run(T, kWarpIters - 1) is still reading it.
+    static_assert(kNumStages >= 3, "TS mainloop needs at least three stages");
+  }
+
   extern __shared__ int4 shared_memory[];
   auto &smem = *reinterpret_cast<SharedStorage *>(shared_memory);
+
+  // TMEM alloc at kernel entry, ahead of any warp-role control flow: the
+  // driver sizes the per-CTA TMEM reservation from the cubin's at-entry
+  // fragment, and an alloc placed after the branch falls outside that window,
+  // reserving all 512 columns and pinning occupancy to one CTA per SM. Warp 0
+  // is a math warp in every config (load threads sit at the top of the CTA)
+  // and tcgen05.alloc is .sync.aligned, so all 32 of its threads issue it.
+  // mbarrier_init_sync() below publishes both the column index and the
+  // mbarriers to the rest of the CTA.
+  if constexpr (Ctx::kMmaType == MmaType::TCGEN05) {
+    if (threadIdx.x < 32) {
+      tcgen05_alloc<SharedStorage::kTcgen05TmemCols>(cast_smem_ptr_to_uint(&smem.tcgen05_tmem_col));
+    }
+    if (threadIdx.x == 0) {
+      __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
+      if constexpr (TuningConfig::kUseTcgen05Ts) {
+        __mbarrier_init(&smem.tcgen05_ts_mbar[0], /*expected_count=*/1);
+        __mbarrier_init(&smem.tcgen05_ts_mbar[1], /*expected_count=*/1);
+      }
+    }
+  }
 
   const KernelParams params{
       shape_m, top_k, use_int64_expert_layout,
@@ -201,6 +246,18 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
       if constexpr (kUseTwoStageReduceBarrier) consumer.arrive(kNumStages + 1);
       if constexpr (!kReduceOverlapLastStageOnly) consumer.arrive(kNumStages);
+    }
+
+    // tcgen05.{relinquish_alloc_permit, dealloc} are .sync.aligned, so all 32
+    // threads of warp 0 issue them together. Sync the math threads (barrier 1)
+    // so every t2r has retired; a __syncthreads here would instead pair with
+    // the load threads' joint __syncthreads below and deadlock.
+    if constexpr (Ctx::kMmaType == MmaType::TCGEN05) {
+      ctx.sync_math_threads();
+      if (threadIdx.x < 32) {
+        tcgen05_relinquish_alloc_permit();
+        tcgen05_dealloc<SharedStorage::kTcgen05TmemCols>(smem.tcgen05_tmem_col);
+      }
     }
   }
 
