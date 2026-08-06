@@ -261,42 +261,19 @@ union Tcgen05InstrDescriptor {
   };
 };
 
-namespace tcgen05_fmt {
-  constexpr uint32_t F16  = 0;
-  constexpr uint32_t BF16 = 1;
-  constexpr uint32_t TF32 = 2;
-}
-namespace tcgen05_cfmt {
-  constexpr uint32_t F16 = 0;
-  constexpr uint32_t F32 = 1;
-  constexpr uint32_t S32 = 2;
-}
-
-CUDA_INLINE uint32_t tcgen05_instr_desc_bf16_bf16_f32(uint32_t shape_m,
-                                                     uint32_t shape_n) {
+// kind::f16 family descriptor. The format codes come from MmaOpClass
+// (Tcgen05OpClassImpl emits kInstrDesc{A,B,C}Format); shape_m/shape_n are the
+// MMA-operand extents, which differ from the block tile on the TS path
+// because it swaps A and B.
+template <uint32_t kAFmt, uint32_t kBFmt, uint32_t kCFmt>
+CUDA_INLINE uint32_t tcgen05_instr_desc_f16fam(uint32_t shape_m,
+                                               uint32_t shape_n) {
   Tcgen05InstrDescriptor d{};
-  d.c_format = tcgen05_cfmt::F32;
-  d.a_format = tcgen05_fmt::BF16;
-  d.b_format = tcgen05_fmt::BF16;
-  d.n_dim    = (shape_n >> 3);   // N=128 -> 16
-  d.m_dim    = (shape_m >> 4);   // M=64  -> 4, M=128 -> 8
-  return d.desc;
-}
-
-// Same kind::f16 family, with the a/b operand formats chosen at compile
-// time. TS mode issues kind::f16 for BOTH bf16 and fp16 activations; only
-// these two format fields (and the software weight-dequant target) change.
-// The TS kernel dequants weights to the SAME element type as the
-// activation, so kAFmt == kBFmt on that path.
-template <uint32_t kAFmt, uint32_t kBFmt>
-CUDA_INLINE uint32_t tcgen05_instr_desc_f16fam_f32(uint32_t shape_m,
-                                                   uint32_t shape_n) {
-  Tcgen05InstrDescriptor d{};
-  d.c_format = tcgen05_cfmt::F32;
+  d.c_format = kCFmt;
   d.a_format = kAFmt;
   d.b_format = kBFmt;
-  d.n_dim    = (shape_n >> 3);
-  d.m_dim    = (shape_m >> 4);
+  d.n_dim    = (shape_n >> 3);   // N=128 -> 16
+  d.m_dim    = (shape_m >> 4);   // M=64  -> 4, M=128 -> 8
   return d.desc;
 }
 

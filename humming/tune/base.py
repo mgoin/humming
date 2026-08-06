@@ -20,6 +20,15 @@ class DeviceHeuristics:
         return False
 
     @classmethod
+    def supports_tcgen05_ts(cls, layer_config: LayerConfig) -> bool:
+        """Whether this device has a TS-mode tcgen05 kernel for `layer_config`.
+
+        Gates both the kernel dispatch and the TS weight/scale/zero-point
+        packing, which must agree; overridden by Sm100Heuristics.
+        """
+        return False
+
+    @classmethod
     def get_base_config(
         cls,
         a_dtype: dtypes.DataType,

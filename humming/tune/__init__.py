@@ -26,6 +26,8 @@ heuristics_map: dict[int, type[DeviceHeuristics]] = {
     89: Sm89Heuristics,
     90: Sm90Heuristics,
     100: Sm100Heuristics,
+    101: Sm100Heuristics,
+    102: Sm100Heuristics,
     103: Sm100Heuristics,
     120: Sm120Heuristics,
     121: Sm121Heuristics,

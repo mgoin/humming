@@ -165,6 +165,8 @@ public:
   static constexpr uint32_t kNumTsSlots = 2;
   static constexpr uint32_t kDColOffset = kNumTsSlots * kTsSlotCols;   // 16
 
+  static_assert(MmaOpClass::kCtaGroup == 1,
+                "TCGEN05_TS: only cta_group::1 is wired up");
   static_assert(BlockShape::N == 128,
                 "TCGEN05_TS: BlockN must be 128 (exactly one 128-row "
                 "MMA-M tile; multi-tile BlockN=256 is not wired up)");
@@ -325,13 +327,13 @@ public:
     int4 *act_ptr = &smem.stages[stage_id].a[0] + iter_id * 2u;
     uint64_t b_desc = tcgen05_smem_desc<128, BlockShape::K>(act_ptr);
     // A<->B swap: idesc M = weight rows (128), N = activation MmaN. Weights
-    // are dequanted to ElementA, so both operand formats follow ElementA
-    // (fp16 -> F16, bf16 -> BF16); the MMA kind stays f16 for both.
-    constexpr uint32_t kFmt = std::is_same<ElementA, Float16>::value
-                                  ? tcgen05_fmt::F16
-                                  : tcgen05_fmt::BF16;
+    // are dequanted to ElementA, so both operand formats follow ElementA and
+    // the MMA kind stays f16 for both fp16 and bf16.
     uint32_t idesc =
-        tcgen05_instr_desc_f16fam_f32<kFmt, kFmt>(kMmaM, BlockShape::M);
+        tcgen05_instr_desc_f16fam<MmaOpClass::kInstrDescAFormat,
+                                  MmaOpClass::kInstrDescBFormat,
+                                  MmaOpClass::kInstrDescCFormat>(
+            kMmaM, BlockShape::M);
 
     bool scale_d = !first_issue_;
     first_issue_ = false;

@@ -257,6 +257,20 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         else:
             mma_cd_dtype = dtypes.float32
 
+        if self.mma_type == MmaType.TCGEN05:
+            # tcgen05.mma.kind::f16 covers the whole block tile per issue, so
+            # MmaShape == (BlockM, BlockN) with K = the kind::f16 16-K step.
+            return MmaOpClass.from_config(
+                self.mma_type,
+                self.block_shape[0],
+                self.block_shape[1],
+                16,
+                self.mma_a_dtype,
+                self.mma_b_dtype,
+                mma_cd_dtype,
+                warp_shape=self.warp_shape,
+            )
+
         mma_shape_m = self.warp_shape[0] if self.mma_type == MmaType.WGMMA else 16
         mma_shape_n = 64 if self.mma_type == MmaType.WGMMA else 8
         mma_shape_k = 256 // self.a_dtype.num_bits
@@ -412,6 +426,10 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             self.use_stream_k = False
         if self.mma_type == MmaType.WGMMA:
             assert self.num_stages >= 3, "WGMMA requires at least three pipeline stages"
+        assert (self.mma_type == MmaType.TCGEN05) == bool(self.use_tcgen05), (
+            "use_tcgen05 and mma_type='tcgen05' must be set together"
+        )
+        assert not self.use_tcgen05 or not self.use_f16_accum, "tcgen05 accumulates in f32 TMEM"
         if self.use_batch_invariant:
             assert not self.use_stream_k, "batch-invariant kernels require use_stream_k=False"
             assert self.warp_shape[2] == self.block_shape[2], (

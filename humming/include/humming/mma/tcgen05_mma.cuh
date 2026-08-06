@@ -254,12 +254,12 @@ public:
                 "TCGEN05: K-warps not supported -- tcgen05.mma "
                 "covers the full BlockK by issuing one MMA per "
                 "16-K-bf16 atom from a single warp");
-  // `tcgen05.mma.kind::f16` is issued via `tcgen05_mma_ss_bf16` with
-  // `tcgen05_instr_desc_bf16_bf16_f32` -- both hardcoded to bf16.
-  // fp16 A requires a parallel instruction-descriptor + scatter (the
-  // scatter must match fp16's SMEM-bit semantics, not bf16's). Without
-  // that, the bf16-shaped instruction would reinterpret fp16 bit
-  // patterns and produce garbage (error magnitudes ~1e16).
+  static_assert(MmaOpClass::kCtaGroup == 1,
+                "TCGEN05: only cta_group::1 is wired up");
+  // `tcgen05_mma_ss_bf16`'s SMEM scatter is hardcoded to bf16's bit
+  // semantics. fp16 A requires a parallel scatter path; without it the
+  // bf16-shaped scatter reinterprets fp16 bit patterns and produces
+  // garbage (error magnitudes ~1e16).
   static_assert(std::is_same<ElementA, BFloat16>::value,
                 "TCGEN05: ElementA must be BFloat16. fp16 A requires "
                 "a parallel instruction-descriptor + scatter path "
@@ -444,7 +444,10 @@ public:
     uint64_t b_desc = tcgen05_smem_desc<kSwizzleBytesB, kKPerSection>(b_ptr);
 
     uint32_t idesc =
-        tcgen05_instr_desc_bf16_bf16_f32(BlockShape::M, BlockShape::N);
+        tcgen05_instr_desc_f16fam<MmaOpClass::kInstrDescAFormat,
+                                  MmaOpClass::kInstrDescBFormat,
+                                  MmaOpClass::kInstrDescCFormat>(
+            BlockShape::M, BlockShape::N);
 
     // First issue of a tile: overwrite D (scale_d=false).
     // Subsequent K-iters: accumulate (scale_d=true).

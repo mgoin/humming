@@ -43,6 +43,12 @@ SF_DTYPE_MAP = {
     "e4m3": "ue4m3",
 }
 
+# tcgen05.mma instruction-descriptor operand/accumulator format codes
+# (PTX ISA 8.7 sec 9.7.16.5.1, mirrored by Tcgen05InstrDescriptor in
+# include/humming/utils/ptx/tcgen05.cuh).
+TCGEN05_OPERAND_FORMAT_MAP = {"f16": 0, "bf16": 1}
+TCGEN05_ACCUM_FORMAT_MAP = {"f16": 0, "f32": 1, "s32": 2}
+
 
 def calc_reg_count(rows, cols, ptx_dtype):
     total_bits = rows * cols * DTYPE_BIT_WIDTH_MAP[ptx_dtype]
@@ -310,6 +316,95 @@ class WgmmaOpClassImpl:
         return asm_code
 
 
+class Tcgen05OpClassImpl:
+    """Blackwell ``tcgen05.mma`` (UMMA) instruction descriptor.
+
+    Differences from the warp-level impls above:
+      * The MMA is issued by a single elected thread against SMEM/TMEM
+        descriptors, so there are no A/B register-tile counts to emit.
+      * The accumulator lives in TMEM. The epilogue does its own t2r load,
+        so a CRegisters alias still describes the RMEM-side tile, but the
+        mainloop never touches C registers.
+
+    Divergence from the other OpClass impls: the ``tcgen05.mma`` PTX is
+    emitted by ``include/humming/utils/ptx/tcgen05.cuh`` instead of here,
+    because the instruction descriptor depends on the operand-swapped MMA
+    shape the TS mainloop picks (weights become MMA-A). The parts that do
+    not depend on that swap -- cta group and the operand/accumulator format
+    codes -- are emitted here so the codegen surface still describes the
+    instruction.
+    """
+
+    def __init__(self, m, n, k, a_dtype, b_dtype, cd_dtype, warp_shape=None):
+        self.shape = (m, n, k)
+        self.a_dtype = a_dtype if isinstance(a_dtype, str) else DTYPE_MAP[a_dtype]
+        self.b_dtype = b_dtype if isinstance(b_dtype, str) else DTYPE_MAP[b_dtype]
+        self.cd_dtype = cd_dtype if isinstance(cd_dtype, str) else DTYPE_MAP[cd_dtype]
+
+        # tcgen05.mma writes a BlockM x BlockN accumulator to TMEM; the epilogue
+        # t2r reads it back distributed over the epilogue warps. Per-thread
+        # CRegisters count = warp_m * warp_n * cd_bits / (32 lanes * 32 bits).
+        if warp_shape is not None:
+            cd_bits = DTYPE_BIT_WIDTH_MAP[self.cd_dtype]
+            self.reg_cd_count = warp_shape[0] * warp_shape[1] * cd_bits // (32 * 32)
+        else:
+            self.reg_cd_count = calc_reg_count(m, n, self.cd_dtype) // 4
+
+        if self.cd_dtype == "f16":
+            self.val_type_cd = "half"
+            self.reg_cd_type = "uint32_t"
+        elif self.cd_dtype == "bf16":
+            self.val_type_cd = "nv_bfloat16"
+            self.reg_cd_type = "uint32_t"
+        elif self.cd_dtype == "f32":
+            self.val_type_cd = "float"
+            self.reg_cd_type = "float"
+        elif self.cd_dtype == "s32":
+            self.val_type_cd = "int32_t"
+            self.reg_cd_type = "uint32_t"
+        else:
+            raise ValueError(f"Invalid cd_dtype for tcgen05: {cd_dtype}")
+
+        for name in ["a", "b"]:
+            dtype = getattr(self, f"{name}_dtype")
+            if dtype not in TCGEN05_OPERAND_FORMAT_MAP:
+                raise ValueError(f"Invalid {name}_dtype for tcgen05: {dtype}")
+        if self.cd_dtype not in TCGEN05_ACCUM_FORMAT_MAP:
+            raise ValueError(f"Invalid cd_dtype for tcgen05: {cd_dtype}")
+
+    def to_cpp_str(self, include_class_name=False):
+        lines = [
+            "static constexpr MmaType kMmaType = MmaType::TCGEN05;",
+            f"using MmaShape = Shape<{self.shape[0]}, {self.shape[1]}, {self.shape[2]}>;",
+            "",
+            f"using ValTypeC = {self.val_type_cd};",
+            f"using ValTypeD = {self.val_type_cd};",
+            "",
+            f"static constexpr uint32_t kATypeBits = {DTYPE_BIT_WIDTH_MAP[self.a_dtype]};",
+            f"static constexpr uint32_t kBTypeBits = {DTYPE_BIT_WIDTH_MAP[self.b_dtype]};",
+            f"static constexpr uint32_t kCTypeBits = {DTYPE_BIT_WIDTH_MAP[self.cd_dtype]};",
+            f"static constexpr uint32_t kDTypeBits = {DTYPE_BIT_WIDTH_MAP[self.cd_dtype]};",
+            # Weights are always software-dequantised to the activation dtype
+            # and issued as kind::f16, so tcgen05 is never a native-mixed MMA.
+            # mainloop/epilogue arith read kNativeMixed unconditionally.
+            "static constexpr bool kNativeMixed = false;",
+            "",
+            "static constexpr uint32_t kCtaGroup = 1;",
+            f"static constexpr uint32_t kInstrDescAFormat = {TCGEN05_OPERAND_FORMAT_MAP[self.a_dtype]};",
+            f"static constexpr uint32_t kInstrDescBFormat = {TCGEN05_OPERAND_FORMAT_MAP[self.b_dtype]};",
+            f"static constexpr uint32_t kInstrDescCFormat = {TCGEN05_ACCUM_FORMAT_MAP[self.cd_dtype]};",
+            "",
+            # Operands come from SMEM/TMEM descriptors, not per-warp register
+            # tiles; only the C footprint is needed, to size the t2r staging.
+            f"using CRegisters = {self.reg_cd_type}[{self.reg_cd_count}];",
+            f"using DRegisters = {self.reg_cd_type}[{self.reg_cd_count}];",
+        ]
+        code = "\n".join("  " + x if x else x for x in lines)
+        if include_class_name:
+            code = f"class MmaOpClass {{\n{code}\n}};"
+        return code
+
+
 class MxMmaOpClassImpl:
     """Microscale (block-scaled) warp-level ``mma.sync`` for SM120.
 
@@ -470,13 +565,27 @@ class MxMmaOpClassImpl:
 
 class MmaOpClass:
     @classmethod
-    def from_config(cls, mma_type, m, n, k, a_dtype, b_dtype, cd_dtype, sf_dtype=None, scale_vec=None):
+    def from_config(
+        cls,
+        mma_type,
+        m,
+        n,
+        k,
+        a_dtype,
+        b_dtype,
+        cd_dtype,
+        sf_dtype=None,
+        scale_vec=None,
+        warp_shape=None,
+    ):
         mma_type = mma_type if isinstance(mma_type, MmaType) else getattr(MmaType, mma_type.upper())
 
         if mma_type == MmaType.MMA:
             return MmaOpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype)
         elif mma_type == MmaType.WGMMA:
             return WgmmaOpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype)
+        elif mma_type == MmaType.TCGEN05:
+            return Tcgen05OpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype, warp_shape=warp_shape)
         elif mma_type == MmaType.MXMMA:
             if sf_dtype is None:
                 raise ValueError("MXMMA requires sf_dtype (block scale-factor dtype)")

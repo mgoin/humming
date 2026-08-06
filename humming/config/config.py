@@ -8,6 +8,16 @@ from humming import dtypes
 from humming.config.base import BaseHummingConfig
 from humming.config.enum import GemmType, MmaType, WeightScale2Type, WeightScaleType
 
+# Weight dtypes wired into the TS-mode dequant (ts_dequant_b_pair in
+# mma/tcgen05_ts_mma.cuh and the guards in utils/ts_packing.py).
+TCGEN05_TS_B_DTYPES = (
+    dtypes.uint2,
+    dtypes.uint4,
+    dtypes.uint8,
+    dtypes.float4e2m1,
+    dtypes.float8e4m3,
+)
+
 
 @dataclasses.dataclass(kw_only=True, unsafe_hash=True)
 class LayerConfig(BaseHummingConfig):
@@ -57,6 +67,32 @@ class LayerConfig(BaseHummingConfig):
         "has_tensor_weight_scale",
         "has_input_scale",
     )
+
+    @property
+    def tcgen05_supported(self):
+        # Legality of the TS-mode tcgen05 kernel, mirroring the static_asserts
+        # in mma/tcgen05_ts_mma.cuh. Unlike mxmma_supported this is not wired
+        # into __post_init__: TS packs weight/scale/zero point in a layout no
+        # other kernel can read, so it stays an explicit mma_type="tcgen05"
+        # opt-in for v1.
+        if torch.cuda.get_device_capability()[0] != 10:
+            return False
+        if self.a_dtype != dtypes.bfloat16 or self.bs_dtype != dtypes.bfloat16:
+            return False
+        if self.b_dtype not in TCGEN05_TS_B_DTYPES:
+            return False
+        if self.has_zero_point and self.is_fp_zero_point and self.b_dtype.num_bits > 4:
+            # The fp zero point is subtracted post-dequant/pre-scale, which only
+            # the uint_to_f16 weight dtypes carry.
+            return False
+        if not (self.is_group_weight_scale or self.is_channel_weight_scale):
+            return False
+        group_size = self.weight_scale_group_size
+        if group_size and group_size < 64 and (group_size % 16 or 64 % group_size):
+            # Sub-stage groups must divide BlockK=64 and hold a whole 16-K MMA
+            # iteration, so no iteration straddles two groups.
+            return False
+        return self.shape_n % 128 == 0 and self.shape_k % 64 == 0
 
     @property
     def mxmma_supported(self):
@@ -252,7 +288,7 @@ class LayerConfig(BaseHummingConfig):
     def mma_type_id(self):
         assert self.mma_type is not None
         value = self.mma_type.value.lower()
-        return ["mma", "wgmma", "umma_placeholder", "mxmma"].index(value)
+        return ["mma", "wgmma", "tcgen05", "mxmma"].index(value)
 
     @property
     def mxmma_native_mixed(self) -> bool:
@@ -293,6 +329,10 @@ class LayerConfig(BaseHummingConfig):
             return self.weight_scale_group_size == 0 or self.a_dtype.num_bits != 16
         elif self.mma_type == MmaType.WGMMA:
             return self.weight_scale_group_size == 0
+        elif self.mma_type == MmaType.TCGEN05:
+            # TS-mode folds the per-row scale into the TMEM drain, so the
+            # weight scale is never re-applied on C.
+            return False
         elif self.mma_type == MmaType.MXMMA:
             return self.is_channel_weight_scale
         else:
@@ -397,7 +437,19 @@ class TuningConfig(BaseHummingConfig):
             self.use_tcgen05_ts = False
         if self.use_tcgen05 is None:
             self.use_tcgen05 = self.use_tcgen05_ts
-        assert self.use_tcgen05 or not self.use_tcgen05_ts
+
+        if self.use_tcgen05_ts:
+            # Fail closed on the tile geometry the TS mainloop static_asserts
+            # (mma/tcgen05_ts_mma.cuh) so an illegal config is rejected here
+            # instead of deep inside NVRTC.
+            assert self.use_tcgen05, "use_tcgen05_ts requires use_tcgen05"
+            assert self.block_shape[1] == 128, "tcgen05 TS requires block_shape_n=128"
+            assert self.warp_shape[1] == 32, "tcgen05 TS requires warp_shape_n=32"
+            assert self.block_shape[2] == 64, "tcgen05 TS requires block_shape_k=64"
+            assert self.warp_shape[0] == self.block_shape[0], "tcgen05 TS requires one M-warp"
+            assert self.warp_shape[2] == self.block_shape[2], "tcgen05 TS requires one K-warp"
+            if self.use_warp_spec:
+                assert self.num_stages >= 3, "tcgen05 TS + warp-spec requires num_stages>=3"
 
         if self.use_mbarrier is None:
             self.use_mbarrier = self.use_tma or self.use_warp_spec

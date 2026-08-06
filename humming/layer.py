@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from humming import dtypes
-from humming.config import GemmType, LayerConfig
+from humming.config import GemmType, LayerConfig, MmaType
 from humming.forward import (
     humming_forward,
     may_hadamard_quant_input,
@@ -96,6 +96,7 @@ class HummingLayerMethod:
         has_bias: bool = False,
         torch_dtype: torch.dtype | None = None,
         sublayer_name: str = "",
+        mma_type: MmaType | str | None = None,
     ) -> HummingLayerMeta:
         config = prepare_layer_config(
             shape_n=shape_n,
@@ -107,6 +108,7 @@ class HummingLayerMethod:
             pad_k_to_multiple=pad_k_to_multiple,
             has_bias=has_bias,
             torch_dtype=torch_dtype,
+            mma_type=mma_type,
         )
         meta = HummingLayerMeta.from_layer_config(config, sublayer_name)
 
@@ -287,6 +289,10 @@ class HummingLayer(torch.nn.Module):
     num_experts: int | None = None
     has_bias: bool = False
     torch_dtype: torch.dtype | None = None
+    # Opt into an explicit MMA path. None keeps the per-device default;
+    # "tcgen05" requests the Blackwell TS-mode kernel and its packed
+    # weight/scale/zero-point layouts (see LayerConfig.tcgen05_supported).
+    mma_type: MmaType | str | None = None
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -527,6 +533,7 @@ class HummingLayer(torch.nn.Module):
             pad_k_to_multiple=self.pad_k_to_multiple,
             torch_dtype=self.torch_dtype,
             has_bias=self.has_bias,
+            mma_type=self.mma_type,
         )
         self._humming_metas = {}
 

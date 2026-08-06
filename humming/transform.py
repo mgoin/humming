@@ -5,6 +5,7 @@ import torch
 from humming import dtypes, ops
 from humming.config import LayerConfig, MmaType, WeightScale2Type, WeightScaleType
 from humming.schema import HummingInputSchema, HummingWeightSchema
+from humming.utils.ts_packing import pack_scales_tcgen05_ts, pack_zero_point_tcgen05_ts
 
 
 def prepare_layer_config(
@@ -17,6 +18,7 @@ def prepare_layer_config(
     pad_k_to_multiple: int = 1,
     has_bias: bool = False,
     torch_dtype: torch.dtype | None = None,
+    mma_type: MmaType | str | None = None,
 ) -> LayerConfig:
     if torch_dtype is None:
         torch_dtype = torch.get_default_dtype()
@@ -62,6 +64,7 @@ def prepare_layer_config(
         weight_scale_2_type=weight_scale_2_type,
         has_zero_point=weight_schema.has_zero_point,
         is_fp_zero_point=weight_schema.is_fp_zero_point,
+        mma_type=mma_type,
     )
 
 
@@ -244,6 +247,7 @@ def transform_humming_weight(
     padded_shape_k: int | None = None,
     interleave_mode: int = 3,
     use_packed_k_layout: bool = False,
+    use_tcgen05_ts: bool = False,
 ) -> torch.Tensor:
     is_moe = weight.ndim == 3
     weight = weight.unsqueeze(0) if not is_moe else weight
@@ -315,6 +319,7 @@ def transform_humming_weight(
         use_fused_e8m0_scale=use_fused_e8m0_scale,
         group_size_zp=group_size_zp,
         use_packed_k_layout=use_packed_k_layout,
+        use_tcgen05_ts=use_tcgen05_ts,
     )
     return repacked_weight if is_moe else repacked_weight.squeeze(0)
 
@@ -325,7 +330,14 @@ def transform_humming_weight_scale(
     is_blockwise: bool = False,
     is_mxmma: bool = False,
     mxmma_scale_vec: int = 4,
+    use_tcgen05_ts: bool = False,
 ) -> torch.Tensor:
+    if use_tcgen05_ts:
+        # TS-mode ownership is lane = weight row, so the scale keeps its
+        # natural [K/gs, N] order with no fragment permutation.
+        assert not to_apply_on_c and not is_blockwise and not is_mxmma
+        return pack_scales_tcgen05_ts(weight_scale)
+
     if is_blockwise:
         return weight_scale.transpose(-1, -2).contiguous()
 
@@ -360,15 +372,22 @@ def transform_humming_zero_point(
     dtype: dtypes.DataType,
     packed: bool = False,
     num_groups_per_mma: int = 1,
+    use_tcgen05_ts: bool = False,
 ) -> torch.Tensor | None:
     if zero_point.dtype.is_floating_point:
-        return transform_humming_weight_scale(zero_point, False)
+        # An fp zero point is a param-dtype stream in the same [K/gs, N] layout
+        # as the weight scale, so it takes the same packer.
+        return transform_humming_weight_scale(zero_point, False, use_tcgen05_ts=use_tcgen05_ts)
 
     if packed:
         zero_point = zero_point.transpose(-1, -2).contiguous()
         zero_point = zero_point.squeeze().view(*zero_point.shape)
         zero_point = ops.unpack_weight(zero_point, dtype.num_bits)
         zero_point = zero_point.transpose(-1, -2).contiguous()
+
+    if use_tcgen05_ts:
+        assert num_groups_per_mma == 1
+        return pack_zero_point_tcgen05_ts(zero_point.to(torch.int32), dtype.num_bits)
 
     num_zp_bits = 4 if dtype.num_bits <= 4 else 8
     shape_n = zero_point.size(-2)
@@ -436,6 +455,19 @@ def transform_humming_tensors(
     if config.use_fused_e8m0_scale and config.a_dtype == dtypes.float8e4m3:
         interleave_mode = 2
 
+    # mma_type=TCGEN05 opts the whole layer into the TS-mode slot-paired
+    # weight/scale/zero-point layouts, which no other kernel can read. The
+    # heuristic must therefore dispatch TS at every shape_m, so pack in
+    # lockstep with the gate it uses.
+    use_tcgen05_ts = config.mma_type == MmaType.TCGEN05
+    if use_tcgen05_ts:
+        from humming.tune import get_heuristics_class
+
+        assert get_heuristics_class().supports_tcgen05_ts(config), (
+            "mma_type='tcgen05' opts into TS-mode packing, but this layer is "
+            "not TS-legal on this device (see LayerConfig.tcgen05_supported)"
+        )
+
     weight = transform_humming_weight(
         weight=weight,
         b_dtype=config.b_dtype,
@@ -446,6 +478,7 @@ def transform_humming_tensors(
         packed=True,
         interleave_mode=interleave_mode,
         use_packed_k_layout=config.use_packed_k_layout,
+        use_tcgen05_ts=use_tcgen05_ts,
     )
 
     if weight_scale is not None:
@@ -462,6 +495,7 @@ def transform_humming_tensors(
             is_blockwise=config.weight_scale_type == WeightScaleType.BLOCK,
             is_mxmma=is_mxmma,
             mxmma_scale_vec=mxmma_scale_vec,
+            use_tcgen05_ts=use_tcgen05_ts,
         )
 
     if zero_point is not None:
@@ -478,6 +512,7 @@ def transform_humming_tensors(
             config.b_dtype,
             packed=True,
             num_groups_per_mma=num_groups_per_mma,
+            use_tcgen05_ts=use_tcgen05_ts,
         )
 
     if bias is not None:
