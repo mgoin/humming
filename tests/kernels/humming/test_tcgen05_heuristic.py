@@ -1,7 +1,14 @@
 import pytest
 
 from humming import dtypes
-from humming.config import GemmType, LayerConfig, MmaType, WeightScale2Type, WeightScaleType
+from humming.config import (
+    GemmType,
+    LayerConfig,
+    MmaType,
+    TuningConfig,
+    WeightScale2Type,
+    WeightScaleType,
+)
 from humming.testing import skip_if_unsupported
 from humming.tune import get_heuristics_class, get_heuristics_config
 
@@ -21,6 +28,11 @@ def _layer_config(**overrides) -> LayerConfig:
         "has_zero_point": True,
     }
     return LayerConfig(**(values | overrides))
+
+
+def _to_tuning_config(config: dict) -> TuningConfig:
+    fields = TuningConfig.__dataclass_fields__
+    return TuningConfig(**{k: v for k, v in config.items() if k in fields})
 
 
 @pytest.fixture(autouse=True)
@@ -347,3 +359,24 @@ def test_ss_opt_in_fallback(overrides, block_shape, shape_m):
 
     default = get_heuristics_config(_layer_config(**overrides), shape_m=shape_m)
     assert not default.get("use_tcgen05")
+
+
+@pytest.mark.parametrize("overrides", [{}, {"shape_n": 6208}], ids=str)
+def test_tcgen05_never_launches_with_pdl(overrides):
+    """pdl reaches the mma.sync kernels but is forced off for tcgen05, whose
+    at-entry TMEM alloc precedes the griddepcontrol handshake."""
+    layer_config = _layer_config(**overrides)
+    assert _to_tuning_config(get_heuristics_config(layer_config, shape_m=2048)).use_pdl
+
+    tcgen05 = _layer_config(mma_type=MmaType.TCGEN05, **overrides)
+    assert not _to_tuning_config(get_heuristics_config(tcgen05, shape_m=2048)).use_pdl
+
+    explicit = TuningConfig(
+        block_shape=(128, 128, 64),
+        warp_shape=(128, 32, 64),
+        use_tcgen05_ts=True,
+        use_warp_spec=True,
+        num_stages=4,
+        use_pdl=True,
+    )
+    assert not explicit.use_pdl

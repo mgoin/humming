@@ -482,6 +482,12 @@ class TuningConfig(BaseHummingConfig):
         if self.use_tcgen05 is None:
             self.use_tcgen05 = self.use_tcgen05_ts
 
+        if self.use_tcgen05:
+            # The pdl handshake sits after the at-entry tcgen05.alloc, so a
+            # dependent CTA can contend for TMEM with the primary kernel it
+            # overlaps; unaudited, so fail closed rather than launch with it.
+            self.use_pdl = False
+
         if self.use_tcgen05_ts:
             # Fail closed on the tile geometry the TS mainloop static_asserts
             # (mma/tcgen05_ts_mma.cuh) so an illegal config is rejected here
