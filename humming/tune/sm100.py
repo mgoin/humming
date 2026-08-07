@@ -63,9 +63,10 @@ class Sm100Heuristics(Sm80Heuristics):
 
     @classmethod
     def supports_tcgen05_ss(cls, layer_config: LayerConfig) -> bool:
-        if layer_config.a_dtype != dtypes.bfloat16:
-            # mma/tcgen05_mma.cuh static_asserts ElementA == BFloat16: the SS
-            # r2s scatter and drain_accum are written against bf16 bit patterns.
+        if layer_config.a_dtype != dtypes.bfloat16 or layer_config.c_dtype != dtypes.bfloat16:
+            # mma/tcgen05_mma.cuh static_asserts ElementA == ElementC == BFloat16:
+            # the SS r2s scatter is written against bf16 bit patterns, and
+            # drain_accum converts and writes the output as bf16.
             return False
         if layer_config.b_dtype not in _SS_B_DTYPE_CONFIG:
             return False

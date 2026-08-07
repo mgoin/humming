@@ -14,22 +14,8 @@ CUDA_INLINE void tcgen05_alloc(uint32_t smem_addr_for_col_index) {
                 NumColumns == 256 || NumColumns == 512,
                 "tcgen05_alloc<N>: N must be 32 / 64 / 128 / 256 / 512");
   // Issuing thread must be the first thread of a single warp in the CTA.
-  if constexpr (NumColumns == 32) {
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 32;\n"
-                 :: "r"(smem_addr_for_col_index) : "memory");
-  } else if constexpr (NumColumns == 64) {
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 64;\n"
-                 :: "r"(smem_addr_for_col_index) : "memory");
-  } else if constexpr (NumColumns == 128) {
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 128;\n"
-                 :: "r"(smem_addr_for_col_index) : "memory");
-  } else if constexpr (NumColumns == 256) {
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 256;\n"
-                 :: "r"(smem_addr_for_col_index) : "memory");
-  } else if constexpr (NumColumns == 512) {
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 512;\n"
-                 :: "r"(smem_addr_for_col_index) : "memory");
-  }
+  asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;\n"
+               :: "r"(smem_addr_for_col_index), "n"(NumColumns) : "memory");
 }
 
 CUDA_INLINE void tcgen05_relinquish_alloc_permit() {
@@ -60,22 +46,8 @@ CUDA_INLINE void tcgen05_dealloc(uint32_t tmem_col_index) {
   static_assert(NumColumns == 32 || NumColumns == 64 || NumColumns == 128 ||
                 NumColumns == 256 || NumColumns == 512,
                 "tcgen05_dealloc<N>: N must be 32 / 64 / 128 / 256 / 512");
-  if constexpr (NumColumns == 32) {
-    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 32;\n"
-                 :: "r"(tmem_col_index) : "memory");
-  } else if constexpr (NumColumns == 64) {
-    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 64;\n"
-                 :: "r"(tmem_col_index) : "memory");
-  } else if constexpr (NumColumns == 128) {
-    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 128;\n"
-                 :: "r"(tmem_col_index) : "memory");
-  } else if constexpr (NumColumns == 256) {
-    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 256;\n"
-                 :: "r"(tmem_col_index) : "memory");
-  } else if constexpr (NumColumns == 512) {
-    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;\n"
-                 :: "r"(tmem_col_index) : "memory");
-  }
+  asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;\n"
+               :: "r"(tmem_col_index), "n"(NumColumns) : "memory");
 }
 
 

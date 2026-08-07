@@ -161,6 +161,9 @@ def test_ts_illegal_layers(overrides):
         },
         # A 16-bit group scale is reinterpreted as ElementA bit-for-bit.
         {"bs_dtype": dtypes.float16},
+        # drain_accum converts with __floats2bfloat162_rn and bypasses the
+        # epilogue smem writer, so a non-bf16 c_dtype would receive bf16 bits.
+        {"c_dtype": dtypes.float16},
         # A block scale narrower than the warp N-tile is not indexed per N.
         {
             "bs_dtype": dtypes.float32,
@@ -178,13 +181,15 @@ def test_ss_illegal_layers(overrides):
 
 
 # The rest of the dispatch-site rejections run as ILLEGAL_CASES in
-# test_tcgen05.py. These two cannot: the weight schema rejects the mismatched
+# test_tcgen05.py. These cannot: the weight schema rejects the mismatched
 # scale tensor before the layer ever reaches the gate.
 @pytest.mark.parametrize(
     "overrides",
     [
         {"a_dtype": dtypes.float16, "c_dtype": dtypes.float16},
         {"a_dtype": dtypes.float16, "bs_dtype": dtypes.float16, "is_fp_zero_point": True},
+        # TS turns the weight dtype down and SS is bf16-out only.
+        {"b_dtype": dtypes.uint3, "c_dtype": dtypes.float16},
     ],
     ids=str,
 )

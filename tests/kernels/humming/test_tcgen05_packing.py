@@ -1,3 +1,5 @@
+import itertools
+
 import pytest
 import torch
 
@@ -151,6 +153,71 @@ def test_cuda_repack_packed_input():
         use_tcgen05_ts=True,
     )
     assert torch.equal(packed.cpu(), pack_weight_tcgen05_ts(codes.cpu(), 4))
+
+
+def _ss_scatter_geometry(block_n: int, block_k: int) -> dict:
+    # bf16 A: 16 K per tcgen05.mma issue, staged section-major at 64 K per section.
+    part_mma_shape_k = 16
+    k_per_section = min(block_k, 64)
+    row_bytes = k_per_section * 2
+    return {
+        "part_mma_shape_k": part_mma_shape_k,
+        "k_per_section": k_per_section,
+        "row_bytes": row_bytes,
+        "section_bytes": block_n * row_bytes,
+        "k_iters_per_section": k_per_section // part_mma_shape_k,
+    }
+
+
+def _ss_scatter_ref_offset(g, t, n_base, iteration, i, frag, pair, base_div128):
+    # Element-wise form: PTX Table 32 (n, k) for the fragment, then the byte
+    # address under loader_a's section-major staging and Swizzle<3,4,3>.
+    n = n_base + i * 16 + 8 * frag + t // 4
+    k_lo = iteration * g["part_mma_shape_k"] + 2 * (t % 4) + 8 * pair
+    k_section, k_in_section = divmod(k_lo, g["k_per_section"])
+    linear_in_section = n * g["row_bytes"] + k_in_section * 2
+    linear = k_section * g["section_bytes"] + linear_in_section
+    xor_shift = (base_div128 + (linear_in_section >> 7)) & 7
+    return linear ^ (xor_shift << 4)
+
+
+def _ss_scatter_closed_base0(g, t, n_base, iteration, base_div128):
+    n0 = n_base + t // 4
+    pre = n0 * g["row_bytes"] + (t % 4) * 4
+    mask = ((base_div128 + n0) & 7) << 4
+    iters = g["k_iters_per_section"]
+    in_section = (pre ^ mask) ^ ((iteration % iters) * g["part_mma_shape_k"] * 2)
+    return in_section + (iteration // iters) * g["section_bytes"]
+
+
+def _ss_scatter_closed_offset(g, t, n_base, iteration, i, frag, pair, base_div128):
+    base0 = _ss_scatter_closed_base0(g, t, n_base, iteration, base_div128)
+    return (base0 ^ (pair * 16)) + i * 16 * g["row_bytes"] + frag * 8 * g["row_bytes"]
+
+
+@pytest.mark.parametrize("block_n", [64, 128, 256])
+@pytest.mark.parametrize("block_k", [64, 128, 256])
+def test_ss_scatter_closed_form_matches_reference(block_n, block_k):
+    # The SS mainloop (mma/tcgen05_mma.cuh) addresses its r2s dequant scatter
+    # with scatter_closed_base0 plus immediates, on the claim that every
+    # additive term occupies a disjoint bit range. Exhaustive over the whole
+    # index space and all 8 SMEM base phases, for every shape the kernel's
+    # static_asserts admit.
+    warp_n = 64
+    g = _ss_scatter_geometry(block_n, block_k)
+    space = itertools.product(
+        range(8),  # SMEM base phase
+        range(max(block_n // warp_n, 1)),  # scatter warp
+        range(32),  # lane
+        range(block_k // g["part_mma_shape_k"]),  # 16-K iter
+        range(warp_n // 16),  # m16n8 fragment pair
+        range(2),  # fragment half
+        range(2),  # k pair
+    )
+    for base_div128, warp, t, iteration, i, frag, pair in space:
+        args = (g, t, warp * warp_n, iteration, i, frag, pair, base_div128)
+        ref, closed = _ss_scatter_ref_offset(*args), _ss_scatter_closed_offset(*args)
+        assert ref == closed, f"{base_div128=} {warp=} {t=} {iteration=} {i=} {frag=} {pair=}"
 
 
 def test_cuda_repack_moe():

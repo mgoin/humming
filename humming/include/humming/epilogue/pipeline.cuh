@@ -57,7 +57,14 @@ public:
 
     // The TCGEN05 drain already filled smem.reduce in gmem_writer's layout and
     // returned nullptr; the fence and barrier below still publish those stores.
+    // The other two readers of regs_c_ptr must therefore be unreachable: the
+    // K-warp reducer above, and a second write split, which would re-read an
+    // accumulator the drain no longer holds.
     constexpr bool kIsTcgen05 = Ctx::kMmaType == MmaType::TCGEN05;
+    static_assert(!kIsTcgen05
+                  || (BlockShape::K == WarpShape::K && kNumWriteSplits == 1),
+                  "TCGEN05: the drain returns nullptr, so K-warp reduction and "
+                  "multi-split writes are unsupported");
 
     if (slice_count > 1) acquire_gmem_barrier();
     PRAGMA_UNROLL

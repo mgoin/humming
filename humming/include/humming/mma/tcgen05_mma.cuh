@@ -10,12 +10,6 @@
 #include <humming/utils/ptx/tcgen05.cuh>
 
 
-// Publishes r2s stores to the async proxy tcgen05.mma reads B through.
-CUDA_INLINE void fence_proxy_async_shared_cta() {
-  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-}
-
-
 template <class Ctx, class ArithClass>
 struct TCGEN05 {
 public:
@@ -26,6 +20,7 @@ public:
   using WarpShape = typename Ctx::WarpShape;
   using ElementA = typename Ctx::ElementA;
   using ElementB = typename Ctx::ElementB;
+  using ElementC = typename Ctx::ElementC;
   using CRegistersType = typename MmaOpClass::CRegisters;
   // Never used on this path; any well-formed shape satisfies the epilogue.
   using CRegistersArrayType = CRegistersType[1][1];
@@ -54,26 +49,14 @@ public:
   static constexpr uint32_t kNScatterWarps =
       MAX(BlockShape::N / WarpShape::N, 1u);
 
-  // Closed-form scatter addressing: every additive term of the element-wise
-  // offset occupies a disjoint bit range, so + == ^ among them and the swizzle
-  // XOR phase depends only on n's low 3 bits. scatter_closed_form_matches()
-  // below checks the two agree over the whole index space.
-  static constexpr uint32_t scatter_ref_offset(
-      uint32_t t, uint32_t n_base, uint32_t iter, uint32_t i,
-      uint32_t frag, uint32_t pair, uint32_t base_div128) {
-    uint32_t n = n_base + i * 16u + 8u * frag + t / 4u;
-    uint32_t k_lo = iter * kPartMmaShapeK + 2u * (t % 4u) + 8u * pair;
-    uint32_t k_section = k_lo / kKPerSectionB;
-    uint32_t k_in_section = k_lo % kKPerSectionB;
-    uint32_t linear_in_section = n * kRowBytesB + k_in_section * 2u;
-    uint32_t linear = k_section * kBSectionSizeBytes + linear_in_section;
-    uint32_t xor_shift = (base_div128 + (linear_in_section >> 7)) & 7u;
-    return linear ^ (xor_shift << 4);
-  }
-
   static constexpr uint32_t kKItersPerSectionB =
       kKPerSectionB / kPartMmaShapeK;
 
+  // Closed-form scatter addressing: every additive term of the element-wise
+  // offset occupies a disjoint bit range, so + == ^ among them and the swizzle
+  // XOR phase depends only on n's low 3 bits. The equivalence with the
+  // element-wise formula is checked over the whole index space by
+  // test_tcgen05_packing.py::test_ss_scatter_closed_form_matches_reference.
   static constexpr uint32_t scatter_closed_base0(
       uint32_t t, uint32_t n_base, uint32_t iter, uint32_t base_div128) {
     uint32_t n0 = n_base + t / 4u;
@@ -82,36 +65,6 @@ public:
     return ((pre ^ mask) ^ ((iter % kKItersPerSectionB) * kPartMmaShapeK * 2u))
            + (iter / kKItersPerSectionB) * kBSectionSizeBytes;
   }
-
-  static constexpr uint32_t scatter_closed_offset(
-      uint32_t t, uint32_t n_base, uint32_t iter, uint32_t i,
-      uint32_t frag, uint32_t pair, uint32_t base_div128) {
-    return (scatter_closed_base0(t, n_base, iter, base_div128)
-            ^ (pair * 16u))
-           + i * 16u * kRowBytesB + frag * 8u * kRowBytesB;
-  }
-
-  static constexpr bool scatter_closed_form_matches() {
-    // Base phases are sampled: the base enters both formulas identically under &7.
-    constexpr uint32_t bases[3] = {0u, 3u, 7u};
-    for (uint32_t t = 0; t < 32u; t++)
-      for (uint32_t w = 0; w < kNScatterWarps; w++)
-        for (uint32_t iter = 0; iter < BlockShape::K / kPartMmaShapeK; iter++)
-          for (uint32_t b = 0; b < 3u; b++)
-            for (uint32_t i = 0; i < WarpShape::N / 16u; i++)
-              for (uint32_t frag = 0; frag < 2u; frag++)
-                for (uint32_t pair = 0; pair < 2u; pair++)
-                  if (scatter_ref_offset(t, w * WarpShape::N, iter, i,
-                                         frag, pair, bases[b])
-                      != scatter_closed_offset(t, w * WarpShape::N, iter,
-                                               i, frag, pair, bases[b]))
-                    return false;
-    return true;
-  }
-
-  static_assert(scatter_closed_form_matches(),
-                "TCGEN05: closed-form scatter offsets diverge from the "
-                "reference element-wise swizzle formula");
 
   Ctx &ctx;
   SharedStorage &smem;
@@ -125,8 +78,6 @@ public:
   alignas(16) uint32_t regs_qb[2][ElementB::kBits * (16 / ElementA::kBits)];
   // Dequantised B in RMEM, pre-r2s: the per-thread slice of the BlockN x BlockK tile.
   alignas(16) uint32_t regs_b_tmp[2][WarpShape::N * kPartMmaShapeK * ElementA::kBits / 32 / 32];
-  // Post-t2r RMEM accumulator read by the epilogue.
-  typename MmaOpClass::CRegisters regs_c;
 
   CUDA_INLINE
   TCGEN05(Ctx &ctx_, ArithClass &arith_)
@@ -134,11 +85,8 @@ public:
 
   CUDA_INLINE
   void zero_accum() {
-    // scale_d drives overwrite-vs-accumulate on the TMEM side; zero the RMEM
-    // regs so the epilogue is defined if no K-iter fires.
-    uint32_t *p = reinterpret_cast<uint32_t *>(regs_c);
-    PRAGMA_UNROLL
-    for (uint32_t i = 0; i < sizeof(regs_c) / 4; i++) p[i] = 0;
+    // The tile's first tcgen05.mma overwrites TMEM D via scale_d; the
+    // accumulator never lands in RMEM before drain_accum.
     first_issue_ = true;
   }
 
@@ -166,6 +114,10 @@ public:
                 "TCGEN05: ElementA must be BFloat16. fp16 A requires "
                 "a parallel instruction-descriptor + scatter path "
                 "that is not wired up.");
+  static_assert(std::is_same<ElementC, BFloat16>::value,
+                "TCGEN05: ElementC must be BFloat16. drain_accum bypasses "
+                "smem_writer and converts with __floats2bfloat162_rn, so any "
+                "other c_dtype would receive bf16 bit patterns.");
   static_assert(!Ctx::kReduceOverlapLastStageOnly,
                 "TCGEN05: reduce_overlap_last_stage_only is not "
                 "supported (untested interaction with the b_dequant "
@@ -234,11 +186,12 @@ public:
         }
       }
     }
-    // Cross-proxy ordering: bar.sync alone gives only generic-proxy ordering.
-    // The fence must sit here rather than at the end of transform_b; there the
-    // dequant is register-only, so ptxas sinks it past the UMMA and each issue
-    // formally reads unpublished data.
-    fence_proxy_async_shared_cta();
+    // Cross-proxy ordering: bar.sync alone gives only generic-proxy ordering,
+    // and tcgen05.mma reads B through the async proxy. The fence must sit here
+    // rather than at the end of transform_b; there the dequant is
+    // register-only, so ptxas sinks it past the UMMA and each issue formally
+    // reads unpublished data.
+    tma_fence_async_shared();
     // bar.sync over math threads only; producers are mid gmem->smem load.
     ctx.sync_math_threads();
 
@@ -414,11 +367,6 @@ public:
   template <class T = uint32_t>
   CUDA_INLINE T *regs_b_as_ptr() {
     return reinterpret_cast<T *>(regs_b_tmp);
-  }
-
-  template <class T = uint32_t>
-  CUDA_INLINE T *regs_c_as_ptr(uint32_t buffer_id = 0) {
-    return reinterpret_cast<T *>(regs_c);
   }
 
 private:

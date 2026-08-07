@@ -105,8 +105,9 @@ public:
                     kDColOffset + BlockShape::M <=
                         SharedStorage::kTcgen05TmemCols,
                 "TCGEN05_TS: staging depth must fit the TMEM reservation");
-  // kTsWaitIter is reached at mainloop index kWarpIters - 3, which must exist
-  // and precede the consumer.arrive at index kWarpIters - 2.
+  // The mainloop stages one iter ahead -- index i calls transform_b(i + 1) --
+  // so kTsWaitIter = kWarpIters - 2 is reached at mainloop index kWarpIters - 3,
+  // which must exist and precede the consumer.arrive at index kWarpIters - 2.
   static_assert(kNumTsGroups == 1 || kTsSlotsPerStage >= 3,
                 "TCGEN05_TS: multi-group staging needs the WAR wait one warp "
                 "iter ahead of the mainloop's consumer.arrive");
@@ -360,12 +361,6 @@ public:
   template <class T = uint32_t>
   CUDA_INLINE T *regs_b_as_ptr() {
     return reinterpret_cast<T *>(regs_qb);
-  }
-
-  template <class T = uint32_t>
-  CUDA_INLINE T *regs_c_as_ptr(uint32_t buffer_id = 0) {
-    // The accumulator lives in TMEM until final_regs_c_as_ptr drains it.
-    return reinterpret_cast<T *>(regs_a);
   }
 
 private:

@@ -338,33 +338,22 @@ class Tcgen05OpClassImpl:
         # tcgen05.mma writes a BlockM x BlockN accumulator to TMEM; the epilogue
         # t2r reads it back distributed over the epilogue warps. Per-thread
         # CRegisters count = warp_m * warp_n * cd_bits / (32 lanes * 32 bits).
-        if warp_shape is not None:
-            cd_bits = DTYPE_BIT_WIDTH_MAP[self.cd_dtype]
-            self.reg_cd_count = warp_shape[0] * warp_shape[1] * cd_bits // (32 * 32)
-        else:
-            self.reg_cd_count = calc_reg_count(m, n, self.cd_dtype) // 4
+        if warp_shape is None:
+            raise ValueError("tcgen05 requires warp_shape to size the epilogue t2r tile")
+        cd_bits = DTYPE_BIT_WIDTH_MAP[self.cd_dtype]
+        self.reg_cd_count = warp_shape[0] * warp_shape[1] * cd_bits // (32 * 32)
 
-        if self.cd_dtype == "f16":
-            self.val_type_cd = "half"
-            self.reg_cd_type = "uint32_t"
-        elif self.cd_dtype == "bf16":
-            self.val_type_cd = "nv_bfloat16"
-            self.reg_cd_type = "uint32_t"
-        elif self.cd_dtype == "f32":
-            self.val_type_cd = "float"
-            self.reg_cd_type = "float"
-        elif self.cd_dtype == "s32":
-            self.val_type_cd = "int32_t"
-            self.reg_cd_type = "uint32_t"
-        else:
-            raise ValueError(f"Invalid cd_dtype for tcgen05: {cd_dtype}")
+        # Both mainloops accumulate in f32 TMEM, and tune/sm100.py rejects
+        # f16 accumulation, so no other accumulator type reaches here.
+        if self.cd_dtype != "f32":
+            raise ValueError(f"tcgen05 accumulates in f32, got cd_dtype: {cd_dtype}")
+        self.val_type_cd = "float"
+        self.reg_cd_type = "float"
 
         for name in ["a", "b"]:
             dtype = getattr(self, f"{name}_dtype")
             if dtype not in TCGEN05_OPERAND_FORMAT_MAP:
                 raise ValueError(f"Invalid {name}_dtype for tcgen05: {dtype}")
-        if self.cd_dtype not in TCGEN05_ACCUM_FORMAT_MAP:
-            raise ValueError(f"Invalid cd_dtype for tcgen05: {cd_dtype}")
 
     def to_cpp_str(self, include_class_name=False):
         lines = [
