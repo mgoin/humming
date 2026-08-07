@@ -53,6 +53,45 @@ def test_ts_opt_in_config(shape_m, block_m):
 
 
 @pytest.mark.parametrize(
+    "overrides,num_stages",
+    [
+        # uint4's zero-point-folded uint_to_f16 hides a fifth stage; uint8+zp,
+        # the one bf16 arm that splits its exponent offset across two
+        # multiplies, peaks at three and loses 8% by five.
+        ({}, 5),
+        ({"has_zero_point": False}, 4),
+        ({"b_dtype": dtypes.uint8}, 3),
+        ({"b_dtype": dtypes.uint8, "has_zero_point": False}, 4),
+        ({"b_dtype": dtypes.uint2}, 4),
+        ({"b_dtype": dtypes.float4e2m1, "has_zero_point": False}, 4),
+        # An fp zero point is a post-dequant subtract rather than a folded
+        # bias, so it takes the zero-point-free depth on both widths.
+        ({"is_fp_zero_point": True}, 4),
+        ({"b_dtype": dtypes.uint8, "is_fp_zero_point": True}, 4),
+        # ElementA picks the arm, not the depth: fp16 uint4 measures the same.
+        ({"a_dtype": dtypes.float16, "c_dtype": dtypes.float16, "bs_dtype": dtypes.float16}, 5),
+    ],
+    ids=str,
+)
+def test_ts_num_stages_is_per_dequant_arm(overrides, num_stages):
+    """TS pipeline depth is tuned per weight dtype, not capped globally."""
+    config = get_heuristics_config(_layer_config(mma_type=MmaType.TCGEN05, **overrides), shape_m=2048)
+    assert config["num_stages"] == num_stages
+
+
+def test_ts_grouped_keeps_the_default_pipeline():
+    """Grouped tiles a short K per expert; both tuned dense depths lose
+    1.6-3.8% at E=8, so the grouped scheduler keeps four stages."""
+    config = get_heuristics_config(
+        _layer_config(mma_type=MmaType.TCGEN05, num_experts=8),
+        shape_m=1024,
+        gemm_type=GemmType.GROUPED_CONTIGUOUS,
+    )
+    assert config["use_tcgen05_ts"] is True
+    assert config["num_stages"] == 4
+
+
+@pytest.mark.parametrize(
     "overrides",
     [
         {},
