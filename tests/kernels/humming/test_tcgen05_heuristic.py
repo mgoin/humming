@@ -60,8 +60,8 @@ def test_ts_opt_in_config(shape_m):
     assert config["num_stages"] >= 3
     assert config["use_warp_spec"] is True
     assert config["use_tma"] is True
-    # No cross-CTA partial-K reduction in the drain, and a group weight scale
-    # with a zero point trips the launcher's BZP assert under TMA.
+    # No cross-CTA partial-K reduction in the drain, and BZP is pinned to the
+    # legacy loader.
     assert config["use_stream_k"] is False
     assert config["use_tma_bzp"] is False
     assert config["raster_group_m"] == 1

@@ -157,8 +157,8 @@ class Sm100Heuristics(Sm80Heuristics):
             "use_tma": True,
             "use_cp_async": False,
             "use_mbarrier": True,
-            # A group weight scale with a zero point trips the launcher's BZP
-            # assert under TMA, and BZP is small, so keep it on cp.async.
+            # TODO: TMA for BZP measures 7-21% faster on TS and bit-identical,
+            # but is unaudited across the packed layouts, so BZP stays legacy.
             "use_tma_bzp": False,
             # The TS epilogue has no cross-CTA partial-K reduction, so stream-K
             # would corrupt any output whose K is split across CTAs.
