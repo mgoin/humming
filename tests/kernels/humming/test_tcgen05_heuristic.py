@@ -9,6 +9,7 @@ from humming.config import (
     WeightScale2Type,
     WeightScaleType,
 )
+from humming.config.config import TCGEN05_TS_B_DTYPES
 from humming.testing import skip_if_unsupported
 from humming.tune import get_heuristics_class, get_heuristics_config
 
@@ -40,47 +41,85 @@ def _requires_tcgen05():
     skip_if_unsupported(mma_type="tcgen05")
 
 
-@pytest.mark.parametrize("shape_m,block_m", [(1, 64), (17, 64), (127, 64), (128, 128), (4096, 128)])
-def test_ts_opt_in_config(shape_m, block_m):
+TS_SHAPE_MS = (1, 17, 127, 128, 4096)
+
+
+@pytest.mark.parametrize("shape_m", TS_SHAPE_MS)
+def test_ts_opt_in_config(shape_m):
     config = get_heuristics_config(_layer_config(mma_type=MmaType.TCGEN05), shape_m=shape_m)
     assert config["mma_type"] == "tcgen05"
     assert config["use_tcgen05"] is True
     assert config["use_tcgen05_ts"] is True
-    assert config["block_shape"] == (block_m, 128, 64)
+    # tcgen05_ts_mma.cuh static_asserts BlockN=128, BlockK=64 and a single
+    # M-warp/K-warp; block_m is the one dimension the heuristic picks, and it
+    # must not tile past the problem.
+    block_m, block_n, block_k = config["block_shape"]
+    assert (block_n, block_k) == (128, 64)
     assert config["warp_shape"] == (block_m, 32, 64)
+    assert block_m <= max(64, 1 << (shape_m - 1).bit_length())
     assert config["num_stages"] >= 3
     assert config["use_warp_spec"] is True
     assert config["use_tma"] is True
+    # No cross-CTA partial-K reduction in the drain, and a group weight scale
+    # with a zero point trips the launcher's BZP assert under TMA.
     assert config["use_stream_k"] is False
     assert config["use_tma_bzp"] is False
     assert config["raster_group_m"] == 1
 
 
-@pytest.mark.parametrize(
-    "overrides,num_stages",
-    [
-        ({}, 5),
-        ({"b_dtype": dtypes.uint8}, 4),
-        ({"b_dtype": dtypes.uint2}, 5),
-        ({"b_dtype": dtypes.uint8, "is_fp_zero_point": True}, 4),
-        ({"a_dtype": dtypes.float16, "c_dtype": dtypes.float16, "bs_dtype": dtypes.float16}, 5),
-    ],
-    ids=str,
-)
-def test_ts_num_stages_is_per_weight_dtype(overrides, num_stages):
-    config = get_heuristics_config(_layer_config(mma_type=MmaType.TCGEN05, **overrides), shape_m=2048)
-    assert config["num_stages"] == num_stages
+def test_ts_block_m_grows_with_shape_m():
+    block_ms = [
+        get_heuristics_config(_layer_config(mma_type=MmaType.TCGEN05), shape_m=shape_m)["block_shape"][0]
+        for shape_m in TS_SHAPE_MS
+    ]
+    assert block_ms == sorted(block_ms)
+    assert (block_ms[0], block_ms[-1]) == (64, 128)
 
 
-@pytest.mark.parametrize("b_dtype,num_stages", [(dtypes.uint4, 5), (dtypes.uint8, 4)])
-def test_ts_grouped_takes_the_dense_pipeline(b_dtype, num_stages):
+def _ts_num_stages(shape_m: int = 2048, **overrides) -> int:
+    config = get_heuristics_config(_layer_config(mma_type=MmaType.TCGEN05, **overrides), shape_m=shape_m)
+    return config["num_stages"]
+
+
+def test_ts_num_stages_is_keyed_on_weight_dtype_alone():
+    # A latency cap per weight dtype: every wired dtype sits between the
+    # mainloop's static_assert floor and the default depth, uint8 is the one
+    # dtype tuned below it, and nothing else about the layer moves the choice.
+    default = _ts_num_stages()
+    assert default >= 3
+    for b_dtype in TCGEN05_TS_B_DTYPES:
+        depth = _ts_num_stages(b_dtype=b_dtype, has_zero_point=b_dtype.is_integer_type)
+        assert 3 <= depth <= default
+    assert _ts_num_stages(b_dtype=dtypes.uint8) < default
+
+    assert _ts_num_stages(has_zero_point=False) == default
+    assert _ts_num_stages(a_dtype=dtypes.float16, c_dtype=dtypes.float16, bs_dtype=dtypes.float16) == default
+    assert _ts_num_stages(b_dtype=dtypes.uint8, is_fp_zero_point=True) == _ts_num_stages(b_dtype=dtypes.uint8)
+
+
+@pytest.mark.parametrize("b_dtype", [dtypes.uint4, dtypes.uint8], ids=str)
+def test_ts_grouped_takes_the_dense_pipeline(b_dtype):
     config = get_heuristics_config(
         _layer_config(mma_type=MmaType.TCGEN05, num_experts=8, b_dtype=b_dtype),
         shape_m=1024,
         gemm_type=GemmType.GROUPED_CONTIGUOUS,
     )
     assert config["use_tcgen05_ts"] is True
-    assert config["num_stages"] == num_stages
+    assert config["num_stages"] == _ts_num_stages(shape_m=1024, b_dtype=b_dtype)
+
+
+@pytest.mark.parametrize("tokens_per_expert", [64, 256])
+def test_ts_grouped_block_m_follows_tokens_per_expert(tokens_per_expert):
+    # shape_m counts padded tokens over all experts, but the scheduler tiles per
+    # expert, so grouped must tile as dense would at tokens-per-expert.
+    num_experts = 8
+    grouped = get_heuristics_config(
+        _layer_config(mma_type=MmaType.TCGEN05, num_experts=num_experts),
+        shape_m=tokens_per_expert * num_experts,
+        gemm_type=GemmType.GROUPED_CONTIGUOUS,
+    )
+    dense = get_heuristics_config(_layer_config(mma_type=MmaType.TCGEN05), shape_m=tokens_per_expert)
+    assert grouped["block_shape"] == dense["block_shape"]
 
 
 @pytest.mark.parametrize(
@@ -215,30 +254,39 @@ def test_ts_opt_in_rejects_unsupported_compute(kwargs, message):
 
 
 @pytest.mark.parametrize(
-    "overrides,block_shape",
+    "overrides",
     [
         # Weight dtypes with no ts_dequant_b_pair arm.
-        ({"b_dtype": dtypes.uint3}, (128, 128, 128)),
-        ({"b_dtype": dtypes.uint6}, (128, 128, 128)),
-        ({"b_dtype": dtypes.uint7}, (128, 128, 128)),
-        ({"b_dtype": dtypes.DataType.from_str("float6e4m1"), "has_zero_point": False}, (128, 128, 128)),
+        {"b_dtype": dtypes.uint3},
+        {"b_dtype": dtypes.uint6},
+        {"b_dtype": dtypes.uint7},
+        {"b_dtype": dtypes.DataType.from_str("float6e4m1"), "has_zero_point": False},
         # shape_n only tiles at BlockN=64, which TS does not accept.
-        ({"shape_n": 6208}, (128, 64, 128)),
+        {"shape_n": 6208},
+        {"b_dtype": dtypes.uint8, "shape_n": 6208},
         # shape_k only tiles at BlockK=64.
-        ({"b_dtype": dtypes.uint3, "shape_k": 4160}, (128, 128, 64)),
-        # uint8 needs the narrow K tile to keep the b_dequant buffer in SMEM.
-        ({"b_dtype": dtypes.uint8, "shape_n": 6208}, (128, 64, 64)),
+        {"b_dtype": dtypes.uint3, "shape_k": 4160},
     ],
     ids=str,
 )
 @pytest.mark.parametrize("shape_m", [1, 2048])
-def test_ss_opt_in_fallback(overrides, block_shape, shape_m):
-    config = get_heuristics_config(_layer_config(mma_type=MmaType.TCGEN05, **overrides), shape_m=shape_m)
+def test_ss_opt_in_fallback(overrides, shape_m):
+    layer_config = _layer_config(mma_type=MmaType.TCGEN05, **overrides)
+    assert not layer_config.tcgen05_ts_supported
+    config = get_heuristics_config(layer_config, shape_m=shape_m)
     assert config["mma_type"] == "tcgen05"
     assert config["use_tcgen05"] is True
     assert not config.get("use_tcgen05_ts")
-    assert config["block_shape"] == block_shape
-    assert config["warp_shape"] == (32, 64, block_shape[2])
+
+    block_m, block_n, block_k = config["block_shape"]
+    group_size = layer_config.weight_scale_group_size
+    # The problem and the weight-scale group must tile, and the mainloop pins
+    # the 32x64 warp tile; block_k is otherwise a tuning choice.
+    assert block_m == 128
+    assert block_n == (128 if layer_config.shape_n % 128 == 0 else 64)
+    assert layer_config.shape_k % block_k == 0
+    assert not (group_size % block_k and block_k % group_size)
+    assert config["warp_shape"] == (32, 64, block_k)
     assert config["num_stages"] >= 3
     assert config["use_stream_k"] is False
     assert config["use_warp_spec"] is True

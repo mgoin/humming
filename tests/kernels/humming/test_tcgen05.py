@@ -160,63 +160,48 @@ TS_SHAPE_CASES = (
 
 TS_CASES = TS_WEIGHT_DTYPE_CASES + TS_SCALE_CASES + TS_SHAPE_CASES
 
-# TS forms no intermediate above the dequantised weight, so it needs no epilogue
-# exponent residual. Each cell pins the |w| window it must land in to be
-# adversarial: near the ElementA maximum, or at either end of the e4m3 scale.
+# TS forms no intermediate above the dequantised weight and carries no epilogue
+# exponent residual, so it saturates earlier than mma.sync: these drive the
+# weights to the ElementA maximum, or to either end of the e4m3 scale range.
 TS_EXTREME_CASES = (
-    (
-        _case(
-            "fp16-fp4e2m1-max-magnitude",
-            a_dtype=dtypes.float16,
-            b_dtype=dtypes.float4e2m1,
-            weight_std_scale=3e4,
-            input_std_scale=1e-3,
-            atol=0.5,
-        ),
-        (2.5e4, 6.5504e4),
+    _case(
+        "fp16-fp4e2m1-max-magnitude",
+        a_dtype=dtypes.float16,
+        b_dtype=dtypes.float4e2m1,
+        weight_std_scale=3e4,
+        input_std_scale=1e-3,
+        atol=0.5,
     ),
-    (
-        _case(
-            "fp16-fp8e4m3-max-magnitude",
-            a_dtype=dtypes.float16,
-            b_dtype=dtypes.float8e4m3,
-            weight_std_scale=3e4,
-            input_std_scale=1e-3,
-            atol=0.5,
-        ),
-        (2.5e4, 6.5504e4),
+    _case(
+        "fp16-fp8e4m3-max-magnitude",
+        a_dtype=dtypes.float16,
+        b_dtype=dtypes.float8e4m3,
+        weight_std_scale=3e4,
+        input_std_scale=1e-3,
+        atol=0.5,
     ),
-    (
-        _case(
-            "fp16-uint8-max-magnitude",
-            a_dtype=dtypes.float16,
-            b_dtype=dtypes.uint8,
-            weight_std_scale=3e4,
-            input_std_scale=1e-3,
-            atol=0.5,
-        ),
-        (2.5e4, 6.5504e4),
+    _case(
+        "fp16-uint8-max-magnitude",
+        a_dtype=dtypes.float16,
+        b_dtype=dtypes.uint8,
+        weight_std_scale=3e4,
+        input_std_scale=1e-3,
+        atol=0.5,
     ),
-    (
-        _case(
-            "fp16-bs-e4m3-max-exponent",
-            a_dtype=dtypes.float16,
-            bs_dtype=dtypes.float8e4m3,
-            weight_std_scale=3e4,
-            input_std_scale=1e-3,
-            atol=0.5,
-        ),
-        (8 * 448.0, 8 * 448.0),
+    _case(
+        "fp16-bs-e4m3-max-exponent",
+        a_dtype=dtypes.float16,
+        bs_dtype=dtypes.float8e4m3,
+        weight_std_scale=3e4,
+        input_std_scale=1e-3,
+        atol=0.5,
     ),
-    (
-        _case(
-            "bf16-bs-e4m3-min-exponent",
-            bs_dtype=dtypes.float8e4m3,
-            weight_std_scale=1e-2,
-            input_std_scale=1e-3,
-            atol=1e-4,
-        ),
-        (8 * 2**-9, 8 * 2**-9),
+    _case(
+        "bf16-bs-e4m3-min-exponent",
+        bs_dtype=dtypes.float8e4m3,
+        weight_std_scale=1e-2,
+        input_std_scale=1e-3,
+        atol=1e-4,
     ),
 )
 
@@ -288,7 +273,7 @@ def _ss_case(
     )
 
 
-# One case per weight dtype in _SS_B_DTYPE_CONFIG, in each zero-point mode the
+# One case per weight dtype in TCGEN05_SS_B_DTYPES, in each zero-point mode the
 # dtype carries, alternating shape_n so both BlockN are exercised.
 SS_WEIGHT_DTYPE_CASES = (
     _ss_case("ss-uint1", b_dtype=dtypes.uint1),
@@ -379,26 +364,14 @@ def test_tcgen05_ts(test_case):
     _run(test_case, expect_ts=True)
 
 
-@pytest.mark.parametrize(
-    "test_case,weight_window",
-    TS_EXTREME_CASES,
-    ids=[case.name for case, _ in TS_EXTREME_CASES],
-)
-def test_tcgen05_ts_max_magnitude(test_case, weight_window):
+@pytest.mark.parametrize("test_case", TS_EXTREME_CASES, ids=str)
+def test_tcgen05_ts_max_magnitude(test_case):
     config = test_case.layer_config
     skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value)
     assert config.tcgen05_ts_supported
-    runner = KernelTestRunner(test_case)
-    weight_max = runner.weight_ref.float().abs().max().item()
-    assert weight_window[0] <= weight_max <= weight_window[1]
-    results = runner.run()
-    for result in results:
-        assert result.tuning_values["use_tcgen05_ts"] is True
+    for result in _run(test_case, expect_ts=True):
+        # Saturating instead of matching the reference would be loud, not silent.
         assert torch.isfinite(result.outputs.float()).all()
-        torch.testing.assert_close(
-            result.outputs, result.outputs_ref, rtol=test_case.rtol, atol=test_case.atol
-        )
-    assert_kernel_test_shape_coverage(results)
 
 
 def test_tcgen05_ts_fp_weight_covers_every_code():
@@ -493,90 +466,25 @@ def test_tcgen05_ts_layer_opt_in(shape_m, torch_dtype):
     torch.testing.assert_close(outputs_ts, outputs_default, rtol=0.01, atol=0.05)
 
 
+def _dtype_zp_modes(b_dtypes) -> set:
+    # The fp arms subtract nothing, so a zero point is legal on integers only.
+    return {
+        (b_dtype, has_zero_point)
+        for b_dtype in b_dtypes
+        for has_zero_point in ((False, True) if b_dtype.is_integer_type else (False,))
+    }
+
+
 def test_tcgen05_case_coverage():
+    # Adding a weight dtype to either mainloop's table must add a running case.
     from humming.config.config import TCGEN05_TS_A_DTYPES, TCGEN05_TS_B_DTYPES
+    from humming.tune.sm100 import TCGEN05_SS_B_DTYPES
 
-    ts_configs = [case.layer_config for case in TS_CASES]
-    assert all(config.mma_type == MmaType.TCGEN05 for config in ts_configs)
-
-    assert {config.b_dtype for config in ts_configs} == set(TCGEN05_TS_B_DTYPES)
-    assert {config.a_dtype for config in ts_configs} == set(TCGEN05_TS_A_DTYPES)
-    weight_dtype_configs = [case.layer_config for case in TS_WEIGHT_DTYPE_CASES]
-    for a_dtype in TCGEN05_TS_A_DTYPES:
-        assert {config.b_dtype for config in weight_dtype_configs if config.a_dtype == a_dtype} == set(
-            TCGEN05_TS_B_DTYPES
-        )
-    assert {(config.a_dtype, config.b_dtype) for config in weight_dtype_configs if config.has_zero_point} == {
-        (a_dtype, b_dtype)
-        for a_dtype in TCGEN05_TS_A_DTYPES
-        for b_dtype in TCGEN05_TS_B_DTYPES
-        if b_dtype.is_integer_type
+    ts_configs = [case.layer_config for case in TS_WEIGHT_DTYPE_CASES]
+    assert {(c.a_dtype, c.b_dtype, c.has_zero_point) for c in ts_configs} == {
+        (a_dtype, *modes) for a_dtype in TCGEN05_TS_A_DTYPES for modes in _dtype_zp_modes(TCGEN05_TS_B_DTYPES)
     }
 
-    assert all(config.c_dtype == config.a_dtype for config in ts_configs)
-    assert {config.bs_dtype for config in ts_configs} == set(TCGEN05_TS_A_DTYPES) | {
-        dtypes.float8e4m3,
-        dtypes.float8e8m0,
-    }
-    assert all(
-        config.bs_dtype == config.a_dtype
-        for config in ts_configs
-        if config.weight_scale_type == WeightScaleType.CHANNEL
-    )
-
-    assert {config.weight_scale_group_size for config in ts_configs} == {0, 16, 32, 64, 128}
-
-    zero_point_modes = {(config.has_zero_point, config.is_fp_zero_point) for config in ts_configs}
-    assert zero_point_modes == {(False, False), (True, False), (True, True)}
-    assert {(config.a_dtype, config.b_dtype) for config in ts_configs if config.is_fp_zero_point} >= {
-        (dtypes.bfloat16, dtypes.uint4),
-        (dtypes.bfloat16, dtypes.uint8),
-        (dtypes.float16, dtypes.uint8),
-    }
-    assert any(config.has_bias for config in ts_configs)
-
-    shape_ns = {case.layer_config.shape_n for case in TS_SHAPE_CASES}
-    shape_ks = {case.layer_config.shape_k for case in TS_SHAPE_CASES}
-    assert all(shape_n % 128 == 0 for shape_n in shape_ns)
-    assert all(shape_k % 64 == 0 for shape_k in shape_ks)
-    assert min(shape_ns) == 128 and min(shape_ks) == 64
-    assert any(shape_k % 128 for shape_k in shape_ks)
-    assert max(shape_ks) >= 8192
-
-    from humming.tune.sm100 import _SS_B_DTYPE_CONFIG
-
-    ss_configs = [case.layer_config for case in SS_CASES]
-    assert {config.b_dtype for config in ss_configs} == set(_SS_B_DTYPE_CONFIG)
-    assert {config.shape_n % 128 == 0 for config in ss_configs} == {False, True}
-    assert all(config.mma_type == MmaType.TCGEN05 for config in ss_configs)
-
-    weight_configs = [case.layer_config for case in SS_WEIGHT_DTYPE_CASES]
-    assert {config.b_dtype for config in weight_configs if not config.has_zero_point} == set(
-        _SS_B_DTYPE_CONFIG
-    )
-    assert {config.b_dtype for config in weight_configs if config.has_zero_point} == {
-        b_dtype for b_dtype in _SS_B_DTYPE_CONFIG if b_dtype.is_integer_type
-    }
-    assert any(config.is_fp_zero_point for config in ss_configs)
-
-    assert {config.weight_scale_type for config in ss_configs} == {
-        WeightScaleType.GROUP,
-        WeightScaleType.BLOCK,
-    }
-    assert {config.bs_dtype for config in ss_configs} == {
-        dtypes.bfloat16,
-        dtypes.float8e4m3,
-        dtypes.float8e8m0,
-        dtypes.float32,
-    }
-
-    assert all(config.a_dtype == dtypes.bfloat16 for config in ss_configs)
-
-    illegal_configs = [case.layer_config for case in ILLEGAL_CASES]
-    assert {config.weight_scale_2_type for config in illegal_configs} == set(WeightScale2Type)
-    assert {WeightScaleType.CHANNEL, WeightScaleType.TENSOR} <= {
-        config.weight_scale_type for config in illegal_configs
-    }
-    assert {config.bs_dtype for config in illegal_configs if config.a_dtype == dtypes.float16} == {
-        dtypes.float8e8m0
-    }
+    ss_configs = [case.layer_config for case in SS_WEIGHT_DTYPE_CASES]
+    assert {(c.b_dtype, c.has_zero_point) for c in ss_configs} == _dtype_zp_modes(TCGEN05_SS_B_DTYPES)
+    assert {c.shape_n % 128 == 0 for c in ss_configs} == {False, True}

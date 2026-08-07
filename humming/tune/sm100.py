@@ -3,35 +3,41 @@ from humming.config import GemmType, LayerConfig, MmaType, WeightScale2Type, Wei
 from humming.tune.sm8x import Sm80Heuristics
 from humming.utils.smem import estimate_smem_size_layer
 
-# (block_k, max num_stages) per weight dtype; membership also gates SS.
-# Retune with benchmarks/bench_tcgen05_dtypes.py.
-_SS_B_DTYPE_CONFIG: dict[dtypes.DataType, tuple[int, int]] = {
-    dtypes.DataType.from_str(name): value
-    for name, value in {
-        "uint1": (128, 4),
-        "uint2": (128, 4),
-        "uint3": (128, 4),
-        "uint4": (128, 3),
-        "uint5": (128, 3),
-        "uint6": (128, 3),
-        "uint7": (128, 3),
-        "uint8": (64, 4),
-        "float3e1m1": (128, 4),
-        "float3e2m0": (128, 4),
-        "float4e2m1": (128, 3),
-        "float4e3m0": (128, 3),
-        "float5e2m2": (128, 3),
-        "float5e4m0": (128, 3),
-        "float6e2m3": (128, 3),
-        "float6e4m1": (128, 3),
-        "float7e2m4": (128, 3),
-        "float7e4m2": (128, 3),
-        "float7e6m0": (128, 3),
-        "float8e1m6": (128, 3),
-        "float8e4m3": (128, 3),
-        "float8e5m2": (128, 3),
-    }.items()
-}
+# Weight dtypes the SS mainloop is wired for; membership gates SS.
+TCGEN05_SS_B_DTYPES = tuple(
+    dtypes.DataType.from_str(name)
+    for name in (
+        "uint1",
+        "uint2",
+        "uint3",
+        "uint4",
+        "uint5",
+        "uint6",
+        "uint7",
+        "uint8",
+        "float3e1m1",
+        "float3e2m0",
+        "float4e2m1",
+        "float4e3m0",
+        "float5e2m2",
+        "float5e4m0",
+        "float6e2m3",
+        "float6e4m1",
+        "float7e2m4",
+        "float7e4m2",
+        "float7e6m0",
+        "float8e1m6",
+        "float8e4m3",
+        "float8e5m2",
+    )
+)
+
+# SS pipeline depth: _fit_num_stages takes the deepest that SMEM holds under
+# this cap, which is four stages up to 3-bit codes and three above, where the
+# bf16 b_dequant staging buffer binds at BlockK=128. Deeper than four measures
+# as noise, and no weight dtype wants a shallower pipeline than SMEM forces.
+# Retune with benchmarks/bench_tcgen05_dtypes.py --block_k --num_stages.
+_SS_MAX_NUM_STAGES = 4
 
 _SS_GROUP_BS_DTYPES = (
     dtypes.bfloat16,
@@ -44,7 +50,7 @@ _TS_GEMM_TYPES = (GemmType.DENSE, GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_
 
 # Per-dtype TS pipeline depth cap; five is the knee except for uint8, whose
 # stage is wide enough that a fifth costs throughput.
-# Retune with benchmarks/bench_ts_vs_ss.py.
+# Retune with benchmarks/bench_ts_vs_ss.py --b_dtype --num_stages.
 _TS_B_DTYPE_STAGES: dict[dtypes.DataType, int] = {
     dtypes.uint8: 4,
 }
@@ -73,7 +79,7 @@ class Sm100Heuristics(Sm80Heuristics):
             # the SS r2s scatter is written against bf16 bit patterns, and
             # drain_accum converts and writes the output as bf16.
             return False
-        if layer_config.b_dtype not in _SS_B_DTYPE_CONFIG:
+        if layer_config.b_dtype not in TCGEN05_SS_B_DTYPES:
             return False
         if layer_config.weight_scale_2_type != WeightScale2Type.NONE:
             return False
@@ -134,7 +140,7 @@ class Sm100Heuristics(Sm80Heuristics):
         else:
             # Grouped: shape_m counts padded tokens over all experts, but the
             # scheduler tiles per expert, so tokens-per-expert sets occupancy.
-            # Retune with benchmarks/bench_ts_moe.py.
+            # Retune with benchmarks/bench_ts_moe.py --block_m.
             tokens_per_expert = shape_m // max(layer_config.num_experts, 1)
             block_m = 128 if tokens_per_expert >= 128 else 64
 
@@ -176,10 +182,10 @@ class Sm100Heuristics(Sm80Heuristics):
         block_n = 128 if layer_config.shape_n % 128 == 0 else 64
 
         # BlockK=128 halves the K-iter count where shape_k and the group allow it.
-        block_k, num_stages = _SS_B_DTYPE_CONFIG[layer_config.b_dtype]
+        block_k = 128
         group_size = layer_config.weight_scale_group_size
         if layer_config.shape_k % block_k or (group_size % block_k and block_k % group_size):
-            block_k, num_stages = 64, 4
+            block_k = 64
 
         config = {
             "block_shape": (128, block_n, block_k),
@@ -196,7 +202,7 @@ class Sm100Heuristics(Sm80Heuristics):
             "use_stream_k": False,
             "raster_group_m": 1,
         }
-        config["num_stages"] = cls._fit_num_stages(layer_config, config, gemm_type, num_stages)
+        config["num_stages"] = cls._fit_num_stages(layer_config, config, gemm_type, _SS_MAX_NUM_STAGES)
         return config
 
     @classmethod

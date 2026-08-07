@@ -1,6 +1,10 @@
 """Drains a known TMEM pattern in the transposed orientation the TS-mode MMA
 produces and compares it against a Python model of gmem_writer's sectioned
 XOR-swizzled smem.reduce layout, independently of the mainloop.
+
+Driving the drain directly is the only way to sweep the XOR swizzle phase: an
+end-to-end GEMM gets whichever phase its SharedStorage layout happens to place
+smem.reduce at.
 """
 
 import ctypes
