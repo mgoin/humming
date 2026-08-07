@@ -157,9 +157,12 @@ class Sm100Heuristics(Sm80Heuristics):
             "use_tma": True,
             "use_cp_async": False,
             "use_mbarrier": True,
-            # TODO: TMA for BZP measures 7-21% faster on TS and bit-identical,
-            # but is unaudited across the packed layouts, so BZP stays legacy.
-            "use_tma_bzp": False,
+            # The TS packed zero point is the row-major [K/gs, N*zp_bits/32]
+            # array make_tma_desc_bzp already describes, so TMA loads it
+            # bit-identically and the load-bound mainloop keeps the 6-21% it
+            # buys on the 2- and 4-bit codes (uint8 is a wash, +-2% by shape).
+            # Retune with benchmarks/bench_ts_vs_ss.py --b_dtype.
+            "use_tma_bzp": True,
             # The TS epilogue has no cross-CTA partial-K reduction, so stream-K
             # would corrupt any output whose K is split across CTAs.
             "use_stream_k": False,
