@@ -94,8 +94,7 @@
 #define IF_USE_TCGEN05(x)
 #endif
 
-// TS mode stages the dequantised weights in TMEM (tcgen05.st), so it needs
-// the per-slot WAR mbarriers instead of SS mode's b_dequant SMEM buffer.
+// TS stages weights in TMEM, so it needs the WAR mbarriers, not b_dequant.
 #if HUMMING_USE_TCGEN05 && HUMMING_USE_TCGEN05_TS
 #define IF_USE_TCGEN05_TS(x) x
 #else
@@ -109,8 +108,7 @@
 #endif
 
 // `reduce` would overlay the last stage and everything after it, including
-// b_dequant, while the tcgen05 epilogue drains TMEM into `reduce` and the
-// producer may already be refilling stages.
+// b_dequant, which the tcgen05 epilogue drains into while the producer refills.
 #if HUMMING_USE_TCGEN05 && HUMMING_REDUCE_OVERLAP_LAST_STAGE_ONLY
 #error "use_tcgen05 is not supported with reduce_overlap_last_stage_only"
 #endif
@@ -190,10 +188,8 @@ public:
   static constexpr uint32_t kChannelBytesBZP = kChannelSizeBZP * sizeof(int4);
   static constexpr uint32_t kBiasBytes = kBiasSize * sizeof(int4);
 
-  // SS-mode tcgen05 staging for the dequantised B operand: one full
-  // (BlockN x BlockK) ElementA tile per ping-pong slot, indexed by
-  // `iter_id % 2` (not stage_id), so two slots cover the pipeline depth
-  // between an issue and the drain of the tcgen05.mma chain it feeds.
+  // SS-mode staging for dequantised B: one BlockN x BlockK ElementA tile per
+  // ping-pong slot, indexed by iter_id % 2.
   static constexpr uint32_t kNumBDequantBuffers = 2;
   static constexpr uint32_t kStageSizeBDequant = BlockShape::N * BlockShape::K * ElementA::kBits / 32 / 4;
 
@@ -218,9 +214,8 @@ public:
       IF_HAS_BIAS(alignas(128) int4 bias[kBiasSize];)
       IF_HAS_CHANNEL_INPUT_SCALE(alignas(128) int4 as_c[kChannelSizeAS];)
       StageStorage stages[kNumStages];
-      // alignas(128) is required by the Swizzle<3,4,3> the tcgen05.mma
-      // descriptor applies: the swizzle XORs bits [4,7) of the byte
-      // address, so a base below 128 B shifts the effective pattern.
+      // alignas(128): the descriptor's Swizzle<3,4,3> XORs bits [4,7) of the
+      // byte address, so a base below 128 B shifts the pattern.
       IF_USE_TCGEN05_SS(alignas(128) int4 b_dequant[kNumBDequantBuffers][kStageSizeBDequant];)
     };
     struct {
@@ -245,25 +240,21 @@ public:
   IF_USE_MBARRIER(alignas(128) uint64_t load_mbar[kNumStages + 2];)
   IF_USE_WARP_SPEC(uint64_t math_mbar[kNumMathMbarriers];)
 
-  // Per-CTA TMEM column index returned by tcgen05.alloc: the issuing warp
-  // writes it, every warp reads it after the alloc sync.
+  // TMEM column index from tcgen05.alloc; written by one warp, read by all.
   IF_USE_TCGEN05(alignas(16) uint32_t tcgen05_tmem_col;)
   // Accumulator commit/drain mbarrier: the epilogue waits it before t2r.
   IF_USE_TCGEN05(alignas(8) uint64_t tcgen05_mbar;)
-  // TS mode: one staging slot per 16-K warp iter, so a whole BlockK stage is
-  // resident in TMEM and the Transform2Mma handshake runs once per stage.
-  // kTcgen05TsGroups stages are resident at once, one mbarrier each.
+  // TS: one staging slot per 16-K warp iter, so a whole BlockK stage is resident;
+  // kTcgen05TsGroups stages resident at once, one mbarrier each.
   static constexpr uint32_t kTcgen05TsGroups = 2;
   static constexpr uint32_t kTcgen05TsSlots = kTcgen05TsGroups * (WarpShape::K / kPartMmaShapeK);
   static constexpr uint32_t kTcgen05TsMbars = kTcgen05TsGroups;
-  // WAR gate between the next stage's tcgen05.st and the in-flight MMA batch
-  // still reading the slots.
+  // WAR gate against the in-flight MMA batch still reading the slots.
   IF_USE_TCGEN05_TS(alignas(8) uint64_t tcgen05_ts_mbar[kTcgen05TsMbars];)
 
 #if HUMMING_USE_TCGEN05
-  // TMEM columns to allocate (power-of-2). SS: BlockN accumulator columns,
-  // BlockN <= 128. TS: kTcgen05TsSlots x 8 staging columns plus BlockM
-  // accumulator columns, since the TS accumulator is transposed (MmaN = BlockM).
+  // TMEM columns to allocate (power of two). SS: BlockN accumulator columns.
+  // TS: staging columns plus BlockM, since the TS accumulator is transposed.
 #if HUMMING_USE_TCGEN05_TS
   static constexpr uint32_t kTcgen05TmemCols =
       (8u * kTcgen05TsSlots + BlockShape::M) <= 128u ? 128u : 256u;

@@ -19,10 +19,8 @@ private:
   using ElementA = typename Ctx::ElementA;
 
   static constexpr bool kUseWgmma = Ctx::kUseWgmma;
-  // tcgen05.mma reads A straight from SMEM through its descriptor, so the
-  // s2r loader_a into RMEM is dead work for it. TS mode goes further and
-  // takes codes/scale/zp in the TS contract order (lane = weight row),
-  // bypassing loader_b's fragment gather and loader_bs/bzp's ownership.
+  // tcgen05.mma reads A from SMEM via its descriptor, so loader_a is skipped;
+  // TS mode also takes codes/scale/zp in contract order (lane = weight row).
   static constexpr bool kUseTcgen05 = Ctx::kMmaType == MmaType::TCGEN05;
   static constexpr bool kUseTcgen05Ts = kUseTcgen05 && Ctx::TuningConfig::kUseTcgen05Ts;
   static constexpr bool kUseMxmma = Ctx::kUseMxmma;
@@ -42,9 +40,7 @@ private:
   static constexpr bool kIsFpZeroPoint = Ctx::kIsFpZeroPoint;
   static constexpr bool kHasBias = Ctx::kHasBias;
 
-  // The TS group indexing below derives the scale/zp group straight from
-  // iter_id, which is the packed-K k_iter_id convention only when the packed
-  // layout is off (bf16 activations cannot select it either way).
+  // The TS group index below assumes iter_id == k_iter_id.
   static_assert(!kUseTcgen05Ts || !Ctx::kUsePackedKLayout,
                 "tcgen05 TS mode does not support the packed-K layout");
 
@@ -108,24 +104,19 @@ public:
     }
   }
 
-  // TS-mode contract loads. Thread (math warp w, lane l) owns weight row
-  // n = 32 * (w % 4) + l of the 128-row MMA-M tile:
-  //   * codes: the slot-paired layout of docs/tcgen05_ts_packing.md is
-  //     byte-compatible with loader_b's WarpN == 32 half-group gather, which
-  //     delivers row n's codes with no loader change;
-  //   * scale: ElementBS at smem.bs[n] (identity N order), decoded to
-  //     ElementA and broadcast to a pair;
-  //   * zp: folded into the per-lane dequant bias, format per weight dtype.
+  // TS contract loads for weight row n = 32 * (w % 4) + lane:
+  //   codes: loader_b's WarpN == 32 half-group gather, byte-compatible with the
+  //          slot-paired layout of docs/tcgen05_ts_packing.md;
+  //   scale: ElementBS at smem.bs[n], decoded to an ElementA pair;
+  //   zp:    folded into the per-lane dequant bias.
   CUDA_INLINE void load_stage_iter_ts(uint32_t stage_id, uint32_t iter_id, uint32_t buffer_id) {
     auto &smem = ctx.smem;
     uint32_t n = (ctx.warp_id() % 4u) * 32u + ctx.lane_id();
 
     loader_b.load(smem.stages[stage_id].b, mma.regs_qb_as_ptr(buffer_id), iter_id);
 
-    // Sub-stage group index within the stage. gs >= BlockK gives one group per
-    // stage; gs < BlockK is a multiple of the 16-K iter, so this iter lies
-    // entirely inside group (iter * kPartMmaShapeK) / gs. Scale and zp share
-    // the granularity, so one index drives both.
+    // gs >= BlockK gives one group per stage; otherwise gs is a multiple of the
+    // 16-K iter, so the iter lies entirely inside one group.
     uint32_t bs_group = 0;
     if constexpr (kIsGroupWeightScale && Ctx::kWeightScaleGroupSize < BlockShape::K) {
       bs_group = (iter_id * kPartMmaShapeK) / Ctx::kWeightScaleGroupSize;
@@ -142,11 +133,8 @@ public:
         mma.regs_bs2_ts[buffer_id] = (s << 16) | s;
       } else {
         // 8-bit software float scale (e8m0 / e4m3): broadcast the byte to the
-        // top of both 16-bit halves and take the same fp_to_fp + 2^kOff decode
-        // the generic dequant path uses, so the value handed to transform_b is
-        // a plain ElementA pair. e8m0 -> bf16 is kOff == 0, i.e. exp << 7
-        // (shared bias 127); e == 0 flushes to zero and e == 0xFF becomes inf,
-        // matching dequant_single on the mma.sync path.
+        // top of both halves, then fp_to_fp + 2^kOff. e == 0 flushes to zero
+        // and e == 0xFF becomes inf, matching dequant_single.
         static_assert(ElementBS::kBits == 8, "TS weight scale: 16- or 8-bit");
         using Scalar2 = typename F16Conversion<ElementA>::scalar_t2;
         constexpr uint32_t kScaleOff = get_dtype_dequant_exp_offset<ElementA, ElementBS>();
@@ -157,15 +145,10 @@ public:
       }
     }
 
-    // Two independent axes, conflated before fp16 A existed:
-    //   * the bias FORMAT follows the dequant arm ts_dequant_b_pair picks --
-    //     uint_to_f16 wants an ElementA x2 subtrahend (base + zp), the
-    //     normalized_uint_to_fp arm wants the raw integer zp;
-    //   * the packed zp STREAM is nibble-wide up to 4 bits and byte-wide above
-    //     (ts_packing.pack_zero_point_tcgen05_ts).
-    // bf16 A ties them (uint8 is its only >4-bit dtype and it takes the
-    // normalized arm); fp16 A has 10 mantissa bits, so uint8 takes
-    // uint_to_f16 out of a byte-wide stream.
+    // Bias format follows the dequant arm (uint_to_f16 wants an ElementA x2
+    // subtrahend, normalized_uint_to_fp wants the raw integer zp); the packed zp
+    // stream is nibble-wide up to 4 bits and byte-wide above. The two axes
+    // coincide only on bf16 A; on fp16 A uint8 takes uint_to_f16 from a byte stream.
     constexpr uint32_t kBBits = Ctx::ElementB::kBits;
     constexpr bool kBiasIsF16x2 =
         Ctx::ElementB::kIsIntegerType && kBBits <= ElementA::kMantissaBits;
@@ -174,10 +157,8 @@ public:
     // subtracting (base | zp) emits code - zp.
     constexpr uint32_t kBiasBase = std::is_same<ElementA, Float16>::value ? 0x64006400u : 0x43004300u;
     if constexpr (kIsFpZeroPoint) {
-      // A per-lane ElementA in the same [K / gs, N] stream layout as the
-      // scale. Both dequant arms hand transform_b the raw code at full
-      // magnitude, so the zp is subtracted there, post-dequant and pre-scale;
-      // the bias register only carries the raw-code dequant base.
+      // Both dequant arms return the raw code at full magnitude, so the fp zp is
+      // subtracted in transform_b post-dequant; the bias carries only the base.
       mma.regs_bias2_ts[buffer_id] = kBiasIsF16x2 ? kBiasBase : 0u;
       uint32_t z = 0u;
       if constexpr (kHasZeroPoint) z = zp_elem<uint16_t>(stage_id, bs_group * BlockShape::N + n);
@@ -199,9 +180,8 @@ public:
     }
   }
 
-  // One zp element of the packed stream. Group zp is staged per stage;
-  // channelwise zp is K-invariant, staged once in bzp_c, and always has
-  // bs_group == 0, so only the base pointer differs.
+  // One zp element of the packed stream. Channelwise zp is K-invariant (staged
+  // once in bzp_c, always bs_group == 0), so only the base pointer differs.
   template <class T>
   CUDA_INLINE uint32_t zp_elem(uint32_t stage_id, uint32_t offset) {
     auto &smem = ctx.smem;

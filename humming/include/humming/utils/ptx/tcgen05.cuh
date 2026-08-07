@@ -1,60 +1,13 @@
 #pragma once
-//
-// PTX wrappers for Blackwell tcgen05.mma (UMMA).
-//
-// Targets sm_100a / sm_103a. The wrappers exposed here cover the minimum
-// surface needed to drive a W4A16-style mainloop:
-//
-//   * tcgen05_alloc / dealloc / relinquish_alloc_permit
-//     -- per-CTA TMEM column allocation (must precede any tcgen05.mma)
-//
-//   * tcgen05_smem_desc()
-//     -- construct an A or B SMEM operand descriptor (same swizzle scheme
-//        as wgmma's matrix descriptor; details in `make_smem_desc()`)
-//
-//   * tcgen05_instr_desc()
-//     -- pack the instruction descriptor required by the {sparse,dense}
-//        variants of tcgen05.mma (shape, dtypes, transpose, etc.)
-//
-//   * tcgen05_mma_ss<KIND>(d_tmem, a_desc, b_desc, idesc, scale_d)
-//     -- issue one tcgen05.mma instruction (SS = both operands SMEM)
-//
-//   * tcgen05_commit / tcgen05_wait / tcgen05_fence
-//     -- group-based completion: commit() closes the issue group,
-//        wait() blocks until all preceding groups retire.
-//
-//   * tcgen05_ld_*  -- TMEM->register loads for the epilogue (the .x32
-//        and .x128 variants cover the 32/128-lane patterns needed by
-//        16x256-wide accumulator tiles).
-//
-// These are *thin* wrappers. The descriptor construction is at runtime
-// (kernel-time), not at codegen-time, because the instruction descriptor
-// encodes things like SMEM swizzle bits that depend on stage layout.
-//
-// References:
-//   - PTX ISA 8.7, sec 9.7.16 (tcgen05 operations)
-//   - PTX ISA 8.7, sec 9.7.16.6 (Instruction Descriptor format)
-//   - CUTLASS include/cute/arch/mma_sm100_desc.hpp for canonical bit packing.
+
+// PTX wrappers for Blackwell tcgen05.mma (UMMA), sm_100a / sm_103a. Bit layouts
+// follow PTX ISA 8.7 sec 9.7.16 and CUTLASS cute/arch/mma_sm100_desc.hpp.
 
 #include <humming/utils/base.cuh>
 
 
-// ============================================================================
-// TMEM allocation
-// ============================================================================
-//
-// Each CTA allocates a contiguous column range in TMEM via
-// `tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32`, which reserves
-// `num_cols` columns and writes the starting column index to a SMEM uint32
-// at the supplied address. The "shared::cta.b32" form means the column
-// pointer is delivered through SMEM (so a single thread issues the alloc
-// and all warps in the CTA observe the column index after a sync).
-//
-// `num_cols` must be a power of 2 between 32 and 512.
-//
-// Pair with `tcgen05_dealloc()` before kernel exit. `relinquish_alloc_permit`
-// is required by the spec on the issuing warp before dealloc.
-
+// `num_cols` must be a power of two in [32, 512]. Pair with tcgen05_dealloc;
+// relinquish_alloc_permit is required on the issuing warp before dealloc.
 template <uint32_t NumColumns>
 CUDA_INLINE void tcgen05_alloc(uint32_t smem_addr_for_col_index) {
   static_assert(NumColumns == 32 || NumColumns == 64 || NumColumns == 128 ||
@@ -85,12 +38,8 @@ CUDA_INLINE void tcgen05_relinquish_alloc_permit() {
       ::: "memory");
 }
 
-// One-thread-elect-out-of-warp helper, used to gate `.sync.aligned`
-// tcgen05 instructions per CUTLASS's pattern
-// (`cute/arch/cluster_sm90.hpp:elect_one_sync`).  Returns true on the
-// elected lane (typically lane 0), false on the others. The implicit
-// branch reconvergence after the if-block lets the elected thread
-// issue the asm while the other 31 wait, satisfying `.sync.aligned`.
+// Elect one lane per warp (CUTLASS elect_one_sync). Branch reconvergence after
+// the if-block satisfies .sync.aligned for the other lanes.
 CUDA_INLINE bool tcgen05_elect_one_sync() {
   uint32_t pred = 0;
   uint32_t laneid = 0;
@@ -130,54 +79,14 @@ CUDA_INLINE void tcgen05_dealloc(uint32_t tmem_col_index) {
 }
 
 
-// ============================================================================
-// SMEM operand descriptor (matches wgmma's layout; same builder used).
-// ============================================================================
-//
-// tcgen05.mma reads each operand from SMEM via a 64-bit descriptor that
-// encodes:
-//   - bits  0..13: SMEM start address (>> 4)
-//   - bits 14..15: reserved
-//   - bits 16..29: leading dimension byte offset (>> 4)
-//   - bits 30..31: reserved
-//   - bits 32..45: stride dimension byte offset (>> 4)
-//   - bits 46..48: reserved
-//   - bits 49..51: matrix base offset (>> 4)
-//   - bits 52..61: reserved
-//   - bits 62..63: swizzle mode (0=none, 1=128B, 2=64B, 3=32B)
-//
-// This is the same layout wgmma uses; humming already has the helper at
-// mma/wgmma.cuh:7-20. We expose it under a more neutral name here so the
-// tcgen05 path can build descriptors without depending on the wgmma header.
-
-// SM100 SmemDescriptor layout (per CUTLASS
-// `include/cute/arch/mma_sm100_desc.hpp:98`):
-//
-//   bits [0, 14)  start_address (>> 4)
-//   bits [16,30)  leading_byte_offset (>> 4)
-//   bits [32,46)  stride_byte_offset (>> 4)
-//   bits [46,48)  version  (we set to 1 for blackwell)
-//   bits [49,52)  base_offset
-//   bit  52       lbo_mode (0 = legacy)
-//   bits [61,64)  layout_type:
-//       0 = NONE
-//       1 = 128B_BASE32B
-//       2 = 128B           (3-bit: 010)
-//       4 = 64B            (3-bit: 100)
-//       6 = 32B            (3-bit: 110)
-//
-// For our K-major bf16 tiles with 128B swizzle the canonical UMMA-K
-// layout is `Swizzle<3,4,3> o ((8,n),2):((8,SBO),1)` (uint128_t units).
-// Mapping to descriptor fields:
-//   SBO = stride between successive 8-N-row blocks (in uint128_t units)
-//       = 8_rows * row_byte_stride / 16
-//       = 8 * BlockK * sizeof(bf16) / 16
-//       = BlockK  (bf16 elements)
-//   LBO = stride between the two K-chunks of the swizzle atom = 1
-//
-// Humming's existing `make_wgmma_smem_desc` hardcodes SBO = 64
-// (correct only for BlockK <= 64 bf16); we parameterise on BlockK here.
-
+// SM100 SMEM descriptor (CUTLASS cute/arch/mma_sm100_desc.hpp):
+//   [0,14)  start_address >> 4      [16,30) leading_byte_offset >> 4
+//   [32,46) stride_byte_offset >> 4 [46,48) version (1 = Blackwell)
+//   [49,52) base_offset             52      lbo_mode
+//   [61,64) layout_type: 0 = none, 2 = 128B, 4 = 64B, 6 = 32B
+// For K-major tiles at 128B swizzle the UMMA-K layout is
+// Swizzle<3,4,3> o ((8,n),2):((8,SBO),1) in uint128_t units, so
+// SBO = 8 rows * BlockK * 2 B / 16 B = BlockK and LBO = 1.
 template <uint32_t SwizzleBytes, uint32_t BlockKElems>
 CUDA_INLINE uint64_t tcgen05_smem_desc(const void *smem_ptr) {
   static_assert(SwizzleBytes == 128 || SwizzleBytes == 64,
@@ -185,19 +94,12 @@ CUDA_INLINE uint64_t tcgen05_smem_desc(const void *smem_ptr) {
   static_assert(BlockKElems > 0 && (BlockKElems % 8) == 0,
                 "BlockK must be a positive multiple of 8 bf16 elements");
 
-  // Layout type (3 bits at [61,63]).
   constexpr uint64_t layout_type =
       SwizzleBytes == 128 ? 2ULL :
       SwizzleBytes == 64  ? 4ULL :
                             0ULL;
 
-  // SBO in uint128_t units. For K-major bf16 with the canonical
-  // `((8,n),2):((8,SBO),1)` layout:
-  //   SBO = 8 N-rows * BlockKElems bf16/row * 2 B/bf16 / 16 B/uint128_t
-  //       = BlockKElems
   constexpr uint64_t sbo = BlockKElems;
-  // LBO = stride between the two K-chunks of the swizzle atom.
-  // In K-major, the second K-chunk is one uint128_t (= 8 bf16) away.
   constexpr uint64_t lbo = 1;
 
   uint32_t smem_addr = cast_smem_ptr_to_uint(smem_ptr);
@@ -212,16 +114,7 @@ CUDA_INLINE uint64_t tcgen05_smem_desc(const void *smem_ptr) {
 }
 
 
-// ============================================================================
-// Instruction descriptor
-// ============================================================================
-//
-// 32-bit "instruction descriptor" passed to every tcgen05.mma issue. The
-// layout follows CUTLASS's `UMMA::InstrDescriptor` exactly
-// (`include/cute/arch/mma_sm100_desc.hpp:412`); reproduce it as a union so
-// we don't have to maintain hand-rolled shift arithmetic. PTX ISA 8.7
-// sec 9.7.16.5.1 is the spec.
-//
+// 32-bit instruction descriptor, one per tcgen05.mma issue:
 //   sparse_id2  : 2  [ 0, 2)  -- meta id for sparse
 //   sparse_flag : 1  [ 2, 3)  -- dense=0, sparse=1
 //   saturate    : 1  [ 3, 4)  -- int8 saturate; 0 for f16/bf16
@@ -261,10 +154,8 @@ union Tcgen05InstrDescriptor {
   };
 };
 
-// kind::f16 family descriptor. The format codes come from MmaOpClass
-// (Tcgen05OpClassImpl emits kInstrDesc{A,B,C}Format); shape_m/shape_n are the
-// MMA-operand extents, which differ from the block tile on the TS path
-// because it swaps A and B.
+// kind::f16 descriptor. shape_m/shape_n are the MMA-operand extents, which
+// differ from the block tile on the TS path (A and B are swapped).
 template <uint32_t kAFmt, uint32_t kBFmt, uint32_t kCFmt>
 CUDA_INLINE uint32_t tcgen05_instr_desc_f16fam(uint32_t shape_m,
                                                uint32_t shape_n) {
@@ -278,39 +169,15 @@ CUDA_INLINE uint32_t tcgen05_instr_desc_f16fam(uint32_t shape_m,
 }
 
 
-// ============================================================================
-// tcgen05.mma issue (SS = both operands from SMEM)
-// ============================================================================
-//
-// Form: tcgen05.mma.cta_group::1.kind::f16.collector::a::fill
-//         [d_tmem], a_desc, b_desc, idesc, scale_d;
-//
-// d_tmem      : TMEM destination address (column index in low 16 bits).
-// a_desc      : 64-bit SMEM matrix descriptor for A.
-// b_desc      : 64-bit SMEM matrix descriptor for B.
-// idesc       : 32-bit instruction descriptor (see above).
-// scale_d     : 0 = overwrite D, 1 = accumulate into D.
-//
-// The .kind::f16 family covers f16/bf16 inputs with f32 acc; we use the
-// bf16 variant.
-
+// SS = both operands from SMEM.
 CUDA_INLINE void tcgen05_mma_ss_bf16(uint32_t d_tmem,
                                      uint64_t a_desc,
                                      uint64_t b_desc,
                                      uint32_t idesc,
                                      bool scale_d) {
-  // Real PTX syntax per CUTLASS
-  // `cute/arch/mma_sm100_umma.hpp:111` (SM100_MMA_F16BF16_SS::fma):
-  //
-  //   tcgen05.mma.cta_group::1.kind::f16
-  //       [tmem_c], desc_a, desc_b, idesc, {mask0, mask1, mask2, mask3}, p
-  //
-  // The `{m0..m3}` operand is a 128-bit sparsity/disable mask -- all-zero
-  // means "no masking". Without this operand the instruction parses to a
-  // different variant and hangs / never retires. The failure mode is
-  // surprising: `compute-sanitizer --tool synccheck` fingers the
-  // trailing `mbarrier_wait` as a "Missing wait" rather than blaming
-  // the malformed mma.
+  // The {m0..m3} operand is a 128-bit disable mask; all-zero means no masking.
+  // Omitting it parses to a different variant that never retires, and the hang
+  // surfaces at the trailing mbarrier_wait rather than at the mma.
   uint32_t mask[4] = {0u, 0u, 0u, 0u};
   asm volatile(
       "{\n\t"
@@ -325,20 +192,9 @@ CUDA_INLINE void tcgen05_mma_ss_bf16(uint32_t d_tmem,
       : "memory");
 }
 
-// TS-mode variant: A comes from TMEM (bracketed operand), B from SMEM
-// via descriptor. Per CUTLASS `cute/arch/mma_sm100_umma.hpp`
-// (SM100_MMA_F16BF16_TS::fma):
-//
-//   tcgen05.mma.cta_group::1.kind::f16
-//       [d_tmem], [a_tmem], b_desc, idesc, {m0..m3}, p;
-//
-// The {m0..m3} mask operand is required in TS mode too; omitting it
-// parses to a different variant that never retires.
-//
-// a_tmem's lane field must be 0 (the MMA reads all M lanes); the
-// column field selects the staging slot. A must be K-major in TMEM
-// (2 bf16 per 32-bit cell, ascending K) -- the only layout TS-mode
-// accepts (CUTLASS static_asserts a_major == K).
+// TS mode: A from TMEM (bracketed), B from SMEM. a_tmem's lane field must be 0
+// (the MMA reads all M lanes) and the column field selects the staging slot;
+// A must be K-major in TMEM (2 ElementA per cell), the only layout TS accepts.
 CUDA_INLINE void tcgen05_mma_ts_bf16(uint32_t d_tmem,
                                      uint32_t a_tmem,
                                      uint64_t b_desc,
@@ -359,51 +215,18 @@ CUDA_INLINE void tcgen05_mma_ts_bf16(uint32_t d_tmem,
 }
 
 
-// ============================================================================
-// Group commit / wait
-// ============================================================================
-//
-// Unlike wgmma's `commit_group / wait_group` pair, tcgen05.mma signals
-// completion through an *mbarrier*. The canonical idiom is:
-//
-//   tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [mbar_smem_addr];
-//   ...
-//   mbarrier.try_wait.parity.shared::cta.b64 P, [mbar_smem_addr], phase;
-//
-// `tcgen05.commit` packages ALL prior tcgen05.mma issues from this CTA
-// into a single batch and arrives on `mbar` exactly once when they all
-// retire. The reader busy-waits on the mbarrier with a phase parity bit
-// that flips on every use of the same mbar.
-//
-// Caller obligations:
-//   * Init the mbar at kernel start: `__mbarrier_init(&mbar, 1)` -- one
-//     expected arrival because each tcgen05.commit arrives exactly once.
-//   * Only one thread issues `tcgen05_commit_to_mbarrier()` per use.
-//   * All threads waiting on the result call `mbarrier_wait(mbar, phase)`
-//     and the caller toggles `phase` after each wait.
-
+// tcgen05.mma signals completion through an mbarrier, not a wait_group:
+// tcgen05.commit batches ALL prior issues from this CTA and arrives once when
+// they retire. Init the mbar with expected_count = 1, one thread commits per
+// use, and readers toggle the phase parity after each wait.
 CUDA_INLINE void tcgen05_commit_to_mbarrier(uint32_t mbar_smem_addr) {
-  // The `.shared::cluster` qualifier matters: per CUTLASS
-  // `cutlass/arch/barrier.h:770`, tcgen05.commit treats the mbarrier
-  // address as cluster-shared. Without this qualifier ptxas accepts
-  // the asm but the hardware never arrives on the mbar, so any
-  // subsequent mbarrier.try_wait spins forever.
+  // The .shared::cluster qualifier is required: without it ptxas accepts the asm
+  // but the hardware never arrives on the mbar and try_wait spins forever.
   asm volatile(
       "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n"
       :: "r"(mbar_smem_addr) : "memory");
 }
 
-CUDA_INLINE void tcgen05_fence_view_async_tmem_store() {
-  // Ensures prior TMEM stores from this CTA are visible before subsequent
-  // SMEM/RMEM-side reads. Cheap; emit unconditionally.
-  asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
-}
-
-// Before/after pair for the TS-mode st -> mma handshake. Per PTX,
-// before_thread_sync in the producing warps only takes effect through a
-// REAL thread sync (bar.sync across the cooperating warps) followed by
-// after_thread_sync on the consuming path; the "before" half alone
-// establishes nothing cross-warp.
 CUDA_INLINE void tcgen05_fence_before_thread_sync() {
   asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory");
 }
@@ -412,24 +235,19 @@ CUDA_INLINE void tcgen05_fence_after_thread_sync() {
   asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
 }
 
-// tcgen05.wait::st -- blocks the warp until its prior tcgen05.st ops
-// complete. `.sync.aligned`: all 32 lanes must execute together.
+// tcgen05.wait::st: blocks until this warp's prior tcgen05.st ops complete.
 CUDA_INLINE void tcgen05_wait_st() {
   asm volatile("tcgen05.wait::st.sync.aligned;\n" ::: "memory");
 }
 
-// tcgen05.wait::ld -- blocks the warp until its prior tcgen05.ld ops
-// have delivered their registers. tcgen05.ld is ASYNC: its destination
-// registers are undefined until this wait retires. Reading them earlier
-// is UB; SASS scheduling masks it in some builds and it surfaces as
-// nondeterministic half-tile corruption in others.
+// tcgen05.ld is async: the destination registers are undefined until this wait
+// retires, and reading them earlier is UB that SASS scheduling can mask.
 CUDA_INLINE void tcgen05_wait_ld() {
   asm volatile("tcgen05.wait::ld.sync.aligned;\n" ::: "memory");
 }
 
-// r2t: store 8 consecutive TMEM columns (one 32-bit cell per lane per
-// column) starting at taddr's column, into the issuing warp's own
-// sub-partition. reg r -> column (taddr.col + r).
+// r2t: store 8 consecutive TMEM columns (one 32-bit cell per lane per column)
+// into the issuing warp's own sub-partition. reg r -> column (taddr.col + r).
 CUDA_INLINE void tcgen05_st_32x32b_x8(uint32_t tmem_addr,
                                       const uint32_t (&r)[8]) {
   asm volatile(
@@ -441,16 +259,7 @@ CUDA_INLINE void tcgen05_st_32x32b_x8(uint32_t tmem_addr,
       : "memory");
 }
 
-// ============================================================================
-// TMEM->register load (t2r) for the epilogue
-// ============================================================================
-//
-// Pattern: tcgen05.ld.sync.aligned.32x32b.x{N}.b32 {d0..dN-1}, [tmem_addr];
-//
-// The shapes are dictated by hardware; we expose the .x32 form, which
-// loads 32 lanes x 32 bits = 128 B per warp, matching the per-warp
-// accumulator slice for an M=64 tile.
-
+// t2r: 32 lanes x 32 bits per warp.
 CUDA_INLINE void tcgen05_ld_32x32b_x32(uint32_t tmem_addr, uint32_t *dst) {
   asm volatile(
       "tcgen05.ld.sync.aligned.32x32b.x32.b32 "

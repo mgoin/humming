@@ -19,8 +19,6 @@ enum class WeightScale2Type : uint32_t {
 enum class MmaType : uint32_t {
   MMA,
   WGMMA,
-  // Blackwell tcgen05.mma (UMMA) -- accumulator in TMEM.
-  // See humming/mma/tcgen05_mma.cuh (SS) and tcgen05_ts_mma.cuh (TS).
   TCGEN05,
   MXMMA
 };

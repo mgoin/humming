@@ -197,14 +197,10 @@ __global__ void weight_repack_nk(
   uint32_t tmp[kNumBitsA / 4][16 / kNumBitsA][kNumBitsA / 4][2][2][32 / kNumBitsA];
 
   if constexpr (kUseTcgen05Ts) {
-    // tcgen05 TS-mode layout (docs/tcgen05_ts_packing.md): thread t owns full
-    // rows {t, t + 32} of the 64-row block (lane = row contract), and the
-    // logical element order per 16-K group is [row t: K ascending, row t + 32:
-    // K ascending] so that after humming_pack_weight's (i, i + 4) interleave
-    // compensation, dequant register r of each word pair holds the
-    // (K = 2r, K = 2r + 1) pair -- the only K-major order TS-mode TMEM A
-    // accepts. Output word placement is unchanged: thread t's words are the
-    // 16 B slot loader_b's WarpN == 32 half-group path gathers.
+    // tcgen05 TS layout (docs/tcgen05_ts_packing.md): thread t owns rows
+    // {t, t + 32}, and the element order per 16-K group is [row t: K ascending,
+    // row t + 32: K ascending], so after humming_pack_weight's (i, i + 4)
+    // interleave, dequant register r holds the (K = 2r, K = 2r + 1) pair.
     static_assert(kNumBitsA == 16, "tcgen05 TS packing needs 16-bit activations");
     // The packed-input zp read below assumes a zp never straddles two words.
     static_assert(!kPackedInput || 32 % kNumBitsB == 0,
@@ -253,71 +249,70 @@ __global__ void weight_repack_nk(
       }
     }
   } else {
-
-  PRAGMA_UNROLL
-  for (uint32_t i = 0; i < 8; i++) {
-    uint32_t row = i * 8 + threadIdx.x / 4;
-    uint32_t zp_smem_row[MAX(zp_smem_stride, 1)];
-
-    if constexpr (zp_smem_stride > 0) {
-      PRAGMA_UNROLL
-      for (uint32_t j = 0; j < zp_smem_stride; j++) {
-        if constexpr (!kPackedInput) {
-          zp_smem_row[j] = zp_smem[row][j];
-        } else {
-          constexpr uint32_t extracted_mask = (1 << kNumBitsB) - 1;
-          uint32_t start_bits = row * kNumBitsB;
-          uint32_t end_bits = (row + 1) * kNumBitsB;
-          uint32_t start_word = start_bits / 32;
-          uint32_t end_word = (end_bits - 1) / 32;
-          uint32_t val = zp_smem[start_word][j] >> (start_bits % 32);
-          if (start_word != end_word) {
-            val |= zp_smem[end_word][j] << (32 - (start_bits % 32));
-          }
-          zp_smem_row[j] = val & extracted_mask;
-        }
-      }
-    }
-
-    uint32_t *smem_row = smem[i * 8 + threadIdx.x / 4];
     PRAGMA_UNROLL
-    for (uint32_t j = 0; j < kNumBitsA / 2; j++) {
-      // 8/4/2 for 16/8/4 bits A
-      PRAGMA_UNROLL
-      for (uint32_t k = 0; k < 32 / kNumBitsA; k++) {
-        // 2/4/8 for 16/8/4 bits A
-        uint32_t index = j * (128 / kNumBitsA) + threadIdx.x % 4 * (32 / kNumBitsA) + k;
+    for (uint32_t i = 0; i < 8; i++) {
+      uint32_t row = i * 8 + threadIdx.x / 4;
+      uint32_t zp_smem_row[MAX(zp_smem_stride, 1)];
 
-        uint32_t extract_value = extract_packed_value<kNumBitsB, kPackedInput>(smem_row, index);
-
-        if constexpr (kShouldPreprocessForINT2FP) {
-          uint32_t zp_val;
-          constexpr uint32_t extracted_mask = (1 << kNumBitsB) - 1;
-
-          if constexpr (kShouldPreprocessWithZP) {
-            zp_val = zp_smem_row[index / kGroupSizeZP];
+      if constexpr (zp_smem_stride > 0) {
+        PRAGMA_UNROLL
+        for (uint32_t j = 0; j < zp_smem_stride; j++) {
+          if constexpr (!kPackedInput) {
+            zp_smem_row[j] = zp_smem[row][j];
           } else {
-            zp_val = 1 << (kNumBitsB - 1);
+            constexpr uint32_t extracted_mask = (1 << kNumBitsB) - 1;
+            uint32_t start_bits = row * kNumBitsB;
+            uint32_t end_bits = (row + 1) * kNumBitsB;
+            uint32_t start_word = start_bits / 32;
+            uint32_t end_word = (end_bits - 1) / 32;
+            uint32_t val = zp_smem[start_word][j] >> (start_bits % 32);
+            if (start_word != end_word) {
+              val |= zp_smem[end_word][j] << (32 - (start_bits % 32));
+            }
+            zp_smem_row[j] = val & extracted_mask;
+          }
+        }
+      }
+
+      uint32_t *smem_row = smem[i * 8 + threadIdx.x / 4];
+      PRAGMA_UNROLL
+      for (uint32_t j = 0; j < kNumBitsA / 2; j++) {
+        // 8/4/2 for 16/8/4 bits A
+        PRAGMA_UNROLL
+        for (uint32_t k = 0; k < 32 / kNumBitsA; k++) {
+          // 2/4/8 for 16/8/4 bits A
+          uint32_t index = j * (128 / kNumBitsA) + threadIdx.x % 4 * (32 / kNumBitsA) + k;
+
+          uint32_t extract_value = extract_packed_value<kNumBitsB, kPackedInput>(smem_row, index);
+
+          if constexpr (kShouldPreprocessForINT2FP) {
+            uint32_t zp_val;
+            constexpr uint32_t extracted_mask = (1 << kNumBitsB) - 1;
+
+            if constexpr (kShouldPreprocessWithZP) {
+              zp_val = zp_smem_row[index / kGroupSizeZP];
+            } else {
+              zp_val = 1 << (kNumBitsB - 1);
+            }
+
+            extract_value = extract_value & extracted_mask;
+            extract_value = extract_value >= zp_val ? extract_value - zp_val : extracted_mask - extract_value;
           }
 
-          extract_value = extract_value & extracted_mask;
-          extract_value = extract_value >= zp_val ? extract_value - zp_val : extracted_mask - extract_value;
-        }
-
-        uint32_t i1 = j / 2;
-        uint32_t i2 = (i * 8) / (kNumBitsA * 4);
-        uint32_t i3 = (i * 8) % (kNumBitsA * 4) / 16;
-        uint32_t i4 = i % 2;
-        uint32_t i5 = j % 2;
-        uint32_t i6 = k;
-        if constexpr (kShouldTransposeMiniBlock) {
-          tmp[i1][i2][i3][i5][i4][i6] = extract_value;
-        } else {
-          tmp[i1][i2][i3][i4][i5][i6] = extract_value;
+          uint32_t i1 = j / 2;
+          uint32_t i2 = (i * 8) / (kNumBitsA * 4);
+          uint32_t i3 = (i * 8) % (kNumBitsA * 4) / 16;
+          uint32_t i4 = i % 2;
+          uint32_t i5 = j % 2;
+          uint32_t i6 = k;
+          if constexpr (kShouldTransposeMiniBlock) {
+            tmp[i1][i2][i3][i5][i4][i6] = extract_value;
+          } else {
+            tmp[i1][i2][i3][i4][i5][i6] = extract_value;
+          }
         }
       }
     }
-  }
   }
 
   uint32_t *tmp2 = reinterpret_cast<uint32_t *>(tmp);

@@ -55,13 +55,9 @@ CUDA_INLINE constexpr T prepare_exp_scale_factor() {
 }
 
 
-// Multiply an ElementA pair by the exact power of two 2^kOff. A single
-// prepare_exp_scale_factor tops out at 2^kMax (bf16 2^127, fp16 2^15), so a
-// larger offset -- uint8's 133 on bf16 -- is applied in two steps: the first
-// 2^kMax lifts normalized_uint_to_fp's subnormal dequant into normal range and
-// the residual finishes it. Each factor is a pure power of two (mantissa
-// preserved, no rounding), mirroring the mainloop 2^127 + epilogue 2^6 split
-// the generic path uses.
+// Multiply an ElementA pair by 2^kOff. One prepare_exp_scale_factor tops out at
+// 2^kMax (bf16 2^127, fp16 2^15), so a larger offset (uint8 on bf16 needs 133)
+// is applied in two exact power-of-two steps.
 template <uint32_t kOff, class EA>
 CUDA_INLINE typename F16Conversion<EA>::scalar_t2 ts_mul_pow2(
     typename F16Conversion<EA>::scalar_t2 t) {

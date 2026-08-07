@@ -1,43 +1,20 @@
 #pragma once
-//
-// Vectorized transposed TMEM drain for the TS-mode tcgen05 epilogue.
-//
-// Input: TMEM D accumulator in TRANSPOSED orientation (lane = weight
-// row n, col = activation m), f32. Output: gmem_writer's sectioned
-// XOR-swizzled smem.reduce layout, bf16:
-//   smem_row = (n / 64) * BlockM + m
-//   int4 col = ((n / 8) % 8) ^ ((smem_row + smem_reduce_base) % 8)
-//   bf16 sub-index = n % 8
-//
-// The scalar drain issues 32 bank-conflicted 2-byte stores per t2r
-// chunk. Here each 8-lane group performs an 8x8 bf16 register
-// transpose (3 shfl.bfly stages; stage 1 swaps the 16-bit halves via
-// prmt, stages 2/3 swap register pairs), after which lane 8g + c holds
-// int4 = D[n0+8g .. n0+8g+7][m0 + 8h + c] for h = 0..3 -- exactly one
-// swizzled smem.reduce int4 -> four 128-bit stores per lane per chunk.
-//
-// Register-coordinate bookkeeping (i = n % 8 as i2i1i0, c = m % 8 as
-// c2c1c0; reg p = 4h + c2c1, halves = c0):
-//   stage 1: lane bit0 (i0) <-> half bit (c0)   [shfl.bfly 1 + prmt]
-//   stage 2: lane bit1 (i1) <-> reg bit0 (c1)   [shfl.bfly 2]
-//   stage 3: lane bit2 (i2) <-> reg bit1 (c2)   [shfl.bfly 4]
-// After stage 3: lane = 8g + c, reg p = 4h + i2i1, half = i0, so the
-// int4 {v[4h] .. v[4h+3]} is n-ascending as the layout requires.
 
 #include <humming/datatype/base_conversion.cuh>
 #include <humming/utils/base.cuh>
 #include <humming/utils/ptx/tcgen05.cuh>
 
-// Drain one warp's 32 TMEM lanes x kBlockM cols. `n` is this thread's
-// weight row ((warp % 4) * 32 + lane); `bias_val` is added per-n in
-// f32 before the output convert (uniform per thread, pre-transpose).
-// ElementC selects the f32->16-bit output convert (bf16 vs fp16); the
-// swizzled smem.reduce layout is identical for both (2-byte elements).
-// kApplyRowScale folds a per-row (channelwise) weight scale `scale_val`
-// into the f32 accumulator before bias + convert: out = acc*scale + bias.
-// It commutes with the K-sum (scale is constant along K), so the drain is
-// the correct apply site. Compile-time off for the group path (identical
-// codegen, bf16 stays bit-exact).
+// Drain one warp's 32 TMEM lanes x kBlockM cols of the TS accumulator
+// (transposed: lane = weight row n, col = activation m) into gmem_writer's
+// smem.reduce layout:
+//   smem_row = (n / 64) * kBlockM + m
+//   int4 col = ((n / 8) % 8) ^ ((smem_row + smem_reduce_base) % 8)
+// Each 8-lane group does an 8x8 register transpose so lane 8g + c ends up
+// holding whole int4s; with i = n % 8 (i2i1i0) and c = m % 8 (c2c1c0) the three
+// shfl.bfly stages swap i0<->c0 (half), i1<->c1 and i2<->c2 (reg bits).
+// `n` is (warp % 4) * 32 + lane; `bias_val` is added per-n in f32 pre-convert.
+// kApplyRowScale folds a channelwise weight scale in (constant along K, so the
+// drain is a valid apply site); ElementC picks the f32 -> 16-bit convert.
 template <uint32_t kBlockM, class ElementC = BFloat16,
           bool kApplyRowScale = false>
 CUDA_INLINE void tmem_ts_drain_transposed(uint32_t d_base,

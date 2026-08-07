@@ -1,35 +1,7 @@
 #pragma once
-//
-// TCGEN05 MMA class for Blackwell sm_100+ (1-CTA, SS-mode mainloop).
-//
-// Mirrors the WMMA / WGMMA interface (`zero_accum`, `transform_b`,
-// `run`, `final_regs_c_as_ptr`) so the kernel mainloop drives it via
-// the `MmaSelector<MmaType::TCGEN05, ...>` specialization in
-// `mma/all.cuh`.
-//
-// Data flow (differences vs WMMA):
-//   * A operand comes from SMEM (`smem.stages[stage].a`) via an SMEM
-//     descriptor, not RMEM. `s2r_pipe` skips the A load for the
-//     TCGEN05 path (see `s2r_pipeline.cuh`).
-//   * B operand: `s2r_pipe` loads the *quantised* int4 codes into
-//     `regs_qb`, `transform_b()` dequantises into RMEM bf16, and the
-//     scatter inside `run()` writes them to `smem.b_dequant[buf_id]`.
-//     tcgen05.mma reads that SMEM staging buffer.
-//   * Accumulator lives in TMEM (one CTA-private allocation of 128
-//     cols, made once at kernel entry).
-//   * `final_regs_c_as_ptr` does the t2r dance (tcgen05.fence +
-//     tcgen05.ld_32x32b_x32) and writes the result directly into
-//     `smem.reduce` in the layout the `gmem_writer` expects, bypassing
-//     `EpilogueSmemWriter` (which assumes >= 2 N-warps).
-//
-// Limitations of this mainloop (`mma/tcgen05_ts_mma.cuh` is the TS-mode
-// mainloop that lifts them):
-//   * 1-CTA only (`cta_group::1`). No clustering, no 2-CTA mma.
-//   * No accumulator double-buffering -- one TMEM region per CTA.
-//   * Per-K-iter `bar.sync 1, kNumMathThreads` is required to publish
-//     the scatter to the tcgen05.mma issuer. Empirically the bar
-//     itself is cheap (~4 cyc) but the underlying SMEM scatter is
-//     the per-K-iter bottleneck (~2000 cyc).
+
+// SS-mode tcgen05.mma (UMMA) mainloop: A from SMEM, dequantised B scattered to
+// smem.b_dequant, accumulator in TMEM. cta_group::1 only.
 
 #include <humming/arith/exp_offset.cuh>
 #include <humming/utils/all.cuh>
@@ -38,9 +10,7 @@
 #include <humming/utils/ptx/tcgen05.cuh>
 
 
-// fence_proxy.async.shared::cta -- ensures prior r2s of dequantised B
-// is observable by subsequent tcgen05.mma SMEM reads. Same primitive
-// wgmma uses; defined here so this file is self-contained.
+// Publishes r2s stores to the async proxy tcgen05.mma reads B through.
 CUDA_INLINE void fence_proxy_async_shared_cta() {
   asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 }
@@ -57,10 +27,7 @@ public:
   using ElementA = typename Ctx::ElementA;
   using ElementB = typename Ctx::ElementB;
   using CRegistersType = typename MmaOpClass::CRegisters;
-  // Instantiated by EpilogueSmemReducer / EpilogueSmemWriter, but never
-  // used on the tcgen05 path (K_WARPS == 1 so reduce() is dead, and the
-  // smem_writer is bypassed via the nullptr sentinel below). Any
-  // well-formed shape works.
+  // Never used on this path; any well-formed shape satisfies the epilogue.
   using CRegistersArrayType = CRegistersType[1][1];
 
   static constexpr bool kHasZeroPoint = Ctx::kHasZeroPoint;
@@ -70,22 +37,16 @@ public:
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kNumWarpShapeNSplits = WarpShape::N == ElementA::kBits * 2 ? 2 : 1;
 
-  // SMEM descriptor swizzle for A and B. Both use Swizzle<3,4,3>
-  // (128-byte swizzle, col XOR by row & 7). `loader_a` emits this
-  // layout when `kUseTcgen05` is set (see `loader_a.cuh`); the
-  // scatter in `run()` writes B in the same swizzle below.
+  // A and B both use Swizzle<3,4,3>: loader_a emits it for A, the scatter in
+  // run() writes B in the same layout.
   static constexpr uint32_t kSwizzleBytesA = 128;
   static constexpr uint32_t kSwizzleBytesB = 128;
 
-  // Each tcgen05.mma.kind::f16 consumes 16 bf16 of K per issue. The
-  // 128B-swizzle atom is 8 bf16 K-wide, so 16 bf16 = 2 atoms = 2 uint128_t.
-  // Per-K-iter SMEM pointer offset (in int4 / uint128_t units).
+  // tcgen05.mma.kind::f16 consumes 16 bf16 of K per issue = 2 128B-swizzle atoms.
   static constexpr uint32_t kKChunkUint128 = 2;
 
-  // B staging geometry, shared by the scatter in run() and the
-  // closed-form validators below. For BlockK > 64 the staging buffer
-  // is section-major (each section = 64 K-bf16 of all N), mirroring
-  // loader_a's treatment of A.
+  // B staging is section-major for BlockK > 64 (64 K-bf16 of all N per section),
+  // mirroring loader_a.
   static constexpr uint32_t kKPerSectionB =
       BlockShape::K < 64u ? BlockShape::K : 64u;
   static constexpr uint32_t kRowBytesB = kKPerSectionB * 2u;
@@ -93,27 +54,10 @@ public:
   static constexpr uint32_t kNScatterWarps =
       MAX(BlockShape::N / WarpShape::N, 1u);
 
-  // ---- closed-form scatter addressing ----
-  //
-  // Reference formula (element-wise, what run() used to evaluate per
-  // store): for lane t, scatter-warp slice n_base, K-iter `iter`,
-  // fragment coords (i, frag, pair):
-  //   n      = n_base + 16 i + 8 frag + t/4
-  //   k_lo   = 16 iter + 2 (t%4) + 8 pair
-  //   linear = (k_lo/64) * kBSectionSizeBytes + n * 128 + (k_lo%64) * 2
-  //   off    = linear ^ ((((smem_base>>7) + n) & 7) << 4)
-  //
-  // Closed form: every additive term of `linear` occupies a disjoint
-  // bit range (4*(t%4): bits 2-3; 32*(iter%4): 5-6; 16*pair: 4;
-  // (t/4)*128: 7-9; frag*1024: 10; i*2048: 11-12; n_base*128: >= 13;
-  // section offset: >= 13), so + == ^ among them, and the XOR phase
-  // depends only on n's low 3 bits, which (i, frag) can't change
-  // (they add multiples of 8). Hence per (thread, K-iter):
-  //   base0 = ((n0*128 + 4*(t%4)) ^ mask) ^ 32*(iter % 4)
-  //           + (iter / 4) * kBSectionSizeBytes
-  //   mask  = (((smem_base>>7) + n0) & 7) << 4,  n0 = n_base + t/4
-  // and each store lands at base0 ^ 16*pair + i*2048 + frag*1024 --
-  // a compile-time immediate off one of two per-thread registers.
+  // Closed-form scatter addressing: every additive term of the element-wise
+  // offset occupies a disjoint bit range, so + == ^ among them and the swizzle
+  // XOR phase depends only on n's low 3 bits. scatter_closed_form_matches()
+  // below checks the two agree over the whole index space.
   static constexpr uint32_t scatter_ref_offset(
       uint32_t t, uint32_t n_base, uint32_t iter, uint32_t i,
       uint32_t frag, uint32_t pair, uint32_t base_div128) {
@@ -148,9 +92,7 @@ public:
   }
 
   static constexpr bool scatter_closed_form_matches() {
-    // Quantify over all lanes, K-iters and fragment coords; sample the
-    // scatter-warp slices and SMEM base phases (the base enters both
-    // formulas identically, additively under &7).
+    // Base phases are sampled: the base enters both formulas identically under &7.
     constexpr uint32_t bases[3] = {0u, 3u, 7u};
     for (uint32_t t = 0; t < 32u; t++)
       for (uint32_t w = 0; w < kNScatterWarps; w++)
@@ -171,36 +113,19 @@ public:
                 "TCGEN05: closed-form scatter offsets diverge from the "
                 "reference element-wise swizzle formula");
 
-  // Closed-form scatter, address-equivalent to the element-wise
-  // formula (static_assert above). Its faster stores once re-exposed a
-  // WS+TMA corruption at BlockK=64; the cause was the un-fenced and
-  // un-awaited TMA-C epilogue read of smem.reduce (which aliases
-  // stages[0]), fixed in the epilogue, so the closed form is
-  // unconditional.
-  static constexpr bool kUseClosedFormScatter = true;
-
   Ctx &ctx;
   SharedStorage &smem;
   ArithClass &arith;
 
-  // `s2r_pipeline.cuh` skips `loader_a.load` for the TCGEN05 path
-  // (tcgen05.mma reads A from SMEM via the descriptor), so this
-  // storage is never written. Keep a single dummy int4 so the
-  // `regs_a_as_ptr()` accessor below has somewhere to point -- the
-  // s2r pipe takes the pointer unconditionally even when it doesn't
-  // dereference. alignas(16) is defensive.
+  // Interface parity only: the s2r pipe takes this pointer unconditionally but
+  // never dereferences it on the tcgen05 path.
   alignas(16) int4 regs_a[1];
 
   // Quantised B codes loaded by s2r_pipe (same layout as WMMA).
   alignas(16) uint32_t regs_qb[2][ElementB::kBits * (16 / ElementA::kBits)];
-  // Dequantised B in RMEM, pre-r2s. Sized to the per-thread slice of the
-  // BlockN x BlockK B tile (matches the post-dequant footprint of WMMA's
-  // regs_b for the same warp shape).
+  // Dequantised B in RMEM, pre-r2s: the per-thread slice of the BlockN x BlockK tile.
   alignas(16) uint32_t regs_b_tmp[2][WarpShape::N * kPartMmaShapeK * ElementA::kBits / 32 / 32];
-  // Final post-t2r RMEM accumulator the epilogue reads. Single buffer
-  // (no double-buffer like WMMA needs for register/scale gating).
-  // MmaOpClass::CRegisters comes from Tcgen05OpClassImpl codegen and is
-  // sized to one warp's slice = warp_M * warp_N / 32 lanes per thread.
+  // Post-t2r RMEM accumulator read by the epilogue.
   typename MmaOpClass::CRegisters regs_c;
 
   CUDA_INLINE
@@ -209,33 +134,14 @@ public:
 
   CUDA_INLINE
   void zero_accum() {
-    // tcgen05.mma's `scale_d` predicate handles "first issue overwrites,
-    // subsequent issues accumulate". We model that by carrying a runtime
-    // flag through `run()`, and zero the RMEM-side regs_c so the
-    // epilogue sees zeros if no K-iters fired (unusual but safe).
+    // scale_d drives overwrite-vs-accumulate on the TMEM side; zero the RMEM
+    // regs so the epilogue is defined if no K-iter fires.
     uint32_t *p = reinterpret_cast<uint32_t *>(regs_c);
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < sizeof(regs_c) / 4; i++) p[i] = 0;
     first_issue_ = true;
   }
 
-  // Supported config space:
-  //   * BlockShape::M in {64, 128}
-  //   * BlockShape::N in {64, 128, 256}
-  //   * BlockShape::K in {64, 128, 256}  (B is section-major-ised
-  //                                       across 64-K-bf16 sections)
-  //   * WarpShape::M == BlockShape::M / 4   (4 M-warps, one per TMEM
-  //                                          sub-partition)
-  //   * WarpShape::N == 64    (smaller WarpN hits loader_b's
-  //                            half-group path, unmodelled here)
-  //   * WarpShape::K == BlockShape::K   (no K-warps; tcgen05.mma
-  //                                      covers full BlockK by
-  //                                      issuing one MMA per 16-K
-  //                                      atom from a single warp)
-  //   * kNumStages in {2, 3, 4}
-  //   * has_zero_point, has_bias both in {True, False}
-  //   * ElementA == BFloat16 only (fp16 A would need a parallel
-  //                                instruction-descriptor + scatter)
   static_assert(BlockShape::M == 64 || BlockShape::M == 128,
                 "TCGEN05: BlockM must be 64 or 128");
   static_assert(BlockShape::N == 64 || BlockShape::N == 128
@@ -256,36 +162,22 @@ public:
                 "16-K-bf16 atom from a single warp");
   static_assert(MmaOpClass::kCtaGroup == 1,
                 "TCGEN05: only cta_group::1 is wired up");
-  // `tcgen05_mma_ss_bf16`'s SMEM scatter is hardcoded to bf16's bit
-  // semantics. fp16 A requires a parallel scatter path; without it the
-  // bf16-shaped scatter reinterprets fp16 bit patterns and produces
-  // garbage (error magnitudes ~1e16).
   static_assert(std::is_same<ElementA, BFloat16>::value,
                 "TCGEN05: ElementA must be BFloat16. fp16 A requires "
                 "a parallel instruction-descriptor + scatter path "
                 "that is not wired up.");
-  // With reduce_overlap_last_stage_only, `smem.reduce` overlays the last
-  // stage AND everything after it -- including `b_dequant`. The t2r in
-  // final_regs_c_as_ptr would then race the producer refill. Untested
-  // combination; the heuristic never sets it, so forbid it outright.
   static_assert(!Ctx::kReduceOverlapLastStageOnly,
                 "TCGEN05: reduce_overlap_last_stage_only is not "
                 "supported (untested interaction with the b_dequant "
                 "staging buffer in the reduce union).");
 
-  // Dequant int4 (from regs_qb) -> bf16 (RMEM) -> SMEM b_dequant staging.
-  // `iter_id` is unused: the r2s that needs the K index happens in run().
+  // Dequant int4 -> ElementA in RMEM; the r2s happens in run(), which knows the K index.
   CUDA_INLINE
   void transform_b(uint32_t buffer_id, uint32_t iter_id) {
-    // For dtypes where ElementA == ElementB we'd skip dequant; tcgen05
-    // bf16xbf16 isn't our target so just emit the int4 path inline.
     static_assert(!std::is_same<ElementA, ElementB>::value,
                   "TCGEN05 path is only wired up for narrow-B (int4) today");
 
-    // dequant writes 4 uint32 starting at the passed pointer per call.
-    // Each outer-i call corresponds to a DIFFERENT m16n8 fragment pair
-    // in regs_b_tmp, so advance the destination by 4 uint32 per iter
-    // (same pattern as wmma.cuh).
+    // Each i is a different m16n8 fragment pair, so advance by 4 uint32 (as in wmma.cuh).
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < WarpShape::N / 16; i++) {
       uint32_t *regs_b_ptr = &regs_b_tmp[buffer_id][i * 4u];
@@ -296,77 +188,37 @@ public:
       arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
     }
 
-    // We defer the r2s of dequantised bf16 to TCGEN05::run(iter_id),
-    // because the r2s needs the K-iter index to compute SMEM offsets
-    // (one K-chunk of 16 bf16 per K-iter) and `transform_b` only
-    // receives buffer_id from humming's mainloop. The dequant results
-    // stay in `regs_b_tmp[buffer_id]` until run() consumes them.
-    // NOTE: no fence here -- transform_b writes REGISTERS only. The
-    // fence.proxy.async that publishes the scatter lives in run(),
-    // between the scatter stores and sync_math_threads.
+    // The r2s is deferred to run(), which knows the K index. Nothing to fence
+    // here: this writes registers only.
   }
 
   CUDA_INLINE
   void run(uint32_t stage_id, uint32_t iter_id) {
     uint32_t buffer_id = iter_id % 2;
 
-    // ---- r2s of the just-dequantised B tile to swizzled SMEM ----
-    //
-    // Per PTX ISA 7.0 Table 32 (mma.m16n8k16.f16, B-matrix layout),
-    // thread t's 4 b16 of B are at:
-    //   v=0: (k = 2*(t%4) + 0, n = t/4)   -- first b32 lo
-    //   v=1: (k = 2*(t%4) + 1, n = t/4)   -- first b32 hi
-    //   v=2: (k = 2*(t%4) + 8, n = t/4)   -- second b32 lo
-    //   v=3: (k = 2*(t%4) + 9, n = t/4)   -- second b32 hi
-    //
-    // humming's `dequant<>` call with j=i fills regs_b_tmp[i*4..i*4+3]
-    // (= 4 b32 = 8 b16) which mma.sync interprets as TWO m16n8 instances:
-    //   instance 2i (n_base = i*16 + 0): {b0=res[0], b1=res[1]}
-    //   instance 2i+1 (n_base = i*16 + 8): {b0=res[2], b1=res[3]}
-    //
-    // Final (reg_index = i*8 + v in [0, 32)) -> (n, k) mapping:
-    //   frag_id   = v / 4                       (0 or 1)
-    //   v_in_frag = v % 4
-    //   n = i*16 + 8*frag_id + (t / 4)
-    //   k = k_base + 2*(t%4) + (v_in_frag & 1) + 8 * (v_in_frag >> 1)
+    // Thread t's 4 b16 of B (PTX ISA Table 32, mma.m16n8k16) with reg_index
+    // = i*8 + v in [0, 32):
+    //   n = i*16 + 8*(v / 4) + t / 4
+    //   k = k_base + 2*(t%4) + (v & 1) + 8 * ((v % 4) >> 1)
     {
       uint32_t t = threadIdx.x % 32u;
       constexpr uint32_t kCalls = WarpShape::N / 16u;
-      // Per-warp N-slice base. kNScatterWarps in {1, 2, 4} for BlockN in
-      // {64, 128, 256}; warps with the same `n_warp_id_scatter`
-      // write redundantly (the 4 M-warps that share an N-slice all
-      // emit the same bytes -- intra-warp the swizzle makes each
-      // store wavefront conflict-free; the redundancy costs extra
-      // wavefronts, not conflicts). A 1-warp-per-N-slice variant was
-      // measured 10% slower (divergence beats duplication).
+      // The 4 M-warps sharing an N-slice write the same bytes; the redundancy
+      // costs wavefronts, not conflicts, and beats a 1-warp variant's divergence.
       uint32_t warp_id_local = threadIdx.x / 32u;
       uint32_t n_warp_id_scatter = warp_id_local % kNScatterWarps;
       uint32_t n_base = n_warp_id_scatter * WarpShape::N;
-      // Hardware Swizzle<3,4,3> applies to the absolute byte address:
-      // the descriptor encodes (smem_base >> 4) in its start_address,
-      // and the HW XOR'ing of bits [4, 7) uses bits [7, 10) of the
-      // *full* abs byte, so smem_base/128 contributes to the XOR
-      // amount and must be included here.
+      // Swizzle<3,4,3> XORs bits [4,7) using bits [7,10) of the ABSOLUTE byte
+      // address, so smem_base/128 enters the phase.
       uint32_t smem_base_div_128 =
           cast_smem_ptr_to_uint(&smem.b_dequant[buffer_id][0]) >> 7;
-      // Two address paths, gated by kUseClosedFormScatter (see the
-      // constant's comment):
-      //   * closed form: swizzle XOR phase is a per-thread constant,
-      //     so the 16 stores of a K-iter reduce to two base registers
-      //     (pair 0 / pair 1) plus compile-time immediate offsets.
-      //   * element-wise: the original per-store formula (kept for
-      //     BlockK=64 where the closed form's faster stores re-expose
-      //     a latent WS+TMA race).
       // Each uint32 store covers the (k, k+1) bf16 pair of one row.
       uint32_t *regs_b_u32_buf =
           reinterpret_cast<uint32_t *>(regs_b_tmp[buffer_id]);
       char *smem_b_bytes =
           reinterpret_cast<char *>(&smem.b_dequant[buffer_id][0]);
-      uint32_t base0 = 0, base1 = 0;
-      if constexpr (kUseClosedFormScatter) {
-        base0 = scatter_closed_base0(t, n_base, iter_id, smem_base_div_128);
-        base1 = base0 ^ 16u;
-      }
+      uint32_t base0 = scatter_closed_base0(t, n_base, iter_id, smem_base_div_128);
+      uint32_t base1 = base0 ^ 16u;
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kCalls; i++) {
         PRAGMA_UNROLL
@@ -375,53 +227,24 @@ public:
           PRAGMA_UNROLL
           for (uint32_t pair_idx = 0; pair_idx < 2u; pair_idx++) {
             uint32_t reg_index_pair = i * 4u + frag_id * 2u + pair_idx;
-            uint32_t addr;
-            if constexpr (kUseClosedFormScatter) {
-              addr = (pair_idx ? base1 : base0) + imm;
-            } else {
-              addr = scatter_ref_offset(t, n_base, iter_id, i, frag_id,
-                                        pair_idx, smem_base_div_128);
-            }
+            uint32_t addr = (pair_idx ? base1 : base0) + imm;
             *reinterpret_cast<uint32_t *>(smem_b_bytes + addr) =
                 regs_b_u32_buf[reg_index_pair];
           }
         }
       }
     }
-    // Publish the generic-proxy scatter stores to the async proxy that
-    // tcgen05.mma reads B through (PTX ISA: cross-proxy ordering
-    // requires fence.proxy.async; bar.sync alone gives only
-    // generic-proxy ordering). CUTLASS emits this fence after every
-    // dequant-store batch before UMMA issue. It must sit here and not
-    // at the end of transform_b: there the dequant is register-only, so
-    // ptxas sinks the fence past the UTCMMA and each MMA formally reads
-    // unpublished data. Placed correctly it serialises the scatter
-    // drain ahead of the math barrier and costs ~10% at M=2048
-    // (closed-form BK128 s4).
+    // Cross-proxy ordering: bar.sync alone gives only generic-proxy ordering.
+    // The fence must sit here rather than at the end of transform_b; there the
+    // dequant is register-only, so ptxas sinks it past the UMMA and each issue
+    // formally reads unpublished data.
     fence_proxy_async_shared_cta();
-    // ctx.sync_math_threads() becomes:
-    //   * __syncthreads() when kNumMathThreads == kNumThreads
-    //     (non-warp-spec path)
-    //   * bar.sync 1, kNumMathThreads under warp-spec (producer
-    //     threads must NOT be awaited here -- they're busy doing
-    //     gmem->smem loads).
+    // bar.sync over math threads only; producers are mid gmem->smem load.
     ctx.sync_math_threads();
 
-    // ---- now build descriptors + issue tcgen05.mma ----
-    // A descriptor reads from smem.stages[stage_id].a; advance the pointer by
-    // `iter_id * kKChunkUint128` so this MMA processes K-chunk `iter_id`.
-    // (tcgen05.mma.kind::f16 only sees 16 bf16 of K per issue; the
-    // outer mainloop's K-loop drives `iter_id` over the BlockK range.)
-    //
-    // For BlockK > 64, humming's loader_a sectionises A into chunks of
-    // 64 K-bf16 each (loader_a.cuh:110: `gmem_col = smem_row /
-    // BlockM * 8 + smem_col` -- rows 0..BlockM-1 hold K=0..63,
-    // BlockM..2*BlockM-1 hold K=64..127, ...). The descriptor's
-    // 8-M-row group stride is 1024 B = 64 uint128 (= 64 K-bf16 worth)
-    // *within* a section regardless of BlockK, so SBO for A is always
-    // `kKPerSection` = MIN(BlockK, 64). To advance the descriptor
-    // start across section boundaries we jump by the section size
-    // (`BlockM * 128 B = BlockM * 8` uint128) instead of by atoms.
+    // For BlockK > 64, loader_a sectionises A into 64-K-bf16 chunks, so the
+    // descriptor's SBO is always MIN(BlockK, 64) and crossing a section means
+    // jumping by the section size rather than by atoms.
     constexpr uint32_t kKPerSection = BlockShape::K < 64u ? BlockShape::K : 64u;
     constexpr uint32_t kKItersPerSection = kKPerSection / 16u;
     constexpr uint32_t kSectionSizeUint128 = BlockShape::M * 8u;
@@ -430,11 +253,7 @@ public:
     int4 *a_ptr = &smem.stages[stage_id].a[0]
                   + section_idx * kSectionSizeUint128
                   + iter_in_section * kKChunkUint128;
-    // B is sectionised the same way A is: the scatter above writes
-    // section-major, with each section holding 64 K-bf16 of all N.
-    // So B's descriptor SBO is also fixed at 64 K-bf16, and the iter
-    // advance crosses sections via `section_idx * kBSectionSizeUint128`
-    // (where the B section size in uint128 is `BlockN * 8`).
+    // B is sectionised the same way, at BlockN * 8 uint128 per section.
     constexpr uint32_t kBSectionSizeUint128 = BlockShape::N * 8u;
     int4 *b_ptr = &smem.b_dequant[buffer_id][0]
                   + section_idx * kBSectionSizeUint128
@@ -449,68 +268,43 @@ public:
                                   MmaOpClass::kInstrDescCFormat>(
             BlockShape::M, BlockShape::N);
 
-    // First issue of a tile: overwrite D (scale_d=false).
-    // Subsequent K-iters: accumulate (scale_d=true).
     bool scale_d = !first_issue_;
     first_issue_ = false;
 
-    // tcgen05.mma per CUTLASS pattern (cute/arch/mma_sm100_umma.hpp:65):
-    // ONE elected thread of warp 0 issues. Other threads wait at branch
-    // reconvergence. tcgen05.mma is NOT .sync.aligned (unlike alloc/
-    // dealloc which require warp-uniform participation), so this is
-    // safe and matches CUTLASS exactly.
+    // One elected thread issues. tcgen05.mma is not .sync.aligned (unlike
+    // alloc/dealloc), so warp-uniform participation is not required.
     if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
       tcgen05_mma_ss_bf16(smem.tcgen05_tmem_col, a_desc, b_desc, idesc,
                           scale_d);
     }
   }
 
-  // Close the tile's MMA batch: all prior tcgen05.mma issues from this
-  // CTA arrive on the mbarrier when they retire. Elect-one; safe to
-  // call right after the last K-iter.
+  // Close the tile's MMA batch; arrivals land on the mbarrier as issues retire.
   CUDA_INLINE void commit_accum() {
     if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
       tcgen05_commit_to_mbarrier(cast_smem_ptr_to_uint(&smem.tcgen05_mbar));
     }
   }
 
-  // Wait for the committed MMA batch to retire. Every math thread must
-  // call this, and it must precede any producer release: in-flight
-  // tcgen05.mma reads the stage SMEM through the async proxy until the
-  // batch retires, so the producer's next-tile loads would corrupt the
-  // last K-iters (observed as K-dependent scattered output errors).
+  // Must precede any producer release: in-flight tcgen05.mma reads stage SMEM
+  // through the async proxy until the batch retires, so the producer's next-tile
+  // loads would corrupt the last K-iters.
   CUDA_INLINE void wait_accum() {
     mbarrier_wait(&smem.tcgen05_mbar, mbar_phase_);
     mbar_phase_ ^= 1u;
-    tcgen05_fence_view_async_tmem_store();
+    tcgen05_fence_after_thread_sync();
   }
 
-  // Run the t2r and write the result directly into `smem.reduce` in
-  // the layout that humming's `gmem_writer::write_legacy` expects,
-  // bypassing the existing `smem_writer` (which assumes >= 2 N-warps
-  // covering BlockN -- a constraint TCGEN05 violates by design).
-  //
-  // gmem_writer reads smem.reduce as a row-major `int4 tile
-  // [BlockM][BlockN / 8]` with this XOR swizzle on the int4 col:
+  // t2r straight into smem.reduce in gmem_writer's layout, bypassing smem_writer
+  // (which assumes >= 2 N-warps). gmem_writer reads smem.reduce as row-major
+  // int4 [BlockM][BlockN / 8] with
   //   swizzled_int4_col = int4_col ^ ((row + smem_base) % 8)
-  // Each int4 holds 8 bf16 (one 8-wide N-strip of a row).
-  //
-  // The caller (EpiloguePipeline::call) must skip `smem_writer.write`
-  // for TCGEN05 -- the SMEM is already filled by the time we return.
-  // We return `nullptr` as a sentinel so the dispatcher can assert.
-  // Caller must have already run commit_accum() + wait_accum().
+  // Returns nullptr as the sentinel.
   template <class T = uint32_t>
   CUDA_INLINE T *drain_accum() {
-    // ---- tcgen05.ld -> per-thread scratch (row-per-thread) ----
-    //
-    // M=64 cta_group::1 TMEM atom (per mma_traits_sm100.hpp:507):
-    //   Shape ((16, 4), N_MMA), Stride ((1, 32), 128)
-    // Valid M values are at DPs {0..15, 32..47, 64..79, 96..111}, spanning
-    // 4 TMEM sub-partitions of 32 DPs each. Per PTX spec, a warp can only
-    // access DPs in its own sub-partition, so we need 4 warps -- each
-    // reading its sub-partition's first 16 DPs (= 16 valid M values).
-    // Lanes 16..31 of each warp see garbage at warp-local DPs 16..31 and
-    // skip the write.
+    // M=64 cta_group::1 TMEM atom: valid M sits at DPs {0..15, 32..47, 64..79,
+    // 96..111}, i.e. the first 16 DPs of each of 4 sub-partitions. A warp can
+    // only access its own sub-partition, hence 4 warps; lanes 16..31 see garbage.
     static constexpr uint32_t kMWarps = MAX(BlockShape::M / WarpShape::M, 1u);
     static constexpr uint32_t kNWarps = MAX(BlockShape::N / WarpShape::N, 1u);
     static constexpr uint32_t kCallsN = MAX(WarpShape::N / 32u, 1u);
@@ -520,26 +314,17 @@ public:
                   "atom, 32 valid M per sub-partition).");
 
     uint32_t warp_id = threadIdx.x / 32u;
-    // TMEM access is sub-partition-bound: warp `w` can ONLY read
-    // DPs (w % 4). The TMEM atom places M=0..15 in sub-part 0,
-    // M=16..31 in sub-part 1, M=32..47 in sub-part 2, M=48..63
-    // in sub-part 3 (per CUTE mma_traits_sm100.hpp:507). So the
-    // M dim MUST be fastest in warp_id, regardless of how the s2r
-    // loader_b assigns N -- the loader and t2r operate on different
-    // SMEM buffers (smem.b for s2r, TMEM for t2r), so they can use
-    // different warp layouts.
+    // M must be fastest in warp_id: the atom binds M=0..15 to sub-part 0, etc.
+    // loader_b's N assignment is independent (different buffers).
     uint32_t m_warp_id = warp_id % kMWarps;
     uint32_t n_warp_id = (warp_id / kMWarps) % kNWarps;
     uint32_t laneid = threadIdx.x % 32u;
 
-    // Per-warp implicit sub-partition base (lane->DP binding is HW-fixed).
-    // The taddr's DP field is warp-local: DP=0 = the warp's first DP.
+    // The taddr DP field is warp-local; the lane -> DP binding is HW-fixed.
     uint32_t base_addr = smem.tcgen05_tmem_col + (n_warp_id * WarpShape::N);
 
-    // ---- Per-warp t2r + pack + SMEM write ----
-    // Compile-time swizzle base -- must match gmem_writer's
-    // `offsetof(SharedStorage, reduce) / 128 % 8` read-side phase
-    // (valid because the smem union is alignas(1024)).
+    // Must match gmem_writer's read-side phase
+    // offsetof(SharedStorage, reduce) / 128 % 8 (valid because the union is alignas(1024)).
     int4 *smem_reduce = smem.reduce;
     uint32_t smem_reduce_base = offsetof(SharedStorage, reduce) / 128u % 8u;
     constexpr uint32_t kBlockN = BlockShape::N;
@@ -549,18 +334,8 @@ public:
       uint32_t tmp[32];
       uint32_t addr = base_addr + ni * 32u;
       tcgen05_ld_32x32b_x32(addr, tmp);
-      // tcgen05.ld is ASYNC -- `tmp` is undefined until wait::ld.
-      // Omitting it happens to work under some SASS schedules and shows
-      // up as nondeterministic half-tile corruption under others.
+      // tcgen05.ld is async; `tmp` is undefined until wait::ld.
       tcgen05_wait_ld();
-      // No per-ni `tcgen05_fence_view_async_tmem_store()` -- wait_accum's
-      // commit + mbarrier wait already ordered the K-loop's TMEM writes
-      // against these reads, and consecutive `tcgen05.ld` calls within
-      // the same warp don't race against each other.
-      // For M=64 atom, only the FIRST 16 DPs per sub-partition hold
-      // valid M values (DPs 16..31 are uninitialised); for M=128 atom
-      // ALL 32 DPs are valid. Gate the SMEM write by `laneid <
-      // WarpShape::M` so the same code handles both cases.
       if (laneid < WarpShape::M) {
         uint32_t m_full = (m_warp_id * WarpShape::M) + laneid;
         uint32_t col_int4_base = (n_warp_id * WarpShape::N + ni * 32u) / 8u;
@@ -571,10 +346,7 @@ public:
           uint32_t *packed_u32 = reinterpret_cast<uint32_t *>(&packed);
           float *src_fp32 =
               reinterpret_cast<float *>(tmp + int4_in_quarter * 8u);
-          // Per-N base for the 8 bf16 we're about to pack into one
-          // int4. With Ctx::kHasBias, smem.bias holds
-          // BlockN bf16 values laid out linearly (bias[n] = bias for
-          // output column n); add it to C before the f32->bf16 cast.
+          // smem.bias is BlockN ElementC laid out linearly; add before the convert.
           uint32_t int4_col_global_for_n =
               (n_warp_id * WarpShape::N + ni * 32u) / 8u
               + int4_in_quarter;
@@ -591,17 +363,9 @@ public:
               f1 += __bfloat162float(smem_bias_bf16[n0 + 1u]);
             }
             __nv_bfloat162 v = __floats2bfloat162_rn(f0, f1);
-            // Epilogue residual exponent rescale (mirrors
-            // `EpilogueArithmetic::may_apply_on_smem_write`'s
-            // `apply_exp_offset()`): when the total dequant
-            // exp_offset exceeds the mainloop's max_allowed_offset,
-            // the leftover lives in `kEpilogueExpOffset.x` and must
-            // be applied here -- WMMA/WGMMA pick it up via the
-            // smem_writer, but TCGEN05 bypasses smem_writer so we
-            // replicate the multiply inline.
-            // `!kHasTensorWeightScale` mirrors the smem_writer guard:
-            // tensor_weight_scale folds the rescale into `gs` via
-            // `may_process_on_smem_write`.
+            // Residual dequant exp offset: WMMA/WGMMA apply it in smem_writer,
+            // which TCGEN05 bypasses. The !kHasTensorWeightScale guard mirrors
+            // smem_writer's; tensor_weight_scale folds the rescale into `gs`.
             if constexpr (ArithClass::kEpilogueExpOffset.x
                           && !Ctx::kHasTensorWeightScale) {
               __nv_bfloat162 scale =
@@ -611,15 +375,10 @@ public:
             }
             packed_u32[pair] = *reinterpret_cast<uint32_t *>(&v);
           }
-          // gmem_writer treats smem.reduce as 8-int4-wide
-          // rows -- the "smem_row" coord is `gmem_row + (gmem_col / 8) *
-          // BlockM`, and the "smem_col" is `gmem_col % 8`. For BlockN<=
-          // 64 the high-section is empty and `m_full * kInt4ColsPerRow +
-          // int4_col` happened to collapse to the same offset; for
-          // BlockN > 64 we MUST split high-N int4 cols (8..15, 16..23,
-          // ...) into separate "rows" at offset (section_idx * BlockM
-          // + m_full) * 8 + section_col. Apply the gmem_writer XOR
-          // swizzle on the (smem_row, smem_col) coord, not on int4_col.
+          // gmem_writer's smem_row is gmem_row + (gmem_col / 8) * BlockM and its
+          // smem_col is gmem_col % 8, so high-N int4 cols must split into
+          // separate rows. The XOR swizzle applies to (smem_row, smem_col), not
+          // to int4_col.
           uint32_t int4_col_global = col_int4_base + int4_in_quarter;
           uint32_t section_idx = int4_col_global / 8u;        // gmem_col / 8
           uint32_t section_col = int4_col_global % 8u;        // gmem_col % 8
@@ -630,8 +389,6 @@ public:
         }
       }
     }
-    // Math-only barrier (same reasoning as the post-scatter one above):
-    // collapses to __syncthreads when not in warp-spec mode.
     ctx.sync_math_threads();
     return nullptr;
   }
@@ -643,12 +400,9 @@ public:
     return drain_accum<T>();
   }
 
-  // The s2r_pipe reads these accessors (same shape as WMMA's interface).
+  // s2r pipeline interface parity.
   template <class T = uint32_t>
   CUDA_INLINE T *regs_a_as_ptr(uint32_t buffer_id) {
-    // Interface parity with WMMA/WGMMA only. The s2r pipeline gates out
-    // `loader_a.load` for the tcgen05 path (A is read from SMEM via the
-    // descriptor), so this pointer is never written or dereferenced.
     return reinterpret_cast<T *>(regs_a);
   }
 
@@ -659,9 +413,6 @@ public:
 
   template <class T = uint32_t>
   CUDA_INLINE T *regs_b_as_ptr() {
-    // TCGEN05 doesn't keep dequantised B in RMEM beyond the transform
-    // step; expose the temporary tile so any debug/arith path that
-    // touches it during transform still works.
     return reinterpret_cast<T *>(regs_b_tmp);
   }
 
@@ -673,10 +424,7 @@ public:
 private:
   // True until the first tcgen05.mma issue lands, used to drive scale_d.
   bool first_issue_ = true;
-  // mbarrier phase parity, flipped by each commit/wait pair. Every
-  // member of this object must stay scalar: a runtime-indexed member
-  // array demotes the whole object from registers to a local-memory
-  // stack frame (measured STACK 16 -> 1104 B and a 4x slowdown).
+  // Every member must stay scalar: a runtime-indexed member array demotes the
+  // whole object from registers to a local stack frame.
   uint32_t mbar_phase_ = 0;
 };
-

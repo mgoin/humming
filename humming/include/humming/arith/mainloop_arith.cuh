@@ -54,11 +54,8 @@ private:
       MmaOpClass::kNativeMixed>();
 
 public:
-  // Residual exponent offset left over after the mainloop applies
-  // kExpOffset.x; it has to be applied when the result is written to SMEM.
-  // The WMMA / WGMMA paths read it through EpilogueArithmetic::kExpOffset in
-  // smem_writer, but the TCGEN05 path bypasses smem_writer and reads it here.
-  // Mirrors EpilogueArithmetic::kExpOffset exactly.
+  // Residual exponent offset for the SMEM write, mirroring
+  // EpilogueArithmetic::kExpOffset; TCGEN05 bypasses smem_writer and reads it here.
   static constexpr uint2 kEpilogueExpOffset = get_epilogue_exp_offset<
       ElementA, ElementB, ElementC, ElementBS, kHasZeroPoint,
       kIsF16Accum, kIsGroupInputScale,
@@ -75,9 +72,7 @@ private:
   static constexpr uint32_t kNumBSPerGroup = kNumSubBlocksN * kNumBSPerSubBlock;
 
 public:
-  // alignas(16): these are read and written through vectorized int4 accesses;
-  // without it the compiler can spill them to local memory at unaligned
-  // offsets and silently drop bytes.
+  // alignas(16): accessed as int4; unaligned spills silently drop bytes.
   alignas(16) uint32_t as[2][kNumASPerGroup];
   alignas(16) uint32_t q_as[kNumASPerGroup];
   alignas(16) uint32_t bs[2][MAX(kNumBSPerGroup, 8) * ElementBS::kBits / 32];

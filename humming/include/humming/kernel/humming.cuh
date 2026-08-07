@@ -73,11 +73,9 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   extern __shared__ int4 shared_memory[];
   auto &smem = *reinterpret_cast<SharedStorage *>(shared_memory);
 
-  // TMEM alloc at kernel entry (see humming_ws.cuh): the driver sizes the
-  // per-CTA TMEM reservation from the cubin's at-entry fragment, so a buried
-  // alloc reserves all 512 columns and pins occupancy to one CTA per SM.
-  // tcgen05.alloc is .sync.aligned, hence all 32 threads of warp 0.
-  // mbarrier_init_sync() below publishes the column index and the mbarriers.
+  // The driver sizes the per-CTA TMEM reservation from the cubin's at-entry
+  // fragment: an alloc placed later reserves all 512 columns and pins occupancy
+  // to one CTA/SM. tcgen05.alloc is .sync.aligned, hence all 32 threads.
   if constexpr (Ctx::kMmaType == MmaType::TCGEN05) {
     if (threadIdx.x < 32) {
       tcgen05_alloc<SharedStorage::kTcgen05TmemCols>(cast_smem_ptr_to_uint(&smem.tcgen05_tmem_col));
@@ -183,9 +181,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     epilogue.call(mma.final_regs_c_as_ptr());
   }
 
-  // tcgen05.{relinquish_alloc_permit, dealloc} are .sync.aligned, so all 32
-  // threads of warp 0 issue them together, after a CTA-wide sync that retires
-  // every t2r.
+  // relinquish/dealloc are .sync.aligned; the sync retires every t2r first.
   if constexpr (Ctx::kMmaType == MmaType::TCGEN05) {
     __syncthreads();
     if (threadIdx.x < 32) {
