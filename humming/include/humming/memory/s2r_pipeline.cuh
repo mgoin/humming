@@ -1,5 +1,7 @@
 #pragma once
 
+#include <humming/arith/exp_offset.cuh>
+#include <humming/datatype/dequant_single.cuh>
 #include <humming/memory/s2r_loader/loader_a.cuh>
 #include <humming/memory/s2r_loader/loader_as.cuh>
 #include <humming/memory/s2r_loader/loader_b.cuh>
@@ -111,7 +113,8 @@ public:
   //   * codes: the slot-paired layout of docs/tcgen05_ts_packing.md is
   //     byte-compatible with loader_b's WarpN == 32 half-group gather, which
   //     delivers row n's codes with no loader change;
-  //   * scale: bf16 at smem.bs[n] (identity N order), broadcast to bf16x2;
+  //   * scale: ElementBS at smem.bs[n] (identity N order), decoded to
+  //     ElementA and broadcast to a pair;
   //   * zp: folded into the per-lane dequant bias, format per weight dtype.
   CUDA_INLINE void load_stage_iter_ts(uint32_t stage_id, uint32_t iter_id, uint32_t buffer_id) {
     auto &smem = ctx.smem;
@@ -129,43 +132,70 @@ public:
     }
 
     if constexpr (kIsGroupWeightScale) {
-      // g2s stages the group's scale rows contiguously at bf16 stride BlockN,
-      // so row n of group g is bs16[g * BlockN + n].
-      const uint16_t *bs16 = reinterpret_cast<const uint16_t *>(smem.stages[stage_id].bs);
-      uint32_t s = bs16[bs_group * BlockShape::N + n];
-      mma.regs_bs2_ts[buffer_id] = (s << 16) | s;
+      // g2s stages the group's scale rows contiguously at ElementBS stride
+      // BlockN, so row n of group g is bs[g * BlockN + n].
+      using ElementBS = typename Ctx::ElementBS;
+      uint32_t index = bs_group * BlockShape::N + n;
+      if constexpr (ElementBS::kBits == 16) {
+        // The gate pins bs_dtype == a_dtype, so the word is ElementA already.
+        uint32_t s = reinterpret_cast<const uint16_t *>(smem.stages[stage_id].bs)[index];
+        mma.regs_bs2_ts[buffer_id] = (s << 16) | s;
+      } else {
+        // 8-bit software float scale (e8m0 / e4m3): broadcast the byte to the
+        // top of both 16-bit halves and take the same fp_to_fp + 2^kOff decode
+        // the generic dequant path uses, so the value handed to transform_b is
+        // a plain ElementA pair. e8m0 -> bf16 is kOff == 0, i.e. exp << 7
+        // (shared bias 127); e == 0 flushes to zero and e == 0xFF becomes inf,
+        // matching dequant_single on the mma.sync path.
+        static_assert(ElementBS::kBits == 8, "TS weight scale: 16- or 8-bit");
+        using Scalar2 = typename F16Conversion<ElementA>::scalar_t2;
+        constexpr uint32_t kScaleOff = get_dtype_dequant_exp_offset<ElementA, ElementBS>();
+        uint32_t e = reinterpret_cast<const uint8_t *>(smem.stages[stage_id].bs)[index];
+        uint32_t raw = fp_to_fp<ElementBS, ElementA>((e * 0x00010001u) << (16u - ElementBS::kBits));
+        Scalar2 s = ts_mul_pow2<kScaleOff, ElementA>(*reinterpret_cast<Scalar2 *>(&raw));
+        mma.regs_bs2_ts[buffer_id] = *reinterpret_cast<uint32_t *>(&s);
+      }
     }
 
-    // The zp operand format is per weight dtype; transform_b's
-    // ts_dequant_b_pair consumes it accordingly.
+    // Two independent axes, conflated before fp16 A existed:
+    //   * the bias FORMAT follows the dequant arm ts_dequant_b_pair picks --
+    //     uint_to_f16 wants an ElementA x2 subtrahend (base + zp), the
+    //     normalized_uint_to_fp arm wants the raw integer zp;
+    //   * the packed zp STREAM is nibble-wide up to 4 bits and byte-wide above
+    //     (ts_packing.pack_zero_point_tcgen05_ts).
+    // bf16 A ties them (uint8 is its only >4-bit dtype and it takes the
+    // normalized arm); fp16 A has 10 mantissa bits, so uint8 takes
+    // uint_to_f16 out of a byte-wide stream.
     constexpr uint32_t kBBits = Ctx::ElementB::kBits;
+    constexpr bool kBiasIsF16x2 =
+        Ctx::ElementB::kIsIntegerType && kBBits <= ElementA::kMantissaBits;
     // Dequant base per ElementA: bf16 128.0 == 0x4300, fp16 1024.0 == 0x6400.
     // Both hold 2^(kBits - 1) + zp exactly in the low mantissa, so uint_to_f16
     // subtracting (base | zp) emits code - zp.
     constexpr uint32_t kBiasBase = std::is_same<ElementA, Float16>::value ? 0x64006400u : 0x43004300u;
     if constexpr (kIsFpZeroPoint) {
-      // A per-lane bf16 in the same [K / gs, N] stream layout as the scale.
-      // transform_b subtracts it from the raw code before the scale, so the
-      // bias register only carries the raw-code dequant base.
-      mma.regs_bias2_ts[buffer_id] = kBiasBase;
+      // A per-lane ElementA in the same [K / gs, N] stream layout as the
+      // scale. Both dequant arms hand transform_b the raw code at full
+      // magnitude, so the zp is subtracted there, post-dequant and pre-scale;
+      // the bias register only carries the raw-code dequant base.
+      mma.regs_bias2_ts[buffer_id] = kBiasIsF16x2 ? kBiasBase : 0u;
       uint32_t z = 0u;
       if constexpr (kHasZeroPoint) z = zp_elem<uint16_t>(stage_id, bs_group * BlockShape::N + n);
       mma.regs_zpfp2_ts[buffer_id] = (z << 16) | z;
-    } else if constexpr (kBBits <= 4) {
-      // 4-bit zp nibble folded into the bf16 subtrahend; no-zp uses the
-      // symmetric midpoint 2^(kBits - 1), matching the reference dequant.
-      // Row n lives in byte n / 2, nibble n % 2, so the group stride halves.
-      uint32_t zp = 1u << (kBBits - 1u);
-      if constexpr (kHasZeroPoint) {
-        uint32_t byte = zp_elem<uint8_t>(stage_id, bs_group * (BlockShape::N / 2u) + (n >> 1));
-        zp = (byte >> ((n & 1u) * 4u)) & 0xFu;
-      }
-      mma.regs_bias2_ts[buffer_id] = kBiasBase | (zp << 16) | zp;
     } else {
-      // uint8 byte zp: one byte per row.
-      uint32_t zp = 0u;
-      if constexpr (kHasZeroPoint) zp = zp_elem<uint8_t>(stage_id, bs_group * BlockShape::N + n);
-      mma.regs_bias2_ts[buffer_id] = zp;
+      // No-zp uses the symmetric midpoint 2^(kBits - 1) in the f16x2 format,
+      // matching the reference dequant; the normalized arm bakes its own.
+      uint32_t zp = kBiasIsF16x2 ? (1u << (kBBits - 1u)) : 0u;
+      if constexpr (kHasZeroPoint) {
+        if constexpr (kBBits <= 4) {
+          // Row n lives in byte n / 2, nibble n % 2, so the group stride halves.
+          uint32_t byte = zp_elem<uint8_t>(stage_id, bs_group * (BlockShape::N / 2u) + (n >> 1));
+          zp = (byte >> ((n & 1u) * 4u)) & 0xFu;
+        } else {
+          zp = zp_elem<uint8_t>(stage_id, bs_group * BlockShape::N + n);
+        }
+      }
+      mma.regs_bias2_ts[buffer_id] = kBiasIsF16x2 ? (kBiasBase | (zp << 16) | zp) : zp;
     }
   }
 

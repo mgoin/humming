@@ -34,11 +34,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _fp(name: str) -> dtypes.DataType:
+    """A narrow float dtype with no humming.dtypes constant."""
+    return dtypes.DataType.from_str(name)
+
+
 def _case(
     name: str,
     *,
+    a_dtype=dtypes.bfloat16,
     b_dtype=dtypes.uint4,
-    bs_dtype=dtypes.bfloat16,
+    c_dtype=None,
+    bs_dtype=None,
     group_size: int = 128,
     group_size_n: int = 0,
     weight_scale_type: WeightScaleType | None = None,
@@ -49,17 +56,22 @@ def _case(
     shape_n: int = SHAPE_N,
     shape_k: int = SHAPE_K,
     mma_type=MmaType.TCGEN05,
+    weight_std_scale: float = 1.0,
+    input_std_scale: float = 1.0,
     atol: float = 0.05,
 ) -> KernelTestCase:
+    # c_dtype and bs_dtype track a_dtype unless a case is pinning the split:
+    # the TS s2r branch reads a 16-bit group scale and the fp zero point as
+    # ElementA regardless of how the launcher typed them.
     return KernelTestCase(
         name=name,
         layer_config=LayerConfig(
             shape_n=shape_n,
             shape_k=shape_k,
-            a_dtype=dtypes.bfloat16,
+            a_dtype=a_dtype,
             b_dtype=b_dtype,
-            c_dtype=dtypes.bfloat16,
-            bs_dtype=bs_dtype,
+            c_dtype=c_dtype or a_dtype,
+            bs_dtype=bs_dtype or a_dtype,
             weight_scale_group_size=group_size,
             weight_scale_group_size_n=group_size_n,
             weight_scale_type=weight_scale_type,
@@ -71,35 +83,107 @@ def _case(
         ),
         compute_config=ComputeConfig(gemm_type=GemmType.DENSE),
         seed=2026,
+        weight_std_scale=weight_std_scale,
+        input_std_scale=input_std_scale,
         atol=atol,
     )
 
 
+# Both activation dtypes issue tcgen05.mma kind::f16; ElementA picks the
+# dequant base and every exponent offset, and fp16's three extra mantissa bits
+# move uint8 from the normalized_uint_to_fp arm to uint_to_f16.
+TS_A_DTYPES = (dtypes.bfloat16, dtypes.float16)
+_A_NAME = {dtypes.bfloat16: "bf16", dtypes.float16: "fp16"}
+
 # Every weight dtype wired into ts_dequant_b_pair, with the zero-point modes
-# each one supports: integer zp for the uint_to_f16 dtypes, none for the fp
-# dtypes (their dequant carries a constant exponent offset instead).
-TS_WEIGHT_DTYPE_CASES = (
-    _case("uint2", b_dtype=dtypes.uint2),
-    _case("uint2-zp", b_dtype=dtypes.uint2, has_zero_point=True),
-    _case("uint4", b_dtype=dtypes.uint4),
-    _case("uint4-zp", b_dtype=dtypes.uint4, has_zero_point=True),
-    _case("uint8", b_dtype=dtypes.uint8),
-    _case("uint8-zp", b_dtype=dtypes.uint8, has_zero_point=True),
-    _case("fp4e2m1", b_dtype=dtypes.float4e2m1),
-    _case("fp8e4m3", b_dtype=dtypes.float8e4m3),
+# each one supports: integer zp for the unsigned-integer dtypes, none for the
+# fp dtypes (their dequant carries a constant exponent offset instead).
+TS_B_DTYPE_ZP_MODES = (
+    (dtypes.uint2, (False, True)),
+    (dtypes.uint4, (False, True)),
+    (dtypes.uint8, (False, True)),
+    (dtypes.float4e2m1, (False,)),
+    (_fp("float4e3m0"), (False,)),
+    (_fp("float8e1m6"), (False,)),
+    (dtypes.float8e4m3, (False,)),
+    (dtypes.float8e5m2, (False,)),
 )
 
+
+def _weight_dtype_cases() -> tuple[KernelTestCase, ...]:
+    cases = []
+    for a_dtype in TS_A_DTYPES:
+        for b_dtype, zp_modes in TS_B_DTYPE_ZP_MODES:
+            for has_zero_point in zp_modes:
+                suffix = "-zp" if has_zero_point else ""
+                cases.append(
+                    _case(
+                        f"{_A_NAME[a_dtype]}-{b_dtype}{suffix}",
+                        a_dtype=a_dtype,
+                        b_dtype=b_dtype,
+                        has_zero_point=has_zero_point,
+                    )
+                )
+    return tuple(cases)
+
+
+TS_WEIGHT_DTYPE_CASES = _weight_dtype_cases()
+
 # gs=0 folds the row scale into the TMEM drain, gs=64 advances the scale row
-# every stage, and gs<64 puts two groups in one BlockK=64 stage.
+# every stage, and gs<64 puts two groups in one BlockK=64 stage. The 8-bit
+# group scales are decoded to ElementA at the s2r load.
 TS_SCALE_CASES = (
-    _case("uint4-channel-scale", group_size=0),
-    _case("uint4-zp-gs16", has_zero_point=True, group_size=16),
-    _case("uint4-zp-gs32", has_zero_point=True, group_size=32),
-    _case("uint4-zp-gs64", has_zero_point=True, group_size=64),
-    _case("uint4-fp-zp-gs128", has_zero_point=True, is_fp_zero_point=True),
-    _case("uint4-fp-zp-gs32", has_zero_point=True, is_fp_zero_point=True, group_size=32),
-    _case("uint2-fp-zp-gs128", b_dtype=dtypes.uint2, has_zero_point=True, is_fp_zero_point=True),
-    _case("uint4-zp-bias", has_zero_point=True, has_bias=True),
+    _case("bf16-uint4-channel-scale", group_size=0),
+    _case("fp16-uint4-channel-scale", a_dtype=dtypes.float16, group_size=0),
+    _case("bf16-uint4-zp-gs16", has_zero_point=True, group_size=16),
+    _case("bf16-uint4-zp-gs32", has_zero_point=True, group_size=32),
+    _case("bf16-uint4-zp-gs64", has_zero_point=True, group_size=64),
+    _case("fp16-uint4-zp-gs32", a_dtype=dtypes.float16, has_zero_point=True, group_size=32),
+    # The byte-wide zp stream against a sub-stage group: fp16 reads it through
+    # the uint_to_f16 bias format, bf16 through the raw-integer one.
+    _case("bf16-uint8-zp-gs32", b_dtype=dtypes.uint8, has_zero_point=True, group_size=32),
+    _case(
+        "fp16-uint8-zp-gs32",
+        a_dtype=dtypes.float16,
+        b_dtype=dtypes.uint8,
+        has_zero_point=True,
+        group_size=32,
+    ),
+    _case("bf16-uint4-fp-zp-gs128", has_zero_point=True, is_fp_zero_point=True),
+    _case("bf16-uint4-fp-zp-gs32", has_zero_point=True, is_fp_zero_point=True, group_size=32),
+    _case("bf16-uint2-fp-zp-gs128", b_dtype=dtypes.uint2, has_zero_point=True, is_fp_zero_point=True),
+    _case(
+        "fp16-uint4-fp-zp-gs128",
+        a_dtype=dtypes.float16,
+        has_zero_point=True,
+        is_fp_zero_point=True,
+    ),
+    # An fp zero point above 4 bits: bf16 subtracts it after the normalized
+    # dequant has been lifted back by 2^133, fp16 after uint_to_f16.
+    _case("bf16-uint8-fp-zp-gs128", b_dtype=dtypes.uint8, has_zero_point=True, is_fp_zero_point=True),
+    _case(
+        "fp16-uint8-fp-zp-gs128",
+        a_dtype=dtypes.float16,
+        b_dtype=dtypes.uint8,
+        has_zero_point=True,
+        is_fp_zero_point=True,
+    ),
+    _case("bf16-bs-e8m0-gs32", bs_dtype=dtypes.float8e8m0, group_size=32),
+    _case(
+        "bf16-bs-e8m0-uint8-zp",
+        b_dtype=dtypes.uint8,
+        bs_dtype=dtypes.float8e8m0,
+        has_zero_point=True,
+        group_size=64,
+    ),
+    _case("bf16-bs-e4m3-zp", bs_dtype=dtypes.float8e4m3, has_zero_point=True),
+    _case(
+        "fp16-bs-e4m3-zp",
+        a_dtype=dtypes.float16,
+        bs_dtype=dtypes.float8e4m3,
+        has_zero_point=True,
+    ),
+    _case("bf16-uint4-zp-bias", has_zero_point=True, has_bias=True),
 )
 
 # TS is legal for shape_n % 128 == 0 and shape_k % 64 == 0; these walk the
@@ -110,9 +194,84 @@ TS_SHAPE_CASES = (
     _case("odd-n-tiles", has_zero_point=True, shape_n=384),
     _case("k-not-multiple-128", has_zero_point=True, group_size=64, shape_n=256, shape_k=320),
     _case("fat-k", has_zero_point=True, shape_n=1024, shape_k=8192, atol=0.1),
+    _case(
+        "fp16-fat-k",
+        a_dtype=dtypes.float16,
+        has_zero_point=True,
+        shape_n=1024,
+        shape_k=8192,
+        atol=0.1,
+    ),
 )
 
 TS_CASES = TS_WEIGHT_DTYPE_CASES + TS_SCALE_CASES + TS_SHAPE_CASES
+
+# ts_dequant_b_pair reconstructs each code exactly -- 2^kOff undoes fp_to_fp's
+# bias shift and nothing larger than the dequantised weight is ever formed --
+# so the TS drain carries no epilogue exponent residual. fp16 is where that
+# matters: the generic mma.sync mainloop caps its offset at 15 - kBits + 1 and
+# defers the rest to the epilogue, keeping its operand 4x below the true value.
+# Each cell pins the |w| window it has to land in for the run to be adversarial
+# at all. The fp16 weight cells sit 2.16x below 65504, so a mainloop
+# intermediate even that much above the reconstructed weight saturates to inf;
+# the e4m3-scale cells saturate the scale itself at both ends of its 8-bit
+# range (uint4's no-zp dequant spans +-8 codes, so |w|max == 8 * scale_max).
+TS_EXTREME_CASES = (
+    (
+        _case(
+            "fp16-fp4e2m1-max-magnitude",
+            a_dtype=dtypes.float16,
+            b_dtype=dtypes.float4e2m1,
+            weight_std_scale=3e4,
+            input_std_scale=1e-3,
+            atol=0.5,
+        ),
+        (2.5e4, 6.5504e4),
+    ),
+    (
+        _case(
+            "fp16-fp8e4m3-max-magnitude",
+            a_dtype=dtypes.float16,
+            b_dtype=dtypes.float8e4m3,
+            weight_std_scale=3e4,
+            input_std_scale=1e-3,
+            atol=0.5,
+        ),
+        (2.5e4, 6.5504e4),
+    ),
+    (
+        _case(
+            "fp16-uint8-max-magnitude",
+            a_dtype=dtypes.float16,
+            b_dtype=dtypes.uint8,
+            weight_std_scale=3e4,
+            input_std_scale=1e-3,
+            atol=0.5,
+        ),
+        (2.5e4, 6.5504e4),
+    ),
+    (
+        _case(
+            "fp16-bs-e4m3-max-exponent",
+            a_dtype=dtypes.float16,
+            bs_dtype=dtypes.float8e4m3,
+            weight_std_scale=3e4,
+            input_std_scale=1e-3,
+            atol=0.5,
+        ),
+        (8 * 448.0, 8 * 448.0),
+    ),
+    (
+        _case(
+            "bf16-bs-e4m3-min-exponent",
+            bs_dtype=dtypes.float8e4m3,
+            weight_std_scale=1e-2,
+            input_std_scale=1e-3,
+            atol=1e-4,
+        ),
+        (8 * 2**-9, 8 * 2**-9),
+    ),
+)
 
 # mma_type="tcgen05" is an opt-in to the tcgen05 family, so a layer neither
 # mainloop is legal for must be rejected while packing instead of falling back.
@@ -139,6 +298,12 @@ ILLEGAL_CASES = (
         weight_scale_2_type=WeightScale2Type.TENSOR,
     ),
     _case("ss-layer-channel-scale", b_dtype=dtypes.uint3, group_size=0),
+    # SS is bf16-only (mma/tcgen05_mma.cuh static_asserts ElementA), so an
+    # fp16 layer TS turns down is rejected rather than downgraded. The two
+    # dtype-split rejections (bs_dtype and c_dtype against a_dtype) cannot be
+    # built as running cases -- the weight schema rejects the mismatched scale
+    # tensor first -- and are pinned in test_tcgen05_heuristic.py instead.
+    _case("fp16-a-with-e8m0-scale", a_dtype=dtypes.float16, bs_dtype=dtypes.float8e8m0, group_size=32),
     _case(
         "ss-layer-tensor-scale",
         b_dtype=dtypes.uint3,
@@ -152,11 +317,6 @@ ILLEGAL_CASES = (
 # dtype TS also carries only reaches SS at the latter.
 SS_SHAPE_N_BLOCK128 = 4096
 SS_SHAPE_N_BLOCK64 = 4160
-
-
-def _fp(name: str) -> dtypes.DataType:
-    """A narrow float weight dtype with no humming.dtypes constant."""
-    return dtypes.DataType.from_str(name)
 
 
 def _ss_case(
@@ -213,7 +373,7 @@ SS_WEIGHT_DTYPE_CASES = (
     _ss_case("ss-fp3e1m1", b_dtype=_fp("float3e1m1")),
     _ss_case("ss-fp3e2m0", b_dtype=_fp("float3e2m0"), shape_n=SS_SHAPE_N_BLOCK64),
     _ss_case("ss-fp4e2m1", b_dtype=dtypes.float4e2m1, shape_n=SS_SHAPE_N_BLOCK64),
-    _ss_case("ss-fp4e3m0", b_dtype=_fp("float4e3m0")),
+    _ss_case("ss-fp4e3m0", b_dtype=_fp("float4e3m0"), shape_n=SS_SHAPE_N_BLOCK64),
     _ss_case("ss-fp5e2m2", b_dtype=_fp("float5e2m2")),
     _ss_case("ss-fp5e4m0", b_dtype=_fp("float5e4m0"), shape_n=SS_SHAPE_N_BLOCK64),
     _ss_case("ss-fp6e2m3", b_dtype=dtypes.float6e2m3),
@@ -223,7 +383,7 @@ SS_WEIGHT_DTYPE_CASES = (
     _ss_case("ss-fp7e6m0", b_dtype=_fp("float7e6m0")),
     _ss_case("ss-fp8e1m6", b_dtype=_fp("float8e1m6"), shape_n=SS_SHAPE_N_BLOCK64),
     _ss_case("ss-fp8e4m3", b_dtype=dtypes.float8e4m3, shape_n=SS_SHAPE_N_BLOCK64),
-    _ss_case("ss-fp8e5m2", b_dtype=dtypes.float8e5m2),
+    _ss_case("ss-fp8e5m2", b_dtype=dtypes.float8e5m2, shape_n=SS_SHAPE_N_BLOCK64),
 )
 
 # The quantisation parameters SS admits beyond a bf16 group scale. Each is
@@ -237,7 +397,12 @@ SS_SCALE_CASES = (
         is_fp_zero_point=True,
         shape_n=SS_SHAPE_N_BLOCK64,
     ),
-    _ss_case("ss-bs-e8m0-gs32", bs_dtype=dtypes.float8e8m0, group_size=32),
+    _ss_case(
+        "ss-bs-e8m0-gs32",
+        bs_dtype=dtypes.float8e8m0,
+        group_size=32,
+        shape_n=SS_SHAPE_N_BLOCK64,
+    ),
     _ss_case(
         "ss-bs-e4m3",
         bs_dtype=dtypes.float8e4m3,
@@ -279,6 +444,58 @@ def test_tcgen05_ts(test_case):
     _run(test_case, expect_ts=True)
 
 
+@pytest.mark.parametrize(
+    "test_case,weight_window",
+    TS_EXTREME_CASES,
+    ids=[case.name for case, _ in TS_EXTREME_CASES],
+)
+def test_tcgen05_ts_max_magnitude(test_case, weight_window):
+    """No TS intermediate exceeds the reconstructed weight, so a layer whose
+    dequantised weights fit ElementA needs no epilogue exponent residual."""
+    config = test_case.layer_config
+    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value)
+    assert config.tcgen05_supported
+    runner = KernelTestRunner(test_case)
+    weight_max = runner.weight_ref.float().abs().max().item()
+    assert weight_window[0] <= weight_max <= weight_window[1]
+    results = runner.run()
+    for result in results:
+        assert result.tuning_values["use_tcgen05_ts"] is True
+        assert torch.isfinite(result.outputs.float()).all()
+        torch.testing.assert_close(
+            result.outputs, result.outputs_ref, rtol=test_case.rtol, atol=test_case.atol
+        )
+    assert_kernel_test_shape_coverage(results)
+
+
+@pytest.mark.parametrize("a_dtype", TS_A_DTYPES, ids=str)
+def test_tcgen05_ts_fp_weight_covers_every_code(a_dtype):
+    """float8e1m6 has the largest single-step exponent offset the fp arm can
+    ask for (127 on bf16, 15 on fp16), so the run has to reach both ends of the
+    format -- the max-exponent codes and the subnormal quantum -- not just the
+    middle of the distribution."""
+    b_dtype = _fp("float8e1m6")
+    test_case = _case(f"{_A_NAME[a_dtype]}-{b_dtype}-codes", a_dtype=a_dtype, b_dtype=b_dtype)
+    skip_if_unsupported(a_dtype=a_dtype, mma_type="tcgen05")
+    runner = KernelTestRunner(test_case)
+
+    group_size = test_case.layer_config.weight_scale_group_size
+    groups = runner.weight_ref.float().view(SHAPE_N, SHAPE_K // group_size, group_size)
+    # weight_ref == code_value * scale and the quantiser puts each group's amax
+    # on the max-magnitude code, so this recovers the code values themselves.
+    codes = groups / groups.abs().amax(-1, keepdim=True)
+    magnitudes = codes.abs().unique()
+    assert len(magnitudes) == 1 << (b_dtype.num_bits - 1)
+    assert magnitudes.max().item() == 1.0
+
+    results = runner.run()
+    for result in results:
+        assert result.tuning_values["use_tcgen05_ts"] is True
+        torch.testing.assert_close(
+            result.outputs, result.outputs_ref, rtol=test_case.rtol, atol=test_case.atol
+        )
+
+
 @pytest.mark.parametrize("test_case", ILLEGAL_CASES, ids=str)
 def test_tcgen05_rejects_illegal_layer(test_case):
     config = test_case.layer_config
@@ -304,8 +521,9 @@ def test_tcgen05_ss(test_case):
     assert not any(result.tuning_values.get("use_tcgen05_ts") for result in results)
 
 
+@pytest.mark.parametrize("torch_dtype", [torch.bfloat16, torch.float16], ids=str)
 @pytest.mark.parametrize("shape_m", [17, 256])
-def test_tcgen05_ts_layer_opt_in(shape_m):
+def test_tcgen05_ts_layer_opt_in(shape_m, torch_dtype):
     """mma_type reaches LayerConfig through HummingLayer, and the opted-in
     layer matches the default path on the same unquantized weights."""
     from humming.layer import HummingLayer
@@ -315,19 +533,19 @@ def test_tcgen05_ts_layer_opt_in(shape_m):
     shape_n, shape_k = 512, 512
     schema = HummingWeightSchema(
         b_dtype=dtypes.uint4,
-        bs_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.DataType.from_torch_dtype(torch_dtype),
         weight_scale_group_size=128,
         has_zero_point=True,
     )
 
     def build(mma_type):
         torch.manual_seed(2026)
-        weight = torch.randn(shape_n, shape_k, dtype=torch.bfloat16, device="cuda") / shape_k**0.5
+        weight = torch.randn(shape_n, shape_k, dtype=torch_dtype, device="cuda") / shape_k**0.5
         layer = HummingLayer(
             shape_n=shape_n,
             shape_k=shape_k,
             weight_config=schema,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=torch_dtype,
             mma_type=mma_type,
         ).cuda()
         layer.load_from_unquantized(weight)
@@ -340,7 +558,7 @@ def test_tcgen05_ts_layer_opt_in(shape_m):
     assert layer_ts.humming_metas[""].mma_type == MmaType.TCGEN05
 
     torch.manual_seed(11)
-    inputs = torch.randn(shape_m, shape_k, dtype=torch.bfloat16, device="cuda") / shape_k**0.5
+    inputs = torch.randn(shape_m, shape_k, dtype=torch_dtype, device="cuda") / shape_k**0.5
     outputs_default = layer_default.forward(inputs.clone())
     outputs_ts = layer_ts.forward(inputs.clone())
     torch.testing.assert_close(outputs_ts, outputs_default, rtol=0.01, atol=0.05)
@@ -371,21 +589,55 @@ def test_tcgen05_layer_rejects_illegal_shape():
 
 
 def test_tcgen05_case_coverage():
-    assert all(case.layer_config.mma_type == MmaType.TCGEN05 for case in TS_CASES)
-    assert {case.layer_config.b_dtype for case in TS_WEIGHT_DTYPE_CASES} == {
-        dtypes.uint2,
-        dtypes.uint4,
-        dtypes.uint8,
-        dtypes.float4e2m1,
-        dtypes.float8e4m3,
-    }
-    assert {case.layer_config.weight_scale_group_size for case in TS_CASES} == {0, 16, 32, 64, 128}
+    from humming.config.config import TCGEN05_TS_A_DTYPES, TCGEN05_TS_B_DTYPES
 
-    zero_point_modes = {
-        (case.layer_config.has_zero_point, case.layer_config.is_fp_zero_point) for case in TS_CASES
+    ts_configs = [case.layer_config for case in TS_CASES]
+    assert all(config.mma_type == MmaType.TCGEN05 for config in ts_configs)
+
+    # Every weight dtype and activation dtype the TS gate admits must have a
+    # running case, so the allowlists and this suite cannot drift apart.
+    assert {config.b_dtype for config in ts_configs} == set(TCGEN05_TS_B_DTYPES)
+    assert {config.a_dtype for config in ts_configs} == set(TCGEN05_TS_A_DTYPES)
+    weight_dtype_configs = [case.layer_config for case in TS_WEIGHT_DTYPE_CASES]
+    for a_dtype in TCGEN05_TS_A_DTYPES:
+        assert {config.b_dtype for config in weight_dtype_configs if config.a_dtype == a_dtype} == set(
+            TCGEN05_TS_B_DTYPES
+        )
+    # The dequant arm flips with ElementA's mantissa width, so every integer
+    # dtype runs both zero-point-free and with an integer zero point on both.
+    assert {(config.a_dtype, config.b_dtype) for config in weight_dtype_configs if config.has_zero_point} == {
+        (a_dtype, b_dtype)
+        for a_dtype in TCGEN05_TS_A_DTYPES
+        for b_dtype in TCGEN05_TS_B_DTYPES
+        if b_dtype.is_integer_type
     }
+
+    # c_dtype and a 16-bit scale are read as ElementA by the TS kernel; the
+    # only other legal scale dtypes are the 8-bit ones s2r decodes.
+    assert all(config.c_dtype == config.a_dtype for config in ts_configs)
+    assert {config.bs_dtype for config in ts_configs} == set(TCGEN05_TS_A_DTYPES) | {
+        dtypes.float8e4m3,
+        dtypes.float8e8m0,
+    }
+    assert all(
+        config.bs_dtype == config.a_dtype
+        for config in ts_configs
+        if config.weight_scale_type == WeightScaleType.CHANNEL
+    )
+
+    assert {config.weight_scale_group_size for config in ts_configs} == {0, 16, 32, 64, 128}
+
+    zero_point_modes = {(config.has_zero_point, config.is_fp_zero_point) for config in ts_configs}
     assert zero_point_modes == {(False, False), (True, False), (True, True)}
-    assert any(case.layer_config.has_bias for case in TS_CASES)
+    # The fp zero point is subtracted post-dequant, so it has to run against
+    # both dequant arms: uint4 takes uint_to_f16 on either activation, uint8
+    # takes normalized_uint_to_fp on bf16 and uint_to_f16 on fp16.
+    assert {(config.a_dtype, config.b_dtype) for config in ts_configs if config.is_fp_zero_point} >= {
+        (dtypes.bfloat16, dtypes.uint8),
+        (dtypes.float16, dtypes.uint8),
+        (dtypes.float16, dtypes.uint4),
+    }
+    assert any(config.has_bias for config in ts_configs)
 
     shape_ns = {case.layer_config.shape_n for case in TS_SHAPE_CASES}
     shape_ks = {case.layer_config.shape_k for case in TS_SHAPE_CASES}
@@ -426,9 +678,16 @@ def test_tcgen05_case_coverage():
         dtypes.float32,
     }
 
-    # Fail-closed coverage: the scale kinds the tcgen05 drains would drop.
+    # SS never sees an fp16 layer: its mainloop and drain are bf16-shaped.
+    assert all(config.a_dtype == dtypes.bfloat16 for config in ss_configs)
+
+    # Fail-closed coverage: the scale kinds the tcgen05 drains would drop, plus
+    # the three fp16 dtype splits that run to completion and return garbage.
     illegal_configs = [case.layer_config for case in ILLEGAL_CASES]
     assert {config.weight_scale_2_type for config in illegal_configs} == set(WeightScale2Type)
     assert {WeightScaleType.CHANNEL, WeightScaleType.TENSOR} <= {
         config.weight_scale_type for config in illegal_configs
+    }
+    assert {config.bs_dtype for config in illegal_configs if config.a_dtype == dtypes.float16} == {
+        dtypes.float8e8m0
     }

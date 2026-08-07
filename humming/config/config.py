@@ -9,14 +9,24 @@ from humming.config.base import BaseHummingConfig
 from humming.config.enum import GemmType, MmaType, WeightScale2Type, WeightScaleType
 
 # Weight dtypes wired into the TS-mode dequant (ts_dequant_b_pair in
-# mma/tcgen05_ts_mma.cuh and the guards in utils/ts_packing.py).
+# mma/tcgen05_ts_mma.cuh and the guards in utils/ts_packing.py). The floating
+# dtypes all share one generic arm; the list is limited to the widths the TS
+# packer holds (32 % num_bits == 0).
 TCGEN05_TS_B_DTYPES = (
     dtypes.uint2,
     dtypes.uint4,
     dtypes.uint8,
     dtypes.float4e2m1,
+    dtypes.DataType.from_str("float4e3m0"),
+    dtypes.DataType.from_str("float8e1m6"),
     dtypes.float8e4m3,
+    dtypes.float8e5m2,
 )
+
+# Activation dtypes the TS mainloop is instantiated for. Both issue
+# tcgen05.mma kind::f16; ElementA picks the dequant base and the exponent
+# offsets (mma/tcgen05_ts_mma.cuh).
+TCGEN05_TS_A_DTYPES = (dtypes.bfloat16, dtypes.float16)
 
 
 @dataclasses.dataclass(kw_only=True, unsafe_hash=True)
@@ -77,15 +87,31 @@ class LayerConfig(BaseHummingConfig):
         # opt-in for v1.
         if torch.cuda.get_device_capability()[0] != 10:
             return False
-        if self.a_dtype != dtypes.bfloat16 or self.bs_dtype != dtypes.bfloat16:
+        if self.a_dtype not in TCGEN05_TS_A_DTYPES:
             return False
         if self.b_dtype not in TCGEN05_TS_B_DTYPES:
             return False
-        if self.has_zero_point and self.is_fp_zero_point and self.b_dtype.num_bits > 4:
-            # The fp zero point is subtracted post-dequant/pre-scale, which only
-            # the uint_to_f16 weight dtypes carry.
+        if self.is_fp_zero_point and self.c_dtype != self.a_dtype:
+            # The launcher types the fp zero-point tensor as c_dtype
+            # (csrc/launcher/tensor.h) but the TS s2r branch reads it as
+            # ElementA, so a c_dtype/a_dtype split is silently wrong.
             return False
-        if not (self.is_group_weight_scale or self.is_channel_weight_scale):
+        if self.is_channel_weight_scale:
+            # Folded into the TMEM drain through F16Conversion<ElementBS>.
+            if self.bs_dtype != self.a_dtype:
+                return False
+        elif self.is_group_weight_scale:
+            if self.bs_dtype == dtypes.float8e8m0:
+                # e8m0 and bf16 share exponent bias 127, so the s2r decode is a
+                # pure exp << 7. fp16's bias is 15, which would need a rebase
+                # plus over/underflow handling; fail closed instead.
+                if self.a_dtype != dtypes.bfloat16:
+                    return False
+            elif self.bs_dtype != self.a_dtype and self.bs_dtype != dtypes.float8e4m3:
+                # A 16-bit scale is reinterpreted as ElementA bit-for-bit by
+                # the s2r branch, so only bs_dtype == a_dtype is legal there.
+                return False
+        else:
             return False
         if self.weight_scale_2_type != WeightScale2Type.NONE:
             # weight_scale_2 is applied in EpilogueArithmetic::may_apply_on_smem_write

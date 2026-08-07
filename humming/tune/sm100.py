@@ -97,6 +97,11 @@ class Sm100Heuristics(Sm80Heuristics):
         must agree, so transform_humming_tensors calls it too.
         """
         if layer_config.a_dtype != dtypes.bfloat16:
+            # Deliberately narrower than the TS gate, which also admits fp16:
+            # mma/tcgen05_mma.cuh static_asserts ElementA == BFloat16 because
+            # the SS r2s scatter and its drain_accum epilogue are written
+            # against bf16 bit patterns (__nv_bfloat162 / __floats2bfloat162_rn).
+            # An fp16 layer TS cannot take is rejected, not downgraded to SS.
             return False
         if layer_config.b_dtype not in _SS_B_DTYPE_CONFIG:
             return False

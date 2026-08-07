@@ -17,14 +17,14 @@
 //     by humming/utils/ts_packing.py; spec in
 //     docs/tcgen05_ts_packing.md): thread (warp w, lane l) owns weight
 //     row n = 32w + l; per K-iter it holds the row's 16-K chunk as
-//     2 uint32 of pre-interleaved uint4 codes; the lop3 dequant below
-//     emits reg r = bf16 pair (K=2r, K=2r+1), the only TMEM-A layout
+//     16 * kBits / 32 uint32 of pre-interleaved codes; the dequant below
+//     emits reg r = ElementA pair (K=2r, K=2r+1), the only TMEM-A layout
 //     TS-mode accepts. Scale/zp are per-lane (lane = row ownership),
 //     loaded by the TS branch in s2r_pipeline.cuh. Humming's
 //     fragment-ownership dequant/arith path is bypassed entirely.
 //
 // TMEM column map (single alloc of SharedStorage::kTcgen05TmemCols):
-//   base + 0  .. 8            W staging slot 0 (16 K bf16, 2/cell)
+//   base + 0  .. 8            W staging slot 0 (16 K ElementA, 2/cell)
 //   base + 8  .. 16           W staging slot 1
 //   base + 16 .. 16 + BlockM  D accumulator (f32, MmaN = BlockM cols)
 //
@@ -44,43 +44,24 @@
 #include <humming/utils/ptx/tcgen05.cuh>
 
 
-// Per-dtype dequant of one bf16x2 code pair in TS contract order: given a
+// Per-dtype dequant of one ElementA code pair in TS contract order: given a
 // code word right-shifted so the target pair sits at the low kBits of each
-// 16-bit half, return the bf16x2 value (before the per-lane group scale,
+// 16-bit half, return the ElementA pair (before the per-lane group scale,
 // which the caller applies). Dispatch is compile-time on ElementB; a new
 // weight dtype adds a branch here rather than re-writing transform_b's
 // inline lop3. Per-branch dequant/zp/exp-offset details are documented at
 // each case below.
 
 
-// Multiply a bf16x2 by the exact power of two 2^kOff. bf16 tops out at
-// 2^128, so an offset > 127 (uint8's 133) is applied in two steps: the
-// first 2^127 lifts normalized_uint_to_fp's subnormal dequant into normal
-// range, the residual then finishes it -- each factor is a pure power of
-// two (mantissa preserved, no rounding), mirroring SS's mainloop 2^127 +
-// epilogue 2^6 split but folded entirely into transform_b.
-template <uint32_t kOff, class EA = BFloat16>
-CUDA_INLINE typename F16Conversion<EA>::scalar_t2 ts_mul_pow2(
-    typename F16Conversion<EA>::scalar_t2 t) {
-  using Scalar2 = typename F16Conversion<EA>::scalar_t2;
-  if constexpr (kOff == 0u) {
-    return t;
-  } else {
-    constexpr uint32_t kW = kOff > 127u ? 127u : kOff;
-    const Scalar2 f0 = prepare_exp_scale_factor<Scalar2, kW>();
-    t = __hmul2(t, f0);
-    if constexpr (kOff > kW) {
-      const Scalar2 f1 = prepare_exp_scale_factor<Scalar2, kOff - kW>();
-      t = __hmul2(t, f1);
-    }
-    return t;
-  }
-}
+// ts_mul_pow2 (the exact 2^kOff multiply, one or two steps against the
+// ElementA exponent ceiling) lives in arith/exp_offset.cuh: the TS s2r scale
+// decode needs it too.
 
 // Dequant one 16-bit-format code pair to ElementA (bf16 or fp16). EA drives
 // the dequant magic (bf16 0x4300 vs fp16 0x6400 base, via uint_to_f16 /
-// fp_to_fp / normalized_uint_to_fp) and the exp-offset element type. bf16 is
-// the shipped path (EA defaults to BFloat16, bit-exact).
+// fp_to_fp / normalized_uint_to_fp) and the exp-offset element type. The
+// mantissa width picks the integer arm, so uint8 splits: normalized on bf16,
+// uint_to_f16 on fp16.
 template <class EB, class EA, bool kHasZeroPoint, bool kIsFpZeroPoint = false>
 CUDA_INLINE uint32_t ts_dequant_b_pair(uint32_t shifted, uint32_t bias2) {
   using Scalar2 = typename F16Conversion<EA>::scalar_t2;
@@ -88,29 +69,36 @@ CUDA_INLINE uint32_t ts_dequant_b_pair(uint32_t shifted, uint32_t bias2) {
     // uint{2,4}: with an integer zp, bias2 is the folded EA(2^(k-1) + zp)
     // subtrahend so uint_to_f16 emits (code - zp) (no-zp midpoint baked
     // in by s2r). With an fp zp, uint_to_f16 subtracts only the base and
-    // returns the RAW code as EA; the caller subtracts the per-lane bf16
+    // returns the RAW code as EA; the caller subtracts the per-lane EA
     // zp post-dequant, pre-scale. No exp offset (kOff==0) either way.
     return uint_to_f16<EB, EA, /*kHasZeroPoint=*/true, kIsFpZeroPoint>(
         shifted, bias2);
   } else if constexpr (EB::kIsIntegerType) {
-    // uint8: 8 > bf16 mantissa, so the 0x4300 trick breaks; route to
-    // normalized_uint_to_fp with the RAW integer zp (bias2, broadcast
+    // uint8 on bf16 A: 8 > bf16's mantissa, so the 0x4300 trick breaks; route
+    // to normalized_uint_to_fp with the RAW integer zp (bias2, broadcast
     // internally; its no-zp branch applies the symmetric midpoint). The
     // result is a subnormal ~(code-zp)*2^-133, corrected by 2^kOff (133).
+    // With an fp zp, normalized_uint_to_fp returns the raw code (also
+    // scaled by 2^-133) and the caller subtracts the per-lane ElementA zp.
+    // ts_mul_pow2 runs BEFORE that subtract, so unlike the generic mainloop
+    // (mainloop_arith.cuh, which caps its offset at 127 and pre-scales the zp
+    // by 2^(kExpOffset.x - 133)) the zp needs no rescale here: the value is
+    // already back at full magnitude when the subtract happens.
     static_assert(EB::kBits == 8, "TS integer dtypes: {uint2, uint4, uint8}");
     constexpr uint32_t kOff =
         get_dtype_dequant_exp_offset<EA, EB, kHasZeroPoint>();
-    uint32_t v = normalized_uint_to_fp<EB, EA, kHasZeroPoint,
-                                       /*kIsFpZeroPoint=*/false>(shifted, bias2);
+    uint32_t v = normalized_uint_to_fp<EB, EA, kHasZeroPoint, kIsFpZeroPoint>(
+        shifted, bias2);
     Scalar2 t = ts_mul_pow2<kOff, EA>(*reinterpret_cast<Scalar2 *>(&v));
     return *reinterpret_cast<uint32_t *>(&t);
   } else if constexpr (EB::kIsFloatingPointType && EB::kBits <= 8u) {
     // Software fp -> EA: relocate each code to the top of its 16-bit
     // half, decode via fp_to_fp (exponent bits copied, NOT rebiased),
-    // then multiply by 2^kOff to correct the bias. For bf16 A the whole
-    // fp4/fp8 offset (126/120 <= 127) lives in the mainloop weight
-    // (get_epilogue_exp_offset == 0), so the caller's per-lane group-scale
-    // hmul2 needs NO epilogue exp-offset plumbing (cf SS kEpilogueExpOffset).
+    // then multiply by 2^kOff to correct the bias. kOff is
+    // 2^(EA_exp-1) - 2^(EB_exp-1): bf16 96..127, fp16 0..15, always one
+    // ts_mul_pow2 step and always an exact reconstruction of the source
+    // value, so the caller's per-lane group-scale hmul2 needs NO epilogue
+    // exp-offset plumbing (cf SS kEpilogueExpOffset).
     constexpr uint32_t kOff = get_dtype_dequant_exp_offset<EA, EB>();
     uint32_t v = fp_to_fp<EB, EA>(shifted << (EA::kBits - EB::kBits));
     Scalar2 t = ts_mul_pow2<kOff, EA>(*reinterpret_cast<Scalar2 *>(&v));
@@ -155,7 +143,7 @@ public:
   static constexpr uint32_t kWpr = 16u * kBBits / 32u;
   // Codes per packed word (u2:16, u4:8, u8:4).
   static constexpr uint32_t kVpw = 32u / kBBits;
-  // bf16x2 pairs produced per word (= kVpw / 2). kWpr * kRegsPerWord == 8.
+  // ElementA pairs produced per word (= kVpw / 2). kWpr * kRegsPerWord == 8.
   static constexpr uint32_t kRegsPerWord = kVpw / 2u;
 
   // The MMA-M tile: exactly one 128-row weight tile covered by 4 warps
@@ -180,7 +168,7 @@ public:
   static_assert(WarpShape::K == BlockShape::K,
                 "TCGEN05_TS: K_WARPS must be 1 (K accumulates in TMEM D)");
   static_assert(BlockShape::K == 64,
-                "TCGEN05_TS: BlockK must be 64 bf16 (single 64-K "
+                "TCGEN05_TS: BlockK must be 64 ElementA (single 64-K "
                 "section; BlockK > 64 needs section-major staging)");
   static_assert(BlockShape::M == 32 || BlockShape::M == 64 ||
                     BlockShape::M == 128,
@@ -200,15 +188,20 @@ public:
       std::is_same<ElementB, UInt2>::value ||
       std::is_same<ElementB, UInt8>::value ||
       std::is_same<ElementB, Float4E2M1>::value ||
-      std::is_same<ElementB, Float8E4M3>::value;
+      std::is_same<ElementB, Float4E3M0>::value ||
+      std::is_same<ElementB, Float8E4M3>::value ||
+      std::is_same<ElementB, Float8E5M2>::value ||
+      std::is_same<ElementB, Float8E1M6>::value;
   static_assert(kTsBDtypeSupported,
                 "TCGEN05_TS: ElementB not in the TS weight-dtype allowlist "
-                "(currently {uint2, uint4, uint8, float4e2m1, float8e4m3})");
-  static_assert(!kIsFpZeroPoint || (ElementB::kIsIntegerType &&
-                                    ElementB::kBits <= ElementA::kMantissaBits),
-                "TCGEN05_TS fp zero-point: only the uint_to_f16 weight dtypes "
-                "(kBits <= mantissa, e.g. uint2/uint4); uint8's normalized "
-                "path does not carry the post-scale fp subtract");
+                "(currently {uint2, uint4, uint8, float4e2m1, float4e3m0, "
+                "float8e1m6, float8e4m3, float8e5m2})");
+  static_assert(!kIsFpZeroPoint ||
+                    (ElementB::kIsIntegerType && !ElementB::kIsSigned),
+                "TCGEN05_TS fp zero-point: unsigned-integer weight dtypes only "
+                "(mirrors MainloopArithmetic); both dequant arms return the "
+                "raw code at full magnitude, so transform_b's post-dequant "
+                "subtract is exact for either");
   static_assert(Ctx::kIsGroupWeightScale || Ctx::kIsChannelWeightScale,
                 "TCGEN05_TS: group or channelwise weight scale (block/mx "
                 "unsupported)");
@@ -233,13 +226,13 @@ public:
   // (u2:1, u4:2, u8:4), double-buffered. Written by the TS branch of
   // s2r_pipeline. alignas(16): loader_b vectorizes the u8 gather as int4.
   alignas(16) uint32_t regs_qb[2][kWpr];
-  // Per-lane bf16x2 broadcast scale (s, s) and dequant bias
-  // bf16x2(128 + zp, 128 + zp), also filled by the s2r TS branch.
+  // Per-lane ElementA broadcast scale (s, s) and dequant bias
+  // (base + zp, base + zp), also filled by the s2r TS branch.
   uint32_t regs_bs2_ts[2];
   uint32_t regs_bias2_ts[2];
-  // Per-lane bf16x2 broadcast fp zero-point (kIsFpZeroPoint only): a real
-  // bf16 subtracted post-dequant / pre-scale to give (code - zp_fp) * scale.
-  // Filled by the s2r TS branch from the [K/gs, N] bf16 zp stream. Unused
+  // Per-lane ElementA broadcast fp zero-point (kIsFpZeroPoint only): a real
+  // ElementA subtracted post-dequant / pre-scale to give (code - zp_fp) * scale.
+  // Filled by the s2r TS branch from the [K/gs, N] zp stream. Unused
   // (never written) on the integer-zp path.
   uint32_t regs_zpfp2_ts[2];
 
@@ -278,7 +271,7 @@ public:
                 q >> (r * kBBits), bias2);
         Scalar2 t = *reinterpret_cast<Scalar2 *>(&v);
         // FP zero point: ts_dequant returned the raw code as EA, so the
-        // zp is a real bf16 subtracted here, BEFORE the scale, matching
+        // zp is a real ElementA subtracted here, BEFORE the scale, matching
         // the SS order (code - zp_fp) * scale. Integer zp is already
         // folded into the code by uint_to_f16 (nothing to do here).
         if constexpr (kIsFpZeroPoint) {
@@ -378,7 +371,7 @@ public:
                      .x;
     }
 
-    // Channelwise weight scale: one bf16 scalar per output row n, staged
+    // Channelwise weight scale: one ElementBS scalar per output row n, staged
     // in smem.bs_c by the channel g2s load. It commutes with the K-sum,
     // so we fold it here (the group path folds its scale in transform_b
     // instead). Read in natural n order -- the g2s copies the CTA's

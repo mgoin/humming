@@ -55,6 +55,35 @@ CUDA_INLINE constexpr T prepare_exp_scale_factor() {
 }
 
 
+// Multiply an ElementA pair by the exact power of two 2^kOff. A single
+// prepare_exp_scale_factor tops out at 2^kMax (bf16 2^127, fp16 2^15), so a
+// larger offset -- uint8's 133 on bf16 -- is applied in two steps: the first
+// 2^kMax lifts normalized_uint_to_fp's subnormal dequant into normal range and
+// the residual finishes it. Each factor is a pure power of two (mantissa
+// preserved, no rounding), mirroring the mainloop 2^127 + epilogue 2^6 split
+// the generic path uses.
+template <uint32_t kOff, class EA>
+CUDA_INLINE typename F16Conversion<EA>::scalar_t2 ts_mul_pow2(
+    typename F16Conversion<EA>::scalar_t2 t) {
+  using Scalar2 = typename F16Conversion<EA>::scalar_t2;
+  if constexpr (kOff == 0u) {
+    return t;
+  } else {
+    // Largest exact power of two of the ElementA exponent field.
+    constexpr uint32_t kMax = (1u << (EA::kExponentBits - 1u)) - 1u;
+    static_assert(kOff <= 2u * kMax, "exp offset exceeds the two-step budget");
+    constexpr uint32_t kW = kOff > kMax ? kMax : kOff;
+    const Scalar2 f0 = prepare_exp_scale_factor<Scalar2, kW>();
+    t = __hmul2(t, f0);
+    if constexpr (kOff > kW) {
+      const Scalar2 f1 = prepare_exp_scale_factor<Scalar2, kOff - kW>();
+      t = __hmul2(t, f1);
+    }
+    return t;
+  }
+}
+
+
 template <class ElementA, class ElementB, class ElementBS, bool kHasZeroPoint, bool kNativeMixed = false>
 CUDA_INLINE constexpr uint32_t get_total_exp_offset() {
   uint32_t offset = 0;

@@ -87,6 +87,28 @@ def test_default_layer_never_selects_tcgen05(overrides, shape_m):
         {"b_dtype": dtypes.float4e2m1, "has_zero_point": False},
         {"b_dtype": dtypes.float8e4m3, "has_zero_point": False},
         {"is_fp_zero_point": True},
+        {"b_dtype": dtypes.uint8, "is_fp_zero_point": True},
+        {"b_dtype": dtypes.float8e5m2, "has_zero_point": False},
+        {"b_dtype": dtypes.DataType.from_str("float4e3m0"), "has_zero_point": False},
+        {"b_dtype": dtypes.DataType.from_str("float8e1m6"), "has_zero_point": False},
+        # fp16 activations: bs_dtype and c_dtype track a_dtype.
+        {"a_dtype": dtypes.float16, "c_dtype": dtypes.float16, "bs_dtype": dtypes.float16},
+        {
+            "a_dtype": dtypes.float16,
+            "c_dtype": dtypes.float16,
+            "bs_dtype": dtypes.float16,
+            "b_dtype": dtypes.uint8,
+        },
+        {
+            "a_dtype": dtypes.float16,
+            "c_dtype": dtypes.float16,
+            "bs_dtype": dtypes.float16,
+            "is_fp_zero_point": True,
+        },
+        # 8-bit group scales, decoded to ElementA at the s2r load.
+        {"bs_dtype": dtypes.float8e8m0, "weight_scale_group_size": 32},
+        {"bs_dtype": dtypes.float8e4m3},
+        {"a_dtype": dtypes.float16, "c_dtype": dtypes.float16, "bs_dtype": dtypes.float8e4m3},
         {"num_experts": 256},
         {"shape_n": 512, "shape_k": 512},
     ],
@@ -106,15 +128,31 @@ def test_ts_legal_layers(overrides):
         {"shape_k": 4128, "weight_scale_group_size": 32},
         # A 16-K MMA iteration must stay inside one weight-scale group.
         {"weight_scale_group_size": 48, "shape_k": 4128},
-        # The fp zero point is subtracted before the scale, which only the
-        # uint_to_f16 dequant bodies carry.
-        {"b_dtype": dtypes.uint8, "is_fp_zero_point": True},
-        # Weight dtypes with no ts_dequant_b_pair arm.
+        # Weight dtypes with no ts_dequant_b_pair arm (the TS packer holds
+        # only 32 % num_bits == 0 widths).
         {"b_dtype": dtypes.uint6},
-        {"b_dtype": dtypes.float8e5m2, "has_zero_point": False},
-        # TS is bf16 x narrow-B only, with bf16 scales.
+        {"b_dtype": dtypes.DataType.from_str("float6e4m1"), "has_zero_point": False},
+        # TS activations are the two 16-bit float dtypes.
         {"a_dtype": dtypes.float8e4m3, "b_dtype": dtypes.float8e4m3, "has_zero_point": False},
-        {"bs_dtype": dtypes.float8e8m0},
+        # A 16-bit group scale is reinterpreted as ElementA bit-for-bit, so it
+        # must be a_dtype; e8m0 shares its exponent bias with bf16 only.
+        {"a_dtype": dtypes.float16, "c_dtype": dtypes.float16},
+        {"bs_dtype": dtypes.float16},
+        {
+            "a_dtype": dtypes.float16,
+            "c_dtype": dtypes.float16,
+            "bs_dtype": dtypes.float8e8m0,
+            "weight_scale_group_size": 32,
+        },
+        # A channelwise scale is folded into the drain as ElementBS.
+        {
+            "bs_dtype": dtypes.float8e4m3,
+            "weight_scale_group_size": 0,
+            "has_zero_point": False,
+        },
+        # The launcher types the fp zero point as c_dtype but s2r reads it as
+        # ElementA.
+        {"a_dtype": dtypes.float16, "bs_dtype": dtypes.float16, "is_fp_zero_point": True},
         # weight_scale_2 is applied in the epilogue smem writer, which the TMEM
         # drain bypasses -- admitting it would drop the scale silently.
         {"weight_scale_2_type": WeightScale2Type.CHANNEL},
@@ -137,8 +175,9 @@ def test_ts_illegal_layers(overrides):
         {"b_dtype": dtypes.DataType.from_str("float3e2m0"), "has_zero_point": False},
         {"b_dtype": dtypes.DataType.from_str("float7e6m0"), "has_zero_point": False},
         # 8-bit group scales are dequantised into bf16 by the generic mainloop.
-        {"bs_dtype": dtypes.float8e8m0, "weight_scale_group_size": 32},
-        {"bs_dtype": dtypes.float8e4m3},
+        # Pinned to a weight dtype TS has no arm for, so they reach SS.
+        {"b_dtype": dtypes.uint7, "bs_dtype": dtypes.float8e8m0, "weight_scale_group_size": 32},
+        {"b_dtype": dtypes.uint7, "bs_dtype": dtypes.float8e4m3},
         # A block scale is one f32 per warp N-tile, and SS pins WarpN at 64.
         {
             "bs_dtype": dtypes.float32,
@@ -202,6 +241,16 @@ def test_ss_illegal_layers(overrides):
         {"b_dtype": dtypes.uint7, "weight_scale_group_size": 0, "has_zero_point": False},
         {"b_dtype": dtypes.uint7, "weight_scale_2_type": WeightScale2Type.CHANNEL},
         {"weight_scale_2_type": WeightScale2Type.TENSOR},
+        # SS is bf16-only, so an fp16 layer TS turns down has no fallback. Both
+        # of these run to completion and return garbage without their gate
+        # clause: the TS s2r branch reads a 16-bit group scale and the fp zero
+        # point as ElementA whatever the launcher typed them as.
+        {"a_dtype": dtypes.float16, "c_dtype": dtypes.float16},
+        {
+            "a_dtype": dtypes.float16,
+            "bs_dtype": dtypes.float16,
+            "is_fp_zero_point": True,
+        },
     ],
     ids=str,
 )
@@ -233,7 +282,7 @@ def test_ts_opt_in_rejects_unsupported_compute(kwargs, message):
         ({"b_dtype": dtypes.uint3}, (128, 128, 128)),
         ({"b_dtype": dtypes.uint6}, (128, 128, 128)),
         ({"b_dtype": dtypes.uint7}, (128, 128, 128)),
-        ({"b_dtype": dtypes.float8e5m2, "has_zero_point": False}, (128, 128, 128)),
+        ({"b_dtype": dtypes.DataType.from_str("float6e4m1"), "has_zero_point": False}, (128, 128, 128)),
         # shape_n only tiles at BlockN=64, which TS does not accept.
         ({"shape_n": 6208}, (128, 64, 128)),
         # shape_k only tiles at BlockK=64.

@@ -43,14 +43,14 @@ dequants one 32-bit code word into `V/2` output regs, `V = 32 / kBitsB`
 values per word (u4: V=8, u8: V=4). For reg `i` the word is shifted right by
 `i·kBitsB` and masked with `(1 << kBitsB - 1) · 0x00010001`, so:
 
-> reg `i` = ( value-slot `i` → lo bf16 , value-slot `i + V/2` → hi bf16 )
+> reg `i` = ( value-slot `i` → lo half , value-slot `i + V/2` → hi half )
 
 where "value-slot s" = bits `[s·kBitsB, (s+1)·kBitsB)` of the word. This is
 the "(i, i+4) in-word interleave" for u4. It is a property of the dequant
 instruction sequence, not of any layout — so the pack must pre-compensate
 for **whatever** logical order we want the regs to come out in.
 
-Wanted TS reg order (contract): reg `r` = bf16 pair `(K=2r, K=2r+1)`,
+Wanted TS reg order (contract): reg `r` = activation-dtype pair `(K=2r, K=2r+1)`,
 ascending K. Solving: logical K-ascending element `e` of a word must be
 stored at value-slot
 
@@ -157,7 +157,7 @@ gather + the §2 slot extraction and asserts the contract.
 existing `regs_qb[2][kBitsB]` declaration in the MMA structs is oversized
 for TS but safe. The TS transform then runs `dequant(qb, res + 4j, j)` for
 `j ∈ [0, kBitsB/2 / (V/2)…)` — for u4: j ∈ {0, 1}, producing regs 0..7 =
-16 bf16 ascending K. No dequant code changes.
+16 activation-dtype values ascending K. No dequant code changes.
 
 ## 5. Scale / zero-point streams (lane = row ownership)
 
@@ -170,11 +170,12 @@ disappears entirely):
 **Scales** (`pack_scales_tcgen05_ts`):
 
 ```
-bf16 [ K/gs , N ]      — scale of (row n, group g) at packed[g, n]
+[ K/gs , N ]           — scale of (row n, group g) at packed[g, n]
 ```
 
-Thread with row `n` reads one bf16 at index `n`. Adjacent lanes read
-adjacent bf16 (2-B granule): lanes 2i/2i+1 share a 32-bit bank word →
+Thread with row `n` reads one scale element at index `n`. For a 16-bit
+scale adjacent lanes read adjacent 2-B granules: lanes 2i/2i+1 share a
+32-bit bank word →
 conflict-free broadcast-merge. Optionally a future loader can vectorize by
 having each lane load 2 groups (`uint32`) when BlockK spans 2 groups.
 
@@ -245,8 +246,8 @@ in natural `[N]` order rather than the C-fragment permutation.
 > `(w % 4) * 32 + lane` (lane = row within the warp's 32-row band).
 >
 > Per 16-K K-iter, after `dequant()` on the codes the pack produces,
-> thread `lane` of warp `w` holds its single row's full 16-K bf16 chunk
-> in 8 × uint32: **reg `r` = bf16 pair (K = 2r in lo half, K = 2r+1 in
+> thread `lane` of warp `w` holds its single row's full 16-K chunk
+> in 8 × uint32: **reg `r` = a pair (K = 2r in lo half, K = 2r+1 in
 > hi half), ascending K** — so TMEM cell `(lane, col c)` =
 > `W[row, 2c..2c+1]`, the K-major layout TS-mode A requires. The lop3
 > (i, i+4) in-word interleave is pre-compensated at pack time: value
@@ -254,7 +255,7 @@ in natural `[N]` order rather than the C-fragment permutation.
 > `(s % (V/2))*2 + s/(V/2)`, `V = 32/kBitsB`.
 >
 > Scales and zero-points follow lane = row ownership: scales
-> `bf16 [K/gs, N]` natural order (thread reads index `row`);
+> `[K/gs, N]` natural order (thread reads index `row`);
 > zero-points `int32 [K/gs, N*zp_bits/32]`, row `n` at bits
 > `[(n % (32/zp_bits)) * zp_bits, ...)` of word `n / (32/zp_bits)`.
 >
