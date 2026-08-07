@@ -33,9 +33,10 @@ TCGEN05_SS_B_DTYPES = tuple(
 )
 
 # SS pipeline depth: _fit_num_stages takes the deepest that SMEM holds under
-# this cap, which is four stages up to 3-bit codes and three above, where the
-# bf16 b_dequant staging buffer binds at BlockK=128. Deeper than four measures
-# as noise, and no weight dtype wants a shallower pipeline than SMEM forces.
+# this cap. At BlockN=128/BlockK=128 the bf16 b_dequant staging buffer binds and
+# that is four stages up to 3-bit codes and three above; the half-width
+# BlockN=64 tiles hold four throughout. Deeper than four measures as noise, and
+# no weight dtype wants a shallower pipeline than SMEM forces.
 # Retune with benchmarks/bench_tcgen05_dtypes.py --block_k --num_stages.
 _SS_MAX_NUM_STAGES = 4
 
@@ -227,6 +228,7 @@ class Sm100Heuristics(Sm80Heuristics):
                 use_tcgen05_ts=config.get("use_tcgen05_ts", False),
             )
 
+        assert max_num_stages >= _MIN_NUM_STAGES, f"max_num_stages is below the {_MIN_NUM_STAGES}-stage floor"
         best = 0
         for num_stages in range(_MIN_NUM_STAGES, max_num_stages + 1):
             if smem_size(num_stages) <= cls.max_smem_size:
