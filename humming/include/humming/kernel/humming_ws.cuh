@@ -79,18 +79,15 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     // must arrive before the mbarrier flips. TS-mode UMMAs read stage SMEM
     // asynchronously until they retire, so each thread's arrive has to be
     // program-ordered after a WAR wait covering every issue over stage T - 1:
-    //   * transform_b at warp iter j waits the slot-(j + 1) % 2 mbarrier,
-    //     whose most recent commit was issued by run(., j - 1), and a commit
-    //     covers the whole batch of MMAs issued so far;
-    //   * the last wait completed before the arrive is the one at iter
-    //     kWarpIters - 3, covering every issue up to run(T, kWarpIters - 4),
-    //     which reaches past run(T - 1, kWarpIters - 1) only for
-    //     kWarpIters >= 4;
-    //   * run consumes slot iter % 2 and transform_b prepares slot
-    //     (iter + 1) % 2, so the ping-pong survives a stage boundary only
-    //     when kWarpIters is even.
-    static_assert(Ctx::kWarpIters >= 4 && Ctx::kWarpIters % 2 == 0,
-                  "TS stage release needs kWarpIters >= 4 and even");
+    //   * every UMMA over a stage is issued by the single run() at warp iter
+    //     kWarpIters - 1, followed by one commit to the staging mbarrier;
+    //   * transform_b waits that commit at TCGEN05_TS::kTsWaitIter, i.e. at
+    //     the transform_b of warp iter kWarpIters - 3 at the latest, so it is
+    //     program-ordered before the arrive one warp iter later.
+    static_assert(
+        SharedStorage::kTcgen05TsSlots ==
+            SharedStorage::kTcgen05TsGroups * Ctx::kWarpIters,
+        "TS staging groups must each cover exactly one BlockK stage");
     // At two stages the producer refills the very stage the arrive released,
     // while run(T, kWarpIters - 1) is still reading it.
     static_assert(kNumStages >= 3, "TS mainloop needs at least three stages");
@@ -114,8 +111,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     if (threadIdx.x == 0) {
       __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
       if constexpr (TuningConfig::kUseTcgen05Ts) {
-        __mbarrier_init(&smem.tcgen05_ts_mbar[0], /*expected_count=*/1);
-        __mbarrier_init(&smem.tcgen05_ts_mbar[1], /*expected_count=*/1);
+        PRAGMA_UNROLL
+        for (uint32_t i = 0; i < SharedStorage::kTcgen05TsMbars; i++) {
+          __mbarrier_init(&smem.tcgen05_ts_mbar[i], /*expected_count=*/1);
+        }
       }
     }
   }

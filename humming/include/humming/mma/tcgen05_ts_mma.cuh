@@ -23,17 +23,25 @@
 //     loaded by the TS branch in s2r_pipeline.cuh. Humming's
 //     fragment-ownership dequant/arith path is bypassed entirely.
 //
-// TMEM column map (single alloc of SharedStorage::kTcgen05TmemCols):
-//   base + 0  .. 8            W staging slot 0 (16 K ElementA, 2/cell)
-//   base + 8  .. 16           W staging slot 1
-//   base + 16 .. 16 + BlockM  D accumulator (f32, MmaN = BlockM cols)
+// TMEM column map (single alloc of SharedStorage::kTcgen05TmemCols), with
+// S = kNumTsSlots = kNumTsGroups x kWarpIters staging slots, i.e. one group of
+// kWarpIters slots per resident BlockK stage:
+//   base + 8j .. 8(j+1)         W staging slot j (16 K ElementA, 2/cell)
+//   base + 8S .. 8S + BlockM    D accumulator (f32, MmaN = BlockM cols)
 //
-// Transform2Mma handshake (WAR on the staging slots):
-// per-slot mbarriers smem.tcgen05_ts_mbar[2]; run() commits the MMA
-// batch to its slot's mbar; transform_b() waits on the slot's mbar
-// before re-storing when arrivals_ > waits_. All math threads keep
-// consistent per-slot counters because they execute run()/transform_b()
-// in identical order.
+// Staging cadence: transform_b() fills its group's slot iter_id; run() is a
+// no-op until the last iter, where it publishes the group with one bar.sync
+// and issues the stage's kWarpIters UMMAs back to back. The per-iter WAR gate,
+// wait::st and bar.sync of a ping-pong schedule dominated the math warps' time
+// (~36%); staging depth alone does not help, only the handshake cadence does.
+// A second group then lets a stage's dequant run against the previous stage's
+// in-flight batch rather than waiting it out.
+//
+// Transform2Mma handshake (WAR on the staging slots): one mbarrier per group;
+// run() commits its batch to the group's mbarrier, and transform_b() waits the
+// previous stage's commit (which transitively retires every earlier batch) at
+// kTsWaitIter. All math threads keep a consistent stage counter because they
+// execute run()/transform_b() in identical order.
 
 #include <humming/arith/exp_offset.cuh>
 #include <humming/datatype/dequant_single.cuh>
@@ -150,9 +158,30 @@ public:
   // of 32 lanes.
   static constexpr uint32_t kMmaM = 128;
   static constexpr uint32_t kTsSlotCols = kPartMmaShapeK * 16u / 32u;  // 8
-  static constexpr uint32_t kNumTsSlots = 2;
-  static constexpr uint32_t kDColOffset = kNumTsSlots * kTsSlotCols;   // 16
+  // One slot per 16-K warp iter: a whole BlockK stage is staged before the
+  // single MMA batch that consumes it, so the WAR gate, the wait::st and the
+  // 128-thread bar.sync are paid once per stage instead of once per iter.
+  // kNumTsGroups such stages are resident, so a stage's dequant overlaps the
+  // previous stage's in-flight batch instead of waiting it out.
+  static constexpr uint32_t kTsSlotsPerStage = Ctx::kWarpIters;
+  static constexpr uint32_t kNumTsGroups = SharedStorage::kTcgen05TsGroups;
+  static constexpr uint32_t kNumTsSlots = kNumTsGroups * kTsSlotsPerStage;
+  static constexpr uint32_t kDColOffset = kNumTsSlots * kTsSlotCols;
+  // Where the WAR wait for the previous stage's batch sits. One group: it must
+  // precede the first overwrite, so iter 0. More: that batch reads a different
+  // group, so the wait slides to the last transform_b before the mainloop's
+  // consumer.arrive -- which is what releases the stage the batch reads, and
+  // hence the latest safe point.
+  static constexpr uint32_t kTsWaitIter =
+      kNumTsGroups > 1 ? kTsSlotsPerStage - 2 : 0;
 
+  static_assert(kNumTsSlots == SharedStorage::kTcgen05TsSlots &&
+                    kDColOffset + BlockShape::M <=
+                        SharedStorage::kTcgen05TmemCols,
+                "TCGEN05_TS: staging depth must fit the TMEM reservation");
+  static_assert(kNumTsGroups == 1 || kTsSlotsPerStage >= 2,
+                "TCGEN05_TS: multi-group staging needs the WAR wait one warp "
+                "iter ahead of the mainloop's consumer.arrive");
   static_assert(MmaOpClass::kCtaGroup == 1,
                 "TCGEN05_TS: only cta_group::1 is wired up");
   static_assert(BlockShape::N == 128,
@@ -248,9 +277,9 @@ public:
     first_issue_ = true;
   }
 
-  // Dequant (contract order) + WAR-gated r2t into the slot. `iter_id` is
-  // unused: the staging slot is selected by buffer_id, and the per-lane
-  // scale/zp registers are refreshed per K-iter by the s2r TS branch.
+  // Dequant (contract order) + WAR-gated r2t into slot `iter_id`. `buffer_id`
+  // selects the s2r register double-buffer only; the per-lane scale/zp
+  // registers are refreshed per K-iter by the s2r TS branch.
   CUDA_INLINE
   void transform_b(uint32_t buffer_id, uint32_t iter_id) {
     using Scalar2 = typename F16Conversion<ElementA>::scalar_t2;
@@ -287,25 +316,33 @@ public:
       }
     }
 
-    // WAR gate: the slot may still be read by an in-flight MMA from
-    // two iterations ago. arrivals_/waits_ differ by at most 1.
-    uint32_t slot = buffer_id;
-    if (arrivals_[slot] > waits_[slot]) {
-      mbarrier_wait(&smem.tcgen05_ts_mbar[slot], waits_[slot] & 1u);
-      waits_[slot]++;
+    // WAR gate, once per stage: wait out the previous stage's batch, which
+    // transitively retires every earlier one. Its commit was the n-th arrival
+    // on mbarrier (T - 1) % kNumTsGroups, so the wait phase is (n - 1) & 1.
+    if (iter_id == kTsWaitIter && stage_ctr_ > 0u) {
+      uint32_t prev = stage_ctr_ - 1u;
+      mbarrier_wait(&smem.tcgen05_ts_mbar[prev % kNumTsGroups],
+                    (prev / kNumTsGroups) & 1u);
     }
 
     // r2t: warp w writes rows 32w..32w+31 (its own sub-partition).
+    uint32_t slot = (stage_ctr_ % kNumTsGroups) * kTsSlotsPerStage + iter_id;
     uint32_t warp = threadIdx.x / 32u;
     uint32_t addr = (smem.tcgen05_tmem_col + slot * kTsSlotCols)
                     | ((warp % 4u) * 32u << 16);
     tcgen05_st_32x32b_x8(addr, out);
-    tcgen05_wait_st();
-    tcgen05_fence_before_thread_sync();
+    // wait::st retires every outstanding store of this thread, so the whole
+    // stage is published by the last slot's wait alone.
+    if (iter_id == kTsSlotsPerStage - 1u) {
+      tcgen05_wait_st();
+      tcgen05_fence_before_thread_sync();
+    }
   }
 
+  // Issue the stage's whole MMA batch, once the last slot has been staged.
   CUDA_INLINE
   void run(uint32_t stage_id, uint32_t iter_id) {
+    if (iter_id != kTsSlotsPerStage - 1u) return;
     // Publish all 4 warps' tcgen05.st to the MMA-issuing thread:
     // before_thread_sync (end of transform_b) -> REAL thread sync ->
     // after_thread_sync. All three links are required for cross-warp
@@ -313,12 +350,6 @@ public:
     ctx.sync_math_threads();
     tcgen05_fence_after_thread_sync();
 
-    uint32_t slot = iter_id % 2u;
-    // Activation descriptor: same canonical Swizzle<3,4,3> K-major
-    // layout + 16-K-per-issue advance the SS kernel uses for A.
-    // BlockK == 64 -> single section, advance is iter_id * 2 uint128.
-    int4 *act_ptr = &smem.stages[stage_id].a[0] + iter_id * 2u;
-    uint64_t b_desc = tcgen05_smem_desc<128, BlockShape::K>(act_ptr);
     // A<->B swap: idesc M = weight rows (128), N = activation MmaN. Weights
     // are dequanted to ElementA, so both operand formats follow ElementA and
     // the MMA kind stays f16 for both fp16 and bf16.
@@ -328,20 +359,28 @@ public:
                                   MmaOpClass::kInstrDescCFormat>(
             kMmaM, BlockShape::M);
 
-    bool scale_d = !first_issue_;
-    first_issue_ = false;
-
+    uint32_t group = stage_ctr_ % kNumTsGroups;
     uint32_t tmem_base = smem.tcgen05_tmem_col;
     if (threadIdx.x < 32 && tcgen05_elect_one_sync()) {
-      tcgen05_mma_ts_bf16(tmem_base + kDColOffset,
-                          tmem_base + slot * kTsSlotCols,
-                          b_desc, idesc, scale_d);
-      // Commit the batch (all MMAs so far) to this slot's mbar; the
-      // arrival transitively proves the slot's reader retired.
+      PRAGMA_UNROLL
+      for (uint32_t j = 0; j < kTsSlotsPerStage; j++) {
+        // Activation descriptor: same canonical Swizzle<3,4,3> K-major
+        // layout + 16-K-per-issue advance the SS kernel uses for A.
+        // BlockK == 64 -> single section, advance is iter * 2 uint128.
+        int4 *act_ptr = &smem.stages[stage_id].a[0] + j * 2u;
+        uint64_t b_desc = tcgen05_smem_desc<128, BlockShape::K>(act_ptr);
+        tcgen05_mma_ts_bf16(
+            tmem_base + kDColOffset,
+            tmem_base + (group * kTsSlotsPerStage + j) * kTsSlotCols,
+            b_desc, idesc, !first_issue_ || j > 0);
+      }
+      // Commit the batch (all MMAs so far); the arrival transitively proves
+      // every slot's reader retired.
       tcgen05_commit_to_mbarrier(
-          cast_smem_ptr_to_uint(&smem.tcgen05_ts_mbar[slot]));
+          cast_smem_ptr_to_uint(&smem.tcgen05_ts_mbar[group]));
     }
-    arrivals_[slot]++;
+    first_issue_ = false;
+    stage_ctr_++;
   }
 
   // Drain TMEM D (transposed: lane = weight row n, col = activation m)
@@ -425,8 +464,8 @@ public:
 private:
   bool first_issue_ = true;
   uint32_t mbar_phase_ = 0;
-  // Per-slot Transform2Mma handshake counters (consistent across all
-  // math threads by construction).
-  uint32_t arrivals_[kNumTsSlots] = {0, 0};
-  uint32_t waits_[kNumTsSlots] = {0, 0};
+  // Stages issued so far; picks the staging group and the WAR mbarrier phase.
+  // Consistent across all math threads by construction, and never reset --
+  // mbarrier phases persist across output tiles.
+  uint32_t stage_ctr_ = 0;
 };

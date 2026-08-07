@@ -6,15 +6,16 @@ LayerConfig resolves to exactly the mma.sync config it did before tcgen05
 existed.
 
 * TS mode stages the dequantised weights in TMEM. It is the tcgen05 default,
-  1.38-1.42x faster than SS at every M where both are legal
+  1.86-2.14x faster than SS at every M where both are legal
   (benchmarks/bench_ts_vs_ss.py). Against the mma.sync config this heuristic
-  otherwise emits, TS wins 1.08-1.11x at M=2048, is level at M=512 and loses
-  below: with use_stream_k off and raster_group_m=1 the grid is N/BlockN CTAs,
-  so at M=16 only 64 of 148 SMs have work. TS packs weights, scales and zero
-  points in a layout no other kernel reads, so a TS layer runs TS at every
+  otherwise emits, TS wins 1.55-1.68x at M=2048 and 1.39-1.49x at M=512, is
+  mixed at M=128 (0.91-1.33x) and loses below: with use_stream_k off and
+  raster_group_m=1 the grid is N/BlockN CTAs, so at M=16 only 64 of 148 SMs
+  have work (raster_group_m > 1 costs TS a further 1-4%). TS packs weights,
+  scales and zero points in a layout no other kernel reads, so a TS layer runs TS at every
   shape_m -- there is no per-M fallback. Its pipeline depth is per-dtype
-  (_TS_B_DTYPE_STAGES) rather than a single cap: the depth that suits one
-  dequant arm costs up to 8% on another.
+  (_TS_B_DTYPE_STAGES) rather than a single cap: uint8 loses 6-11% at the
+  depth every other weight dtype wants.
 * SS mode stages them in SMEM. It is the substrate TS was built on and the
   tcgen05 fallback for layers TS is not legal for. It never beats mma.sync at
   any shape measured -- 0.13-0.91x in benchmarks/bench_tcgen05_vs_wmma.py and
@@ -74,20 +75,19 @@ _SS_GROUP_BS_DTYPES = (
 
 _TS_GEMM_TYPES = (GemmType.DENSE, GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
 
-# TS num_stages for the dense cells that want something other than the default
-# four, keyed on (b_dtype, integer zero point). TS stages only the packed
-# weights -- there is no bf16 b_dequant buffer -- so nothing here is SMEM-bound
-# below nine stages and the depth is pure latency tuning of ts_dequant_b_pair:
-# uint4's zero-point-folded uint_to_f16 hides a fifth stage, while uint8+zp,
-# the one bf16 arm that splits its exponent offset across two multiplies, peaks
-# at three and loses 8% by five. The key is the dequant arm rather than the
-# weight width: an fp zero point is a separate post-dequant subtract and tracks
-# the zero-point-free timing at four.
-_TS_B_DTYPE_STAGES: dict[tuple[dtypes.DataType, bool], int] = {
-    (dtypes.uint4, True): 5,
-    (dtypes.uint8, True): 3,
+# TS num_stages for the weight dtypes that want something other than the
+# default five. TS stages only the packed weights -- there is no bf16
+# b_dequant buffer -- so nothing here is SMEM-bound below nine stages. Since
+# the staging handshake was batched to once per BlockK stage the mainloop is
+# load-bound (ablating the whole dequant/r2t path off the math warps buys
+# 3.9%), so the depth is TMA runway rather than dequant latency: five is the
+# knee for every dtype except uint8, whose stage is wide enough that a fifth
+# costs 6-11%. The dequant arm and the zero-point mode no longer move it, and
+# neither does the grouped scheduler.
+_TS_B_DTYPE_STAGES: dict[dtypes.DataType, int] = {
+    dtypes.uint8: 4,
 }
-_TS_DEFAULT_NUM_STAGES = 4
+_TS_DEFAULT_NUM_STAGES = 5
 
 
 class Sm100Heuristics(Sm80Heuristics):
@@ -215,19 +215,13 @@ class Sm100Heuristics(Sm80Heuristics):
             "raster_group_m": 1,
         }
         config["num_stages"] = cls._fit_num_stages(
-            layer_config, config, gemm_type, cls._ts_max_num_stages(layer_config, gemm_type)
+            layer_config, config, gemm_type, cls._ts_max_num_stages(layer_config)
         )
         return config
 
     @classmethod
-    def _ts_max_num_stages(cls, layer_config: LayerConfig, gemm_type: GemmType) -> int:
-        if gemm_type != GemmType.DENSE:
-            # Both tuned dense depths lose 1.6-3.8% against the default at
-            # E=8, so the grouped scheduler keeps it.
-            return _TS_DEFAULT_NUM_STAGES
-        has_int_zero_point = layer_config.has_zero_point and not layer_config.is_fp_zero_point
-        key = (layer_config.b_dtype, has_int_zero_point)
-        return _TS_B_DTYPE_STAGES.get(key, _TS_DEFAULT_NUM_STAGES)
+    def _ts_max_num_stages(cls, layer_config: LayerConfig) -> int:
+        return _TS_B_DTYPE_STAGES.get(layer_config.b_dtype, _TS_DEFAULT_NUM_STAGES)
 
     @classmethod
     def _ss_config(cls, layer_config: LayerConfig, gemm_type: GemmType) -> dict | None:

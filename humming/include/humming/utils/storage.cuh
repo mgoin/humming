@@ -250,16 +250,23 @@ public:
   IF_USE_TCGEN05(alignas(16) uint32_t tcgen05_tmem_col;)
   // Accumulator commit/drain mbarrier: the epilogue waits it before t2r.
   IF_USE_TCGEN05(alignas(8) uint64_t tcgen05_mbar;)
-  // TS mode: per-staging-slot WAR gate between the next tcgen05.st and
-  // the in-flight MMA still reading that slot.
-  IF_USE_TCGEN05_TS(alignas(8) uint64_t tcgen05_ts_mbar[2];)
+  // TS mode: one staging slot per 16-K warp iter, so a whole BlockK stage is
+  // resident in TMEM and the Transform2Mma handshake runs once per stage.
+  // kTcgen05TsGroups stages are resident at once, one mbarrier each.
+  static constexpr uint32_t kTcgen05TsGroups = 2;
+  static constexpr uint32_t kTcgen05TsSlots = kTcgen05TsGroups * (WarpShape::K / kPartMmaShapeK);
+  static constexpr uint32_t kTcgen05TsMbars = kTcgen05TsGroups;
+  // WAR gate between the next stage's tcgen05.st and the in-flight MMA batch
+  // still reading the slots.
+  IF_USE_TCGEN05_TS(alignas(8) uint64_t tcgen05_ts_mbar[kTcgen05TsMbars];)
 
 #if HUMMING_USE_TCGEN05
   // TMEM columns to allocate (power-of-2). SS: BlockN accumulator columns,
-  // BlockN <= 128. TS: 2 x 8 staging columns plus BlockM accumulator
-  // columns, since the TS accumulator is transposed (MmaN = BlockM).
+  // BlockN <= 128. TS: kTcgen05TsSlots x 8 staging columns plus BlockM
+  // accumulator columns, since the TS accumulator is transposed (MmaN = BlockM).
 #if HUMMING_USE_TCGEN05_TS
-  static constexpr uint32_t kTcgen05TmemCols = (16u + BlockShape::M) <= 128u ? 128u : 256u;
+  static constexpr uint32_t kTcgen05TmemCols =
+      (8u * kTcgen05TsSlots + BlockShape::M) <= 128u ? 128u : 256u;
 #else
   static constexpr uint32_t kTcgen05TmemCols = 128u;
 #endif

@@ -85,8 +85,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     if (threadIdx.x == 0) {
       __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
       if constexpr (TuningConfig::kUseTcgen05Ts) {
-        __mbarrier_init(&smem.tcgen05_ts_mbar[0], /*expected_count=*/1);
-        __mbarrier_init(&smem.tcgen05_ts_mbar[1], /*expected_count=*/1);
+        PRAGMA_UNROLL
+        for (uint32_t i = 0; i < SharedStorage::kTcgen05TsMbars; i++) {
+          __mbarrier_init(&smem.tcgen05_ts_mbar[i], /*expected_count=*/1);
+        }
       }
     }
   }
