@@ -1,16 +1,24 @@
 """sm_100 (Blackwell) tuning heuristics.
 
-Two tcgen05 paths sit on top of the mma.sync baseline:
+Two tcgen05 mainloops sit on top of the mma.sync baseline, and neither is
+reachable without the per-layer ``mma_type="tcgen05"`` opt-in: a default
+LayerConfig resolves to exactly the mma.sync config it did before tcgen05
+existed.
 
-* TS mode, opted into per layer with ``mma_type="tcgen05"``. It packs weights,
-  scales and zero points in a layout no other kernel reads, so a TS layer runs
-  TS at every shape_m -- there is no per-M fallback, and an illegal shape is an
-  error rather than a silent downgrade.
-* SS mode, auto-selected for a narrow bf16-activation window where it
-  benchmarks 1.20-1.55x faster than mma.sync (benchmarks/bench_ts_vs_ss.py).
+* TS mode stages the dequantised weights in TMEM. It is the tcgen05 default,
+  1.35-1.40x faster than SS at every M where both are legal
+  (benchmarks/bench_ts_vs_ss.py). Against the mma.sync config this heuristic
+  otherwise emits, TS wins 1.06-1.09x at M=2048, is level at M=512 and loses
+  below: with use_stream_k off and raster_group_m=1 the grid is N/BlockN CTAs,
+  so at M=16 only 64 of 148 SMs have work. TS packs weights, scales and zero
+  points in a layout no other kernel reads, so a TS layer runs TS at every
+  shape_m -- there is no per-M fallback.
+* SS mode stages them in SMEM. It is the substrate TS was built on and the
+  tcgen05 fallback for layers TS is not legal for. It never beats mma.sync at
+  any shape measured -- 0.13-0.91x in benchmarks/bench_tcgen05_vs_wmma.py and
+  0.56-0.94x in benchmarks/bench_tcgen05_dtypes.py -- which is exactly why
+  selection is opt-in rather than automatic.
 """
-
-import math
 
 from humming import dtypes
 from humming.config import GemmType, LayerConfig, MmaType
@@ -18,13 +26,14 @@ from humming.tune.sm8x import Sm80Heuristics
 from humming.utils.smem import estimate_smem_size_layer
 
 # B dtypes opted into SS mode, mapped to the (block_k, num_stages) each was
-# tuned to by benchmarks/bench_tcgen05_dtypes.py. Wide dtypes drop to fewer
-# stages (or BlockK=64) because the bf16 b_dequant staging buffer pushes
-# BlockK=128 stages=4 over the SMEM cap.
+# tuned to by benchmarks/bench_tcgen05_dtypes.py. The stage counts are what
+# _fit_num_stages can actually emit: the bf16 b_dequant staging buffer means
+# only uint3 keeps a fourth stage at BlockK=128 (uint4 there needs 234,496 B
+# against the device's 232,448 B cap), and uint8 needs BlockK=64.
 _SS_B_DTYPE_CONFIG: dict[dtypes.DataType, tuple[int, int]] = {
     dtypes.uint3: (128, 4),
-    dtypes.uint4: (128, 4),
-    dtypes.float4e2m1: (128, 4),
+    dtypes.uint4: (128, 3),
+    dtypes.float4e2m1: (128, 3),
     dtypes.uint5: (128, 3),
     dtypes.uint6: (128, 3),
     dtypes.float8e4m3: (128, 3),
@@ -47,6 +56,27 @@ class Sm100Heuristics(Sm80Heuristics):
         return layer_config.tcgen05_supported
 
     @classmethod
+    def supports_tcgen05_ss(cls, layer_config: LayerConfig) -> bool:
+        """Whether the SS-mode tcgen05 kernel can run `layer_config`.
+
+        Mirrors the static_asserts in mma/tcgen05_mma.cuh: bf16 activations
+        against a narrow B dtype with a group weight scale, read from the
+        ordinary mma.sync weight layout. Gates dispatch and packing, which must
+        agree, so transform_humming_tensors calls it too.
+        """
+        if layer_config.a_dtype != dtypes.bfloat16:
+            return False
+        if layer_config.b_dtype not in _SS_B_DTYPE_CONFIG:
+            return False
+        group_size = layer_config.weight_scale_group_size
+        if group_size <= 0:
+            return False
+        if group_size % 64 and 64 % group_size:
+            # A BlockK stage must hold whole weight-scale groups.
+            return False
+        return layer_config.shape_n % 64 == 0 and layer_config.shape_k % 64 == 0
+
+    @classmethod
     def get_config(
         cls,
         layer_config: LayerConfig,
@@ -56,17 +86,16 @@ class Sm100Heuristics(Sm80Heuristics):
         gemm_type: GemmType = GemmType.DENSE,
     ):
         if layer_config.mma_type == MmaType.TCGEN05:
-            assert cls.supports_tcgen05_ts(layer_config), (
-                "mma_type='tcgen05' selects the TS kernel, which this layer is "
-                "not legal for (see LayerConfig.tcgen05_supported)"
+            assert gemm_type in _TS_GEMM_TYPES, f"tcgen05 does not support {gemm_type}"
+            assert not use_f16_accum, "tcgen05 accumulates in f32 TMEM"
+            assert not use_batch_invariant, "tcgen05 does not implement batch-invariant reduction"
+            if cls.supports_tcgen05_ts(layer_config):
+                return cls._ts_config(layer_config, shape_m, gemm_type)
+            ss_config = cls._ss_config(layer_config, gemm_type)
+            assert ss_config is not None, (
+                "mma_type='tcgen05' is legal for neither the TS kernel (see "
+                "LayerConfig.tcgen05_supported) nor the SS fallback"
             )
-            assert gemm_type in _TS_GEMM_TYPES, f"tcgen05 TS does not support {gemm_type}"
-            assert not use_f16_accum, "tcgen05 TS accumulates in f32 TMEM"
-            assert not use_batch_invariant, "tcgen05 TS does not implement batch-invariant reduction"
-            return cls._ts_config(layer_config, shape_m, gemm_type)
-
-        ss_config = cls._ss_config(layer_config, shape_m, use_batch_invariant, gemm_type)
-        if ss_config is not None:
             return ss_config
 
         return super().get_config(
@@ -117,48 +146,25 @@ class Sm100Heuristics(Sm80Heuristics):
         return config
 
     @classmethod
-    def _ss_config(
-        cls,
-        layer_config: LayerConfig,
-        shape_m: int,
-        use_batch_invariant: bool,
-        gemm_type: GemmType,
-    ) -> dict | None:
-        """SS-mode config, or None when mma.sync should win.
+    def _ss_config(cls, layer_config: LayerConfig, gemm_type: GemmType) -> dict | None:
+        """SS-mode config, or None when SS cannot run this layer.
 
-        Supported (mirrors the static_asserts in mma/tcgen05_mma.cuh): dense
-        bf16 x narrow-B with a group weight scale. Profitable cutoffs come from
-        benchmarks/bench_ts_vs_ss.py: below M=128 mma.sync's smaller tiles
-        spread better, fat-K weights only win from M=512 up, and below ~64
-        output tiles a 128x128 CTA tile leaves most SMs idle.
+        Reached only under the mma_type="tcgen05" opt-in, and only where TS is
+        illegal. SS never beats the mma.sync config this heuristic otherwise
+        emits, so it carries no profitability cutoff: an opted-in layer gets
+        tcgen05 at every shape_m, or an error.
         """
-        if gemm_type != GemmType.DENSE or use_batch_invariant:
-            return None
-        if layer_config.a_dtype != dtypes.bfloat16:
-            return None
-        if layer_config.b_dtype not in _SS_B_DTYPE_CONFIG:
-            return None
-        if layer_config.weight_scale_group_size <= 0:
-            return None
-        if shape_m < 128:
-            return None
-        if layer_config.shape_n < layer_config.shape_k and shape_m < 512:
-            return None
-        num_tiles = math.ceil(layer_config.shape_n / 128) * math.ceil(shape_m / 128)
-        if num_tiles < 64:
+        if gemm_type != GemmType.DENSE or not cls.supports_tcgen05_ss(layer_config):
             return None
 
-        block_n = 128
-        if layer_config.shape_n % 128 != 0:
-            if layer_config.shape_n % 64 != 0:
-                return None
-            block_n = 64
+        block_n = 128 if layer_config.shape_n % 128 == 0 else 64
 
         # BlockK=128 halves the K-iter count and wins 3-8% over BlockK=64
-        # wherever shape_k allows it; the per-dtype entry picks the stage count
-        # that still fits in SMEM.
+        # wherever shape_k and the weight-scale group allow it; the per-dtype
+        # entry picks the deepest pipeline that still fits in SMEM.
         block_k, num_stages = _SS_B_DTYPE_CONFIG[layer_config.b_dtype]
-        if layer_config.shape_k % 128 != 0:
+        group_size = layer_config.weight_scale_group_size
+        if layer_config.shape_k % block_k or (group_size % block_k and block_k % group_size):
             block_k, num_stages = 64, 4
 
         config = {

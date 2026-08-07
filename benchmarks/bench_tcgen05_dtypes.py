@@ -49,14 +49,6 @@ SHAPE_MS = [256, 2048]
 SS_LADDER = [(128, 4), (128, 3), (64, 4), (64, 3)]
 
 
-class _MmaSyncHeuristics(Sm100Heuristics):
-    """The sm100 heuristic with SS mode switched off: the mma.sync baseline."""
-
-    @classmethod
-    def _ss_config(cls, *args, **kwargs) -> dict | None:
-        return None
-
-
 def build_layer(shape_n: int, shape_k: int, b_dtype: str, has_zero_point: bool) -> HummingLayer:
     torch.manual_seed(2026)
     layer = HummingLayer(
@@ -86,7 +78,7 @@ def bench(layer: HummingLayer, inputs: torch.Tensor, config: dict) -> float:
 
 
 def mma_sync_config(layer_config: LayerConfig, shape_m: int) -> dict:
-    config = _MmaSyncHeuristics.get_config(layer_config=layer_config, shape_m=shape_m)
+    config = Sm100Heuristics.get_config(layer_config=layer_config, shape_m=shape_m)
     config["raster_group_m"] = raster_group_m_for_config(layer_config, config["block_shape"])
     return config
 

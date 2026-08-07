@@ -52,9 +52,25 @@ def test_ts_opt_in_config(shape_m, block_m):
     assert config["raster_group_m"] == 1
 
 
-@pytest.mark.parametrize("shape_m", [1, 16, 64, 128, 512, 2048])
-def test_default_layer_never_selects_ts(shape_m):
-    config = get_heuristics_config(_layer_config(), shape_m=shape_m)
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        # Fat-K, few-output-tile and wide-dtype layers: the whole M >= 128
+        # window that SS used to take over before selection became opt-in.
+        {"shape_n": 8192, "shape_k": 28672},
+        {"shape_n": 6144},
+        {"b_dtype": dtypes.uint3},
+        {"b_dtype": dtypes.uint8},
+    ],
+    ids=str,
+)
+@pytest.mark.parametrize("shape_m", [1, 16, 64, 128, 256, 512, 1024, 2048, 4096])
+def test_default_layer_never_selects_tcgen05(overrides, shape_m):
+    """Without the opt-in sm100 resolves to the mma.sync config it always did."""
+    config = get_heuristics_config(_layer_config(**overrides), shape_m=shape_m)
+    assert config.get("mma_type") is None
+    assert not config.get("use_tcgen05")
     assert not config.get("use_tcgen05_ts")
 
 
@@ -108,9 +124,24 @@ def test_ts_illegal_layers(overrides):
     assert not get_heuristics_class().supports_tcgen05_ts(config)
 
 
-def test_ts_opt_in_rejects_illegal_layer():
-    config = _layer_config(shape_n=192, mma_type=MmaType.TCGEN05)
-    with pytest.raises(AssertionError, match="not legal"):
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # Neither tuning table carries this weight dtype.
+        {"b_dtype": dtypes.uint7},
+        # BlockN bottoms out at 64 and BlockK at 64, so the shape must tile.
+        {"shape_n": SHAPE_N + 32},
+        {"shape_k": SHAPE_K + 32, "weight_scale_group_size": 32},
+        # A BlockK stage must hold whole weight-scale groups.
+        {"weight_scale_group_size": 48, "shape_k": SHAPE_K + 32},
+        # SS needs a group weight scale, and TS needs a wired dequant arm.
+        {"b_dtype": dtypes.uint7, "weight_scale_group_size": 0, "has_zero_point": False},
+    ],
+    ids=str,
+)
+def test_opt_in_rejects_illegal_layer(overrides):
+    config = _layer_config(mma_type=MmaType.TCGEN05, **overrides)
+    with pytest.raises(AssertionError, match="legal for neither"):
         get_heuristics_config(config, shape_m=512)
 
 
@@ -130,51 +161,34 @@ def test_ts_opt_in_rejects_unsupported_compute(kwargs, message):
 
 
 @pytest.mark.parametrize(
-    "overrides,shape_m,selects_ss",
-    [
-        # Fat-N: mma.sync's smaller tiles win below the M cutoff.
-        ({}, 1, False),
-        ({}, 64, False),
-        ({}, 128, True),
-        ({}, 2048, True),
-        # Fat-K only pays off from M=512 up.
-        ({"shape_n": 8192, "shape_k": 28672}, 256, False),
-        ({"shape_n": 8192, "shape_k": 28672}, 512, True),
-        # Below the output-tile floor most SMs would idle.
-        ({"shape_n": 6144}, 128, False),
-        ({"shape_n": 6144}, 256, True),
-        # Outside the SS-mode dtype and scale window.
-        ({"a_dtype": dtypes.float8e4m3, "b_dtype": dtypes.float8e4m3, "has_zero_point": False}, 512, False),
-        ({"b_dtype": dtypes.uint7}, 512, False),
-        ({"weight_scale_group_size": 0, "has_zero_point": False}, 512, False),
-    ],
-    ids=str,
-)
-def test_ss_auto_selection(overrides, shape_m, selects_ss):
-    config = get_heuristics_config(_layer_config(**overrides), shape_m=shape_m)
-    assert (config.get("mma_type") == "tcgen05") == selects_ss
-    assert bool(config.get("use_tcgen05")) == selects_ss
-    if selects_ss:
-        assert not config.get("use_tcgen05_ts")
-        assert config["use_stream_k"] is False
-        assert config["use_warp_spec"] is True
-
-
-@pytest.mark.parametrize(
     "overrides,block_shape",
     [
-        ({}, (128, 128, 128)),
-        # shape_k only tiles at BlockK=64.
-        ({"shape_k": 4160}, (128, 128, 64)),
-        # shape_n only tiles at BlockN=64.
+        # Weight dtypes with no ts_dequant_b_pair arm.
+        ({"b_dtype": dtypes.uint3}, (128, 128, 128)),
+        ({"b_dtype": dtypes.uint6}, (128, 128, 128)),
+        ({"b_dtype": dtypes.float8e5m2, "has_zero_point": False}, (128, 128, 128)),
+        # shape_n only tiles at BlockN=64, which TS does not accept.
         ({"shape_n": 6208}, (128, 64, 128)),
+        # shape_k only tiles at BlockK=64.
+        ({"b_dtype": dtypes.uint3, "shape_k": 4160}, (128, 128, 64)),
         # uint8 needs the narrow K tile to keep the b_dequant buffer in SMEM.
-        ({"b_dtype": dtypes.uint8}, (128, 128, 64)),
+        ({"b_dtype": dtypes.uint8, "shape_n": 6208}, (128, 64, 64)),
     ],
     ids=str,
 )
-def test_ss_block_shape(overrides, block_shape):
-    config = get_heuristics_config(_layer_config(**overrides), shape_m=512)
+@pytest.mark.parametrize("shape_m", [1, 128, 2048])
+def test_ss_opt_in_fallback(overrides, block_shape, shape_m):
+    """An opted-in layer TS is illegal for runs SS at every shape_m; the same
+    layer without the opt-in stays on mma.sync."""
+    config = get_heuristics_config(_layer_config(mma_type=MmaType.TCGEN05, **overrides), shape_m=shape_m)
     assert config["mma_type"] == "tcgen05"
+    assert config["use_tcgen05"] is True
+    assert not config.get("use_tcgen05_ts")
     assert config["block_shape"] == block_shape
     assert config["warp_shape"] == (32, 64, block_shape[2])
+    assert config["num_stages"] >= 3
+    assert config["use_stream_k"] is False
+    assert config["use_warp_spec"] is True
+
+    default = get_heuristics_config(_layer_config(**overrides), shape_m=shape_m)
+    assert not default.get("use_tcgen05")

@@ -99,42 +99,57 @@ TS_SHAPE_CASES = (
 
 TS_CASES = TS_WEIGHT_DTYPE_CASES + TS_SCALE_CASES + TS_SHAPE_CASES
 
-# mma_type="tcgen05" packs weights in a layout only the TS kernel reads, so an
-# illegal layer must be rejected while packing instead of falling back.
-TS_ILLEGAL_CASES = (
-    _case("shape-n-not-multiple-128", shape_n=384 + 64, has_zero_point=True),
+# mma_type="tcgen05" is an opt-in to the tcgen05 family, so a layer neither
+# mainloop is legal for must be rejected while packing instead of falling back.
+ILLEGAL_CASES = (
+    _case("shape-n-not-multiple-64", shape_n=SHAPE_N + 32, has_zero_point=True),
     _case("shape-k-not-multiple-64", shape_k=SHAPE_K + 32, group_size=32, has_zero_point=True),
     _case("straddling-scale-group", group_size=48, has_zero_point=True, shape_k=384),
-    _case("fp-zero-point-uint8", b_dtype=dtypes.uint8, has_zero_point=True, is_fp_zero_point=True),
-    _case("weight-dtype-not-wired", b_dtype=dtypes.uint6, has_zero_point=True),
+    _case("weight-dtype-not-wired", b_dtype=dtypes.uint7, has_zero_point=True),
 )
 
 
-def _ss_case(name: str, *, b_dtype, has_zero_point: bool) -> KernelTestCase:
+def _ss_case(
+    name: str,
+    *,
+    b_dtype,
+    has_zero_point: bool,
+    is_fp_zero_point: bool = False,
+    shape_n: int = 4096,
+) -> KernelTestCase:
     return _case(
         name,
         b_dtype=b_dtype,
         has_zero_point=has_zero_point,
-        shape_n=4096,
+        is_fp_zero_point=is_fp_zero_point,
+        shape_n=shape_n,
         shape_k=2048,
-        mma_type=None,
+        mma_type=MmaType.TCGEN05,
         atol=0.1,
     )
 
 
-# SS mode reads the ordinary mma.sync weight layout and stages the dequantised
-# B operand in SMEM, so it is auto-selected -- above the heuristic's M cutoff --
-# for every weight dtype in the SS tuning table.
+# The opt-in falls back to SS wherever TS is illegal. uint3/uint5/uint6/fp8e5m2
+# have no ts_dequant_b_pair arm; the dtypes TS does carry are pushed onto SS by
+# shape_n % 128, which TS requires and SS (BlockN=64) does not. Between them
+# these cover every weight dtype in the SS tuning table at both BlockN.
 SS_CASES = (
     _ss_case("ss-uint3-zp", b_dtype=dtypes.uint3, has_zero_point=True),
-    _ss_case("ss-uint4-zp", b_dtype=dtypes.uint4, has_zero_point=True),
-    _ss_case("ss-uint4", b_dtype=dtypes.uint4, has_zero_point=False),
     _ss_case("ss-uint5-zp", b_dtype=dtypes.uint5, has_zero_point=True),
     _ss_case("ss-uint6-zp", b_dtype=dtypes.uint6, has_zero_point=True),
-    _ss_case("ss-uint8-zp", b_dtype=dtypes.uint8, has_zero_point=True),
-    _ss_case("ss-fp4e2m1", b_dtype=dtypes.float4e2m1, has_zero_point=False),
-    _ss_case("ss-fp8e4m3", b_dtype=dtypes.float8e4m3, has_zero_point=False),
     _ss_case("ss-fp8e5m2", b_dtype=dtypes.float8e5m2, has_zero_point=False),
+    _ss_case("ss-uint4-zp", b_dtype=dtypes.uint4, has_zero_point=True, shape_n=4160),
+    _ss_case("ss-uint4", b_dtype=dtypes.uint4, has_zero_point=False, shape_n=4160),
+    _ss_case("ss-uint8-zp", b_dtype=dtypes.uint8, has_zero_point=True, shape_n=4160),
+    _ss_case(
+        "ss-uint8-fp-zp",
+        b_dtype=dtypes.uint8,
+        has_zero_point=True,
+        is_fp_zero_point=True,
+        shape_n=4160,
+    ),
+    _ss_case("ss-fp4e2m1", b_dtype=dtypes.float4e2m1, has_zero_point=False, shape_n=4160),
+    _ss_case("ss-fp8e4m3", b_dtype=dtypes.float8e4m3, has_zero_point=False, shape_n=4160),
 )
 
 
@@ -161,26 +176,28 @@ def test_tcgen05_ts(test_case):
     _run(test_case, expect_ts=True)
 
 
-@pytest.mark.parametrize("test_case", TS_ILLEGAL_CASES, ids=str)
-def test_tcgen05_ts_rejects_illegal_layer(test_case):
+@pytest.mark.parametrize("test_case", ILLEGAL_CASES, ids=str)
+def test_tcgen05_rejects_illegal_layer(test_case):
     config = test_case.layer_config
     skip_if_unsupported(mma_type=config.mma_type.value)
     assert not config.tcgen05_supported
-    with pytest.raises(AssertionError, match="TS-legal"):
+    with pytest.raises(AssertionError, match="legal for neither"):
         KernelTestRunner(test_case)
 
 
 @pytest.mark.parametrize("test_case", SS_CASES, ids=str)
 def test_tcgen05_ss(test_case):
+    """The opt-in dispatches SS -- never mma.sync -- where TS is illegal."""
     config = test_case.layer_config
     skip_if_unsupported(a_dtype=config.a_dtype, mma_type="tcgen05")
-    assert config.mma_type == MmaType.MMA
+    assert config.mma_type == MmaType.TCGEN05
+    assert not config.tcgen05_supported
     heuristic_config = get_heuristics_config(config, shape_m=1024)
     assert heuristic_config["mma_type"] == "tcgen05"
     assert heuristic_config["use_tcgen05"] is True
     assert not heuristic_config.get("use_tcgen05_ts")
     results = _run(test_case)
-    assert any(result.tuning_values.get("use_tcgen05") for result in results)
+    assert all(result.tuning_values.get("use_tcgen05") for result in results)
     assert not any(result.tuning_values.get("use_tcgen05_ts") for result in results)
 
 
@@ -226,12 +243,12 @@ def test_tcgen05_ts_layer_opt_in(shape_m):
     torch.testing.assert_close(outputs_ts, outputs_default, rtol=0.01, atol=0.05)
 
 
-def test_tcgen05_ts_layer_rejects_illegal_shape():
+def test_tcgen05_layer_rejects_illegal_shape():
     from humming.layer import HummingLayer
     from humming.schema import HummingWeightSchema
 
     skip_if_unsupported(mma_type="tcgen05")
-    shape_n, shape_k = 192, 512
+    shape_n, shape_k = 160, 512
     schema = HummingWeightSchema(
         b_dtype=dtypes.uint4,
         bs_dtype=dtypes.bfloat16,
@@ -246,7 +263,7 @@ def test_tcgen05_ts_layer_rejects_illegal_shape():
         mma_type="tcgen05",
     ).cuda()
     layer.load_from_unquantized(torch.randn(shape_n, shape_k, dtype=torch.bfloat16, device="cuda"))
-    with pytest.raises(AssertionError, match="TS-legal"):
+    with pytest.raises(AssertionError, match="legal for neither"):
         layer.transform()
 
 
@@ -275,7 +292,10 @@ def test_tcgen05_case_coverage():
     assert any(shape_k % 128 for shape_k in shape_ks)
     assert max(shape_ks) >= 8192
 
-    # Every weight dtype the SS heuristic opts in must have a running case.
+    # Every weight dtype the SS table carries must have a running case, at both
+    # BlockN, and no SS case may be one the opt-in would route to TS instead.
     from humming.tune.sm100 import _SS_B_DTYPE_CONFIG
 
     assert {case.layer_config.b_dtype for case in SS_CASES} == set(_SS_B_DTYPE_CONFIG)
+    assert {case.layer_config.shape_n % 128 == 0 for case in SS_CASES} == {False, True}
+    assert all(case.layer_config.mma_type == MmaType.TCGEN05 for case in SS_CASES)

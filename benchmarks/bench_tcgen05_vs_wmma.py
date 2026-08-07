@@ -1,8 +1,8 @@
 """tcgen05 SS mode vs mma.sync across LLM projection shapes, W4A16.
 
-Sweeps M for the projection shapes of Llama-3 and Mixtral and marks the points
-where the sm100 heuristic actually selects SS mode, which is where its cutoffs
-in humming/tune/sm100.py come from.
+Sweeps M for the projection shapes of Llama-3 and Mixtral. mma.sync is what the
+sm100 heuristic emits for these layers; SS is only reachable under the
+mma_type="tcgen05" opt-in, and this sweep is why nothing selects it by default.
 """
 
 import torch
@@ -33,14 +33,6 @@ SHAPES = [
 SHAPE_MS = [1, 16, 64, 128, 256, 512, 1024, 2048]
 
 
-class _MmaSyncHeuristics(Sm100Heuristics):
-    """The sm100 heuristic with SS mode switched off: the mma.sync baseline."""
-
-    @classmethod
-    def _ss_config(cls, *args, **kwargs) -> dict | None:
-        return None
-
-
 def build_layer(shape_n: int, shape_k: int) -> HummingLayer:
     torch.manual_seed(2026)
     layer = HummingLayer(
@@ -65,21 +57,20 @@ def bench(layer: HummingLayer, inputs: torch.Tensor, config: dict) -> float:
 
 
 def mma_sync_config(layer_config: LayerConfig, shape_m: int) -> dict:
-    config = _MmaSyncHeuristics.get_config(layer_config=layer_config, shape_m=shape_m)
+    config = Sm100Heuristics.get_config(layer_config=layer_config, shape_m=shape_m)
     config["raster_group_m"] = raster_group_m_for_config(layer_config, config["block_shape"])
     return config
 
 
 def main() -> None:
     print(f"device: {torch.cuda.get_device_name(0)}")
-    header = f"{'M':>6}{'mma us':>10}{'SS us':>10}{'mma/SS':>9}{'shipped':>9}"
+    header = f"{'M':>6}{'mma us':>10}{'SS us':>10}{'mma/SS':>9}"
     for label, shape_n, shape_k in SHAPES:
         layer = build_layer(shape_n, shape_k)
         layer_config = layer.humming_config
-        # Only the SS profitability gates depend on shape_m, not the geometry it
-        # returns, so take the config from above the cutoff and time it at every
-        # M -- that is what makes the cutoff itself measurable here.
-        ss_config = Sm100Heuristics._ss_config(layer_config, 1 << 20, False, GemmType.DENSE)
+        # SS reads the ordinary weight layout, so it runs on the non-opted-in
+        # layer; its geometry does not depend on shape_m.
+        ss_config = Sm100Heuristics._ss_config(layer_config, GemmType.DENSE)
         print(f"\n{label}: N={shape_n} K={shape_k}")
         print(header)
         print("-" * len(header))
@@ -87,11 +78,7 @@ def main() -> None:
             inputs = torch.randn((shape_m, shape_k), dtype=torch.bfloat16, device="cuda:0")
             mma_us = bench(layer, inputs, mma_sync_config(layer_config, shape_m))
             ss_us = bench(layer, inputs, ss_config)
-            shipped = Sm100Heuristics.get_config(layer_config, shape_m).get("use_tcgen05", False)
-            print(
-                f"{shape_m:>6}{mma_us:>10.1f}{ss_us:>10.1f}"
-                f"{mma_us / ss_us:>8.2f}x{'SS' if shipped else 'mma':>9}"
-            )
+            print(f"{shape_m:>6}{mma_us:>10.1f}{ss_us:>10.1f}{mma_us / ss_us:>8.2f}x")
 
 
 if __name__ == "__main__":

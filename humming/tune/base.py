@@ -29,6 +29,15 @@ class DeviceHeuristics:
         return False
 
     @classmethod
+    def supports_tcgen05_ss(cls, layer_config: LayerConfig) -> bool:
+        """Whether this device has an SS-mode tcgen05 kernel for `layer_config`.
+
+        SS reads the ordinary weight layout, so this only gates dispatch and the
+        mma_type="tcgen05" opt-in; overridden by Sm100Heuristics.
+        """
+        return False
+
+    @classmethod
     def get_base_config(
         cls,
         a_dtype: dtypes.DataType,

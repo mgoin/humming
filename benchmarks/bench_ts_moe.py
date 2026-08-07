@@ -38,14 +38,6 @@ NUM_TOKENS = 512
 GEMM_TYPES = [GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED]
 
 
-class _MmaSyncHeuristics(Sm100Heuristics):
-    """The sm100 heuristic with SS mode switched off: the mma.sync baseline."""
-
-    @classmethod
-    def _ss_config(cls, *args, **kwargs) -> dict | None:
-        return None
-
-
 def build_layer(shape_n: int, shape_k: int, num_experts: int, mma_type: str | None = None):
     torch.manual_seed(2026)
     layer = HummingLayer(
@@ -114,7 +106,7 @@ def main() -> None:
                 problem = make_problem(shape_k, num_experts, top_k, gemm_type)
                 shape_m = problem["inputs"].shape[0]
                 ts_config = Sm100Heuristics._ts_config(ts_layer.humming_config, shape_m, gemm_type)
-                mma_config = _MmaSyncHeuristics.get_config(
+                mma_config = Sm100Heuristics.get_config(
                     layer_config=layer.humming_config,
                     shape_m=shape_m,
                     gemm_type=gemm_type,

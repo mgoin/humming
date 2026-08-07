@@ -2,8 +2,9 @@
 
 The three paths run the same layer, so the columns differ only in the mainloop:
 mma.sync dequantises into registers, SS mode stages the dequantised weights in
-SMEM for tcgen05.mma, and TS mode stages them in TMEM. Sources the M cutoffs in
-humming/tune/sm100.py.
+SMEM for tcgen05.mma, and TS mode stages them in TMEM. The mma.sync column is
+what the sm100 heuristic emits without the mma_type="tcgen05" opt-in, so it is
+also the upstream baseline.
 """
 
 import torch
@@ -27,14 +28,6 @@ SHAPES = [
     ("Llama70B down", 8192, 28672),
 ]
 SHAPE_MS = [16, 128, 512, 2048]
-
-
-class _MmaSyncHeuristics(Sm100Heuristics):
-    """The sm100 heuristic with SS mode switched off: the mma.sync baseline."""
-
-    @classmethod
-    def _ss_config(cls, *args, **kwargs) -> dict | None:
-        return None
 
 
 def build_layer(shape_n: int, shape_k: int, mma_type: str | None = None) -> HummingLayer:
@@ -62,7 +55,7 @@ def bench(layer: HummingLayer, inputs: torch.Tensor, config: dict) -> float:
 
 
 def mma_sync_config(layer_config: LayerConfig, shape_m: int) -> dict:
-    config = _MmaSyncHeuristics.get_config(layer_config=layer_config, shape_m=shape_m)
+    config = Sm100Heuristics.get_config(layer_config=layer_config, shape_m=shape_m)
     config["raster_group_m"] = raster_group_m_for_config(layer_config, config["block_shape"])
     return config
 
@@ -83,10 +76,9 @@ def main() -> None:
     for label, shape_n, shape_k in SHAPES:
         layer = build_layer(shape_n, shape_k)
         ts_layer = build_layer(shape_n, shape_k, mma_type="tcgen05")
-        # Only the SS profitability gates depend on shape_m, not the geometry it
-        # returns, so take the config from above the cutoff and time it at every
-        # M -- that is what makes the cutoff itself measurable here.
-        ss_config = Sm100Heuristics._ss_config(layer.humming_config, 1 << 20, False, GemmType.DENSE)
+        # SS reads the ordinary weight layout, so it runs on the non-opted-in
+        # layer; its geometry does not depend on shape_m.
+        ss_config = Sm100Heuristics._ss_config(layer.humming_config, GemmType.DENSE)
         for shape_m in SHAPE_MS:
             inputs = torch.randn((shape_m, shape_k), dtype=torch.bfloat16, device="cuda:0")
             ts_config = Sm100Heuristics._ts_config(ts_layer.humming_config, shape_m, GemmType.DENSE)

@@ -459,17 +459,19 @@ def transform_humming_tensors(
     if config.use_fused_e8m0_scale and config.a_dtype == dtypes.float8e4m3:
         interleave_mode = 2
 
-    # mma_type=TCGEN05 opts the whole layer into the TS-mode slot-paired
-    # weight/scale/zero-point layouts, which no other kernel can read. The
-    # heuristic must therefore dispatch TS at every shape_m, so pack in
-    # lockstep with the gate it uses.
-    use_tcgen05_ts = config.mma_type == MmaType.TCGEN05
-    if use_tcgen05_ts:
+    # mma_type=TCGEN05 opts the layer into the tcgen05 kernels. TS mode reads
+    # slot-paired weight/scale/zero-point layouts no other kernel can read, so
+    # pack in lockstep with the gate the heuristic dispatches on; the SS
+    # fallback reads the ordinary layout and needs no packing change.
+    use_tcgen05_ts = False
+    if config.mma_type == MmaType.TCGEN05:
         from humming.tune import get_heuristics_class
 
-        assert get_heuristics_class().supports_tcgen05_ts(config), (
-            "mma_type='tcgen05' opts into TS-mode packing, but this layer is "
-            "not TS-legal on this device (see LayerConfig.tcgen05_supported)"
+        heuristics_cls = get_heuristics_class()
+        use_tcgen05_ts = heuristics_cls.supports_tcgen05_ts(config)
+        assert use_tcgen05_ts or heuristics_cls.supports_tcgen05_ss(config), (
+            "mma_type='tcgen05' is legal for neither the TS kernel (see "
+            "LayerConfig.tcgen05_supported) nor the SS fallback on this device"
         )
 
     weight = transform_humming_weight(
