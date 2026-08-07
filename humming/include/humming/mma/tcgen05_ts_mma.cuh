@@ -179,7 +179,9 @@ public:
                     kDColOffset + BlockShape::M <=
                         SharedStorage::kTcgen05TmemCols,
                 "TCGEN05_TS: staging depth must fit the TMEM reservation");
-  static_assert(kNumTsGroups == 1 || kTsSlotsPerStage >= 2,
+  // kTsWaitIter is reached at mainloop index kWarpIters - 3, which must exist
+  // and precede the consumer.arrive at index kWarpIters - 2.
+  static_assert(kNumTsGroups == 1 || kTsSlotsPerStage >= 3,
                 "TCGEN05_TS: multi-group staging needs the WAR wait one warp "
                 "iter ahead of the mainloop's consumer.arrive");
   static_assert(MmaOpClass::kCtaGroup == 1,
