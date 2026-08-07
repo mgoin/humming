@@ -21,25 +21,54 @@ existed.
 """
 
 from humming import dtypes
-from humming.config import GemmType, LayerConfig, MmaType
+from humming.config import GemmType, LayerConfig, MmaType, WeightScale2Type, WeightScaleType
 from humming.tune.sm8x import Sm80Heuristics
 from humming.utils.smem import estimate_smem_size_layer
 
-# B dtypes opted into SS mode, mapped to the (block_k, num_stages) each was
-# tuned to by benchmarks/bench_tcgen05_dtypes.py. The stage counts are what
-# _fit_num_stages can actually emit: the bf16 b_dequant staging buffer means
-# only uint3 keeps a fourth stage at BlockK=128 (uint4 there needs 234,496 B
-# against the device's 232,448 B cap), and uint8 needs BlockK=64.
+# Every weight dtype the library pairs with a bf16 activation, mapped to the
+# (block_k, num_stages) SS runs it at. SS reads the ordinary mma.sync weight
+# layout, so this is a tuning table and not a capability gate: the entries
+# benchmarks/bench_tcgen05_dtypes.py swept keep their tuned values, and the rest
+# take the deepest pipeline estimate_smem_size_layer fits at BlockK=128 -- the
+# bf16 b_dequant staging buffer binds there (uint4 at four stages needs
+# 234,496 B against the device's 232,448 B cap).
 _SS_B_DTYPE_CONFIG: dict[dtypes.DataType, tuple[int, int]] = {
-    dtypes.uint3: (128, 4),
-    dtypes.uint4: (128, 3),
-    dtypes.float4e2m1: (128, 3),
-    dtypes.uint5: (128, 3),
-    dtypes.uint6: (128, 3),
-    dtypes.float8e4m3: (128, 3),
-    dtypes.float8e5m2: (128, 3),
-    dtypes.uint8: (64, 4),
+    dtypes.DataType.from_str(name): value
+    for name, value in {
+        "uint1": (128, 4),
+        "uint2": (128, 4),
+        "uint3": (128, 4),
+        "uint4": (128, 3),
+        "uint5": (128, 3),
+        "uint6": (128, 3),
+        "uint7": (128, 3),
+        "uint8": (64, 4),
+        "float3e1m1": (128, 4),
+        "float3e2m0": (128, 4),
+        "float4e2m1": (128, 3),
+        "float4e3m0": (128, 3),
+        "float5e2m2": (128, 3),
+        "float5e4m0": (128, 3),
+        "float6e2m3": (128, 3),
+        "float6e4m1": (128, 3),
+        "float7e2m4": (128, 3),
+        "float7e4m2": (128, 3),
+        "float7e6m0": (128, 3),
+        "float8e1m6": (128, 3),
+        "float8e4m3": (128, 3),
+        "float8e5m2": (128, 3),
+    }.items()
 }
+
+# Weight-scale dtypes the generic mainloop dequantises into ElementA before
+# applying them on B. A 16-bit scale is reinterpreted as ElementA bit-for-bit,
+# so only bs_dtype == a_dtype is legal there.
+_SS_GROUP_BS_DTYPES = (
+    dtypes.bfloat16,
+    dtypes.float8e4m3,
+    dtypes.float8e5m2,
+    dtypes.float8e8m0,
+)
 
 _TS_GEMM_TYPES = (GemmType.DENSE, GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
 
@@ -60,17 +89,38 @@ class Sm100Heuristics(Sm80Heuristics):
         """Whether the SS-mode tcgen05 kernel can run `layer_config`.
 
         Mirrors the static_asserts in mma/tcgen05_mma.cuh: bf16 activations
-        against a narrow B dtype with a group weight scale, read from the
-        ordinary mma.sync weight layout. Gates dispatch and packing, which must
-        agree, so transform_humming_tensors calls it too.
+        against a narrow B dtype, read from the ordinary mma.sync weight layout.
+        Every quantisation parameter is admitted by name rather than by absence
+        of a check, because the SS drain replicates only what the mainloop
+        applies: anything the epilogue smem writer would have applied is
+        silently dropped instead of raising. Gates dispatch and packing, which
+        must agree, so transform_humming_tensors calls it too.
         """
         if layer_config.a_dtype != dtypes.bfloat16:
             return False
         if layer_config.b_dtype not in _SS_B_DTYPE_CONFIG:
             return False
-        group_size = layer_config.weight_scale_group_size
-        if group_size <= 0:
+        if layer_config.weight_scale_2_type != WeightScale2Type.NONE:
+            # weight_scale_2 lives in EpilogueArithmetic::may_apply_on_smem_write,
+            # which drain_accum bypasses.
             return False
+        # CHANNEL and TENSOR weight scales are applied on C, and
+        # should_apply_bs_on_c is False for TCGEN05, so only the scale kinds the
+        # mainloop applies on B are legal.
+        if layer_config.weight_scale_type == WeightScaleType.GROUP:
+            if layer_config.bs_dtype not in _SS_GROUP_BS_DTYPES:
+                return False
+        elif layer_config.weight_scale_type == WeightScaleType.BLOCK:
+            # The block scale is read as one f32 per warp N-tile, and SS pins
+            # WarpShape::N at 64.
+            if layer_config.bs_dtype != dtypes.float32:
+                return False
+            if layer_config.weight_scale_group_size_n % 64:
+                return False
+        else:
+            return False
+        # GROUP and BLOCK both carry weight_scale_group_size > 0 (LayerConfig).
+        group_size = layer_config.weight_scale_group_size
         if group_size % 64 and 64 % group_size:
             # A BlockK stage must hold whole weight-scale groups.
             return False

@@ -96,6 +96,24 @@ def test_zero_point(test_case):
     assert_kernel_test_shape_coverage(results)
 
 
+@pytest.mark.parametrize("b_dtype", [dtypes.float4e2m1, dtypes.float8e4m3], ids=str)
+def test_fp_zero_point_requires_unsigned_integer_weight(b_dtype):
+    """arith/mainloop_arith.cuh static_asserts an unsigned-integer B for the fp
+    zero point, so the layer must be rejected here rather than inside NVRTC."""
+    with pytest.raises(AssertionError, match="unsigned-integer b_dtype"):
+        LayerConfig(
+            shape_n=SHAPE_N,
+            shape_k=SHAPE_K,
+            a_dtype=dtypes.bfloat16,
+            b_dtype=b_dtype,
+            c_dtype=dtypes.bfloat16,
+            bs_dtype=dtypes.bfloat16,
+            weight_scale_group_size=WEIGHT_SCALE_GROUP_SIZE,
+            has_zero_point=True,
+            is_fp_zero_point=True,
+        )
+
+
 def test_zero_point_case_coverage():
     integer_cases = [case for case in ZERO_POINT_CASES if not case.layer_config.is_fp_zero_point]
     floating_cases = [case for case in ZERO_POINT_CASES if case.layer_config.is_fp_zero_point]

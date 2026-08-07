@@ -87,6 +87,11 @@ class LayerConfig(BaseHummingConfig):
             return False
         if not (self.is_group_weight_scale or self.is_channel_weight_scale):
             return False
+        if self.weight_scale_2_type != WeightScale2Type.NONE:
+            # weight_scale_2 is applied in EpilogueArithmetic::may_apply_on_smem_write
+            # and every tcgen05 drain bypasses the smem writer, so it would be
+            # silently dropped rather than applied.
+            return False
         group_size = self.weight_scale_group_size
         if group_size and group_size < 64 and (group_size % 16 or 64 % group_size):
             # Sub-stage groups must divide BlockK=64 and hold a whole 16-K MMA
@@ -174,6 +179,12 @@ class LayerConfig(BaseHummingConfig):
                 self.b_dtype = dataclasses.replace(self.b_dtype, is_signed=True)
             else:
                 self.b_dtype = dataclasses.replace(self.b_dtype, is_signed=False)
+
+        if self.has_zero_point and self.is_fp_zero_point:
+            assert self.b_dtype.is_integer_type and not self.b_dtype.is_signed, (
+                "is_fp_zero_point requires an unsigned-integer b_dtype "
+                f"(arith/mainloop_arith.cuh static_asserts it), got {self.b_dtype}"
+            )
 
         self._update_weight_scale_flags()
 

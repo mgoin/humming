@@ -1,7 +1,7 @@
 import pytest
 
 from humming import dtypes
-from humming.config import GemmType, LayerConfig, MmaType
+from humming.config import GemmType, LayerConfig, MmaType, WeightScale2Type, WeightScaleType
 from humming.testing import skip_if_unsupported
 from humming.tune import get_heuristics_class, get_heuristics_config
 
@@ -115,6 +115,10 @@ def test_ts_legal_layers(overrides):
         # TS is bf16 x narrow-B only, with bf16 scales.
         {"a_dtype": dtypes.float8e4m3, "b_dtype": dtypes.float8e4m3, "has_zero_point": False},
         {"bs_dtype": dtypes.float8e8m0},
+        # weight_scale_2 is applied in the epilogue smem writer, which the TMEM
+        # drain bypasses -- admitting it would drop the scale silently.
+        {"weight_scale_2_type": WeightScale2Type.CHANNEL},
+        {"weight_scale_2_type": WeightScale2Type.TENSOR},
     ],
     ids=str,
 )
@@ -127,15 +131,77 @@ def test_ts_illegal_layers(overrides):
 @pytest.mark.parametrize(
     "overrides",
     [
-        # Neither tuning table carries this weight dtype.
+        # Weight dtypes with no ts_dequant_b_pair arm, one per dequant family.
+        {"b_dtype": dtypes.uint1},
         {"b_dtype": dtypes.uint7},
+        {"b_dtype": dtypes.DataType.from_str("float3e2m0"), "has_zero_point": False},
+        {"b_dtype": dtypes.DataType.from_str("float7e6m0"), "has_zero_point": False},
+        # 8-bit group scales are dequantised into bf16 by the generic mainloop.
+        {"bs_dtype": dtypes.float8e8m0, "weight_scale_group_size": 32},
+        {"bs_dtype": dtypes.float8e4m3},
+        # A block scale is one f32 per warp N-tile, and SS pins WarpN at 64.
+        {
+            "bs_dtype": dtypes.float32,
+            "weight_scale_type": WeightScaleType.BLOCK,
+            "weight_scale_group_size": 64,
+            "weight_scale_group_size_n": 64,
+            "has_zero_point": False,
+        },
+    ],
+    ids=str,
+)
+def test_ss_legal_layers(overrides):
+    config = _layer_config(**overrides)
+    assert not config.tcgen05_supported
+    assert get_heuristics_class().supports_tcgen05_ss(config)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # Applied on C by the epilogue smem writer both drains bypass.
+        {"weight_scale_2_type": WeightScale2Type.CHANNEL},
+        {"weight_scale_2_type": WeightScale2Type.TENSOR},
+        {"weight_scale_group_size": 0, "has_zero_point": False},
+        {
+            "bs_dtype": dtypes.float32,
+            "weight_scale_type": WeightScaleType.TENSOR,
+            "weight_scale_group_size": 0,
+            "has_zero_point": False,
+        },
+        # A 16-bit group scale is reinterpreted as ElementA bit-for-bit.
+        {"bs_dtype": dtypes.float16},
+        # A block scale narrower than the warp N-tile is not indexed per N.
+        {
+            "bs_dtype": dtypes.float32,
+            "weight_scale_type": WeightScaleType.BLOCK,
+            "weight_scale_group_size": 64,
+            "weight_scale_group_size_n": 32,
+            "has_zero_point": False,
+        },
+    ],
+    ids=str,
+)
+def test_ss_illegal_layers(overrides):
+    config = _layer_config(b_dtype=dtypes.uint3, **overrides)
+    assert not get_heuristics_class().supports_tcgen05_ss(config)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # Neither tuning table carries this weight dtype.
+        {"b_dtype": dtypes.float6e3m2, "has_zero_point": False},
         # BlockN bottoms out at 64 and BlockK at 64, so the shape must tile.
         {"shape_n": SHAPE_N + 32},
         {"shape_k": SHAPE_K + 32, "weight_scale_group_size": 32},
         # A BlockK stage must hold whole weight-scale groups.
         {"weight_scale_group_size": 48, "shape_k": SHAPE_K + 32},
-        # SS needs a group weight scale, and TS needs a wired dequant arm.
+        # SS applies only the scale kinds the mainloop carries, and TS needs a
+        # wired dequant arm.
         {"b_dtype": dtypes.uint7, "weight_scale_group_size": 0, "has_zero_point": False},
+        {"b_dtype": dtypes.uint7, "weight_scale_2_type": WeightScale2Type.CHANNEL},
+        {"weight_scale_2_type": WeightScale2Type.TENSOR},
     ],
     ids=str,
 )
@@ -166,6 +232,7 @@ def test_ts_opt_in_rejects_unsupported_compute(kwargs, message):
         # Weight dtypes with no ts_dequant_b_pair arm.
         ({"b_dtype": dtypes.uint3}, (128, 128, 128)),
         ({"b_dtype": dtypes.uint6}, (128, 128, 128)),
+        ({"b_dtype": dtypes.uint7}, (128, 128, 128)),
         ({"b_dtype": dtypes.float8e5m2, "has_zero_point": False}, (128, 128, 128)),
         # shape_n only tiles at BlockN=64, which TS does not accept.
         ({"shape_n": 6208}, (128, 64, 128)),
