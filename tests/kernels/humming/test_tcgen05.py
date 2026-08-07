@@ -97,7 +97,8 @@ _A_NAME = {dtypes.bfloat16: "bf16", dtypes.float16: "fp16"}
 
 # Every weight dtype wired into ts_dequant_b_pair, with the zero-point modes
 # each one supports: integer zp for the unsigned-integer dtypes, none for the
-# fp dtypes (their dequant carries a constant exponent offset instead).
+# fp dtypes, whose dequant arms subtract nothing (LayerConfig rejects the
+# combination -- test_tcgen05_ts_fp_weight_rejects_zero_point).
 TS_B_DTYPE_ZP_MODES = (
     (dtypes.uint2, (False, True)),
     (dtypes.uint4, (False, True)),
@@ -494,6 +495,18 @@ def test_tcgen05_ts_fp_weight_covers_every_code(a_dtype):
         torch.testing.assert_close(
             result.outputs, result.outputs_ref, rtol=test_case.rtol, atol=test_case.atol
         )
+
+
+@pytest.mark.parametrize(
+    "b_dtype", [b_dtype for b_dtype, _ in TS_B_DTYPE_ZP_MODES if b_dtype.is_floating_point_type], ids=str
+)
+@pytest.mark.parametrize("is_fp_zero_point", [False, True], ids=["int-zp", "fp-zp"])
+def test_tcgen05_ts_fp_weight_rejects_zero_point(b_dtype, is_fp_zero_point):
+    """ts_dequant_b_pair's fp arm never reads the zero-point bias, so a zero
+    point on a floating-point weight dtype is dropped silently on TS where SS
+    and mma.sync fail in NVRTC. LayerConfig rejects all three."""
+    with pytest.raises(AssertionError, match="unsigned-integer b_dtype"):
+        _case("fp-weight-zp", b_dtype=b_dtype, has_zero_point=True, is_fp_zero_point=is_fp_zero_point)
 
 
 @pytest.mark.parametrize("test_case", ILLEGAL_CASES, ids=str)

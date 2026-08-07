@@ -96,10 +96,14 @@ def test_zero_point(test_case):
     assert_kernel_test_shape_coverage(results)
 
 
+@pytest.mark.parametrize("is_fp_zero_point", [False, True], ids=["int-zp", "fp-zp"])
 @pytest.mark.parametrize("b_dtype", [dtypes.float4e2m1, dtypes.float8e4m3], ids=str)
-def test_fp_zero_point_requires_unsigned_integer_weight(b_dtype):
-    """arith/mainloop_arith.cuh static_asserts an unsigned-integer B for the fp
-    zero point, so the layer must be rejected here rather than inside NVRTC."""
+def test_zero_point_requires_unsigned_integer_weight(b_dtype, is_fp_zero_point):
+    """No dequant arm subtracts a zero point from a floating-point weight --
+    datatype/dequant_single.cuh static_asserts !kHasZeroPoint on the fp->fp arm
+    and arith/mainloop_arith.cuh does the same for the fp zero point -- so the
+    layer must be rejected here rather than inside NVRTC. tcgen05 TS has no
+    such assert and would drop the zero point silently."""
     with pytest.raises(AssertionError, match="unsigned-integer b_dtype"):
         LayerConfig(
             shape_n=SHAPE_N,
@@ -110,7 +114,7 @@ def test_fp_zero_point_requires_unsigned_integer_weight(b_dtype):
             bs_dtype=dtypes.bfloat16,
             weight_scale_group_size=WEIGHT_SCALE_GROUP_SIZE,
             has_zero_point=True,
-            is_fp_zero_point=True,
+            is_fp_zero_point=is_fp_zero_point,
         )
 
 

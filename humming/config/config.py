@@ -206,10 +206,17 @@ class LayerConfig(BaseHummingConfig):
             else:
                 self.b_dtype = dataclasses.replace(self.b_dtype, is_signed=False)
 
-        if self.has_zero_point and self.is_fp_zero_point:
+        if self.has_zero_point:
+            # Every dequant arm that subtracts a zero point takes an unsigned
+            # integer source: datatype/dequant_single.cuh static_asserts
+            # !kHasZeroPoint on the fp->fp and identity arms and
+            # arith/mainloop_arith.cuh does the same for the fp zero point.
+            # tcgen05 TS has no such assert -- ts_dequant_b_pair's fp arm just
+            # never reads the bias -- so an fp b_dtype must be rejected here or
+            # the zero point is silently dropped.
             assert self.b_dtype.is_integer_type and not self.b_dtype.is_signed, (
-                "is_fp_zero_point requires an unsigned-integer b_dtype "
-                f"(arith/mainloop_arith.cuh static_asserts it), got {self.b_dtype}"
+                "a zero point requires an unsigned-integer b_dtype "
+                f"(datatype/dequant_single.cuh static_asserts it), got {self.b_dtype}"
             )
 
         self._update_weight_scale_flags()
