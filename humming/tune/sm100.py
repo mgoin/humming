@@ -128,6 +128,7 @@ class Sm100Heuristics(Sm80Heuristics):
         else:
             # Grouped: shape_m counts padded tokens over all experts, but the
             # scheduler tiles per expert, so tokens-per-expert sets occupancy.
+            # Retune with benchmarks/bench_ts_moe.py.
             tokens_per_expert = shape_m // max(layer_config.num_experts, 1)
             block_m = 128 if tokens_per_expert >= 128 else 64
 

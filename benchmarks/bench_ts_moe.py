@@ -1,10 +1,6 @@
 """tcgen05 TS mode vs mma.sync for grouped MoE GEMMs, W4A16.
 
-Grouping lives above the MMA, so this measures the same TS mainloop as the dense
-bench under the grouped-contiguous and grouped-masked schedulers. Tokens per
-expert, not the padded token total, drives the TS tile choice in
-humming/tune/sm100.py, so each shape is benched at both a coarse and a
-fine-grained expert count.
+The sweep behind the grouped block_m rule in humming/tune/sm100.py.
 """
 
 import math
@@ -24,8 +20,7 @@ WEIGHT_CONFIG = {
     "has_zero_point": True,
 }
 
-# (label, N, K, [(num_experts, top_k), ...]) -- per-expert projections at each
-# model's expert config, plus a coarse E=8 point for the tile-fill comparison.
+# Each model's expert config plus a coarse E=8 point, for the tile-fill compare.
 SHAPES = [
     ("Qwen3-MoE gate/up", 1536, 4096, [(8, 2), (128, 8)]),
     ("Qwen3-MoE down", 4096, 1536, [(8, 2), (128, 8)]),
@@ -64,7 +59,6 @@ def bench(layer: HummingLayer, config: dict, **launch_kwargs) -> float:
 
 
 def make_problem(shape_k: int, num_experts: int, top_k: int, gemm_type: GemmType) -> dict:
-    """Grouped inputs plus the launch tensors, with tokens spread evenly."""
     expert_max_tokens = math.ceil(NUM_TOKENS * top_k / num_experts)
     _, expert_layout, *_ = generate_random_moe_tensors(
         shape_m=NUM_TOKENS,

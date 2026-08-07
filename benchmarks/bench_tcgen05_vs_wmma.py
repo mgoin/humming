@@ -1,8 +1,6 @@
 """tcgen05 SS mode vs mma.sync across LLM projection shapes, W4A16.
 
-Sweeps M for the projection shapes of Llama-3 and Mixtral. mma.sync is what the
-sm100 heuristic emits for these layers; SS is only reachable under the
-mma_type="tcgen05" opt-in, and this sweep is why nothing selects it by default.
+The sweep behind "SS never beats mma.sync" in humming/tune/sm100.py.
 """
 
 import torch
@@ -68,8 +66,7 @@ def main() -> None:
     for label, shape_n, shape_k in SHAPES:
         layer = build_layer(shape_n, shape_k)
         layer_config = layer.humming_config
-        # SS reads the ordinary weight layout, so it runs on the non-opted-in
-        # layer; its geometry does not depend on shape_m.
+        # SS reads the ordinary weight layout and does not depend on shape_m.
         ss_config = Sm100Heuristics._ss_config(layer_config, GemmType.DENSE)
         print(f"\n{label}: N={shape_n} K={shape_k}")
         print(header)

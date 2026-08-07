@@ -1,11 +1,3 @@
-"""Contract tests for the tcgen05 TS-mode weight/scale/zero-point layouts.
-
-The register-layout contract (docs/tcgen05_ts_packing.md) is that after
-loader_b's half-group gather and the lop3 dequant, thread (warp w, lane l)
-holds W[32 * (w % 4) + l, 16 * chunk .. + 16] in ascending-K register order,
-with scales and zero points owned per lane = weight row.
-"""
-
 import pytest
 import torch
 
@@ -51,7 +43,6 @@ def test_weight_pack_roundtrip_moe():
 
 @pytest.mark.parametrize("weight_bits", WEIGHT_BITS)
 def test_register_contract(weight_bits):
-    """Simulate the WarpN=32 half-group gather plus the lop3 slot extraction."""
     shape_n, shape_k = 128, 64
     codes = _random_codes(shape_n, shape_k, weight_bits, seed=1)
     packed = pack_weight_tcgen05_ts(codes, weight_bits)
@@ -71,7 +62,6 @@ def test_register_contract(weight_bits):
 
 
 def test_register_contract_block_n64():
-    """A 64-row MMA-M tile is covered by two warps, bands 0 and 1."""
     shape_n, shape_k = 64, 32
     codes = _random_codes(shape_n, shape_k, seed=2)
     packed = pack_weight_tcgen05_ts(codes, 4)
@@ -118,11 +108,6 @@ def test_zero_point_stream_roundtrip(weight_bits):
 
 @pytest.mark.parametrize("shape", [(64, 64), (128, 128), (256, 512), (128, 1792)])
 def test_mma_sync_inverse_matches_cuda_repack(shape):
-    """Both layouts must round-trip the same logical weights.
-
-    The mma.sync inverse is the base the TS interleave derivation stands on,
-    so pinning it keeps the TS reference packer honest.
-    """
     skip_if_unsupported()
     shape_n, shape_k = shape
     codes = _random_codes(shape_n, shape_k, seed=5, device="cuda")
@@ -155,7 +140,6 @@ def test_cuda_repack_matches_reference(shape, weight_bits):
 
 
 def test_cuda_repack_packed_input():
-    """Bit-packed rows (as produced by ops.pack_weight) reach the same layout."""
     skip_if_unsupported()
     shape_n, shape_k = 128, 256
     codes = _random_codes(shape_n, shape_k, seed=9, device="cuda")

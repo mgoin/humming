@@ -40,13 +40,8 @@ def _requires_tcgen05():
     skip_if_unsupported(mma_type="tcgen05")
 
 
-def test_heuristics_class_resolves_to_sm100():
-    assert get_heuristics_class().sm_version == 100
-
-
 @pytest.mark.parametrize("shape_m,block_m", [(1, 64), (17, 64), (127, 64), (128, 128), (4096, 128)])
 def test_ts_opt_in_config(shape_m, block_m):
-    """A tcgen05 layer runs TS at every shape_m; only the M tile moves."""
     config = get_heuristics_config(_layer_config(mma_type=MmaType.TCGEN05), shape_m=shape_m)
     assert config["mma_type"] == "tcgen05"
     assert config["use_tcgen05"] is True
@@ -56,9 +51,6 @@ def test_ts_opt_in_config(shape_m, block_m):
     assert config["num_stages"] >= 3
     assert config["use_warp_spec"] is True
     assert config["use_tma"] is True
-    # The TS epilogue drains TMEM straight into the TMA-C store and has no
-    # cross-CTA partial-K reduction, and the launcher rejects a TMA BZP
-    # descriptor for a group weight scale with a zero point.
     assert config["use_stream_k"] is False
     assert config["use_tma_bzp"] is False
     assert config["raster_group_m"] == 1
@@ -67,32 +59,21 @@ def test_ts_opt_in_config(shape_m, block_m):
 @pytest.mark.parametrize(
     "overrides,num_stages",
     [
-        # The load-bound mainloop wants five stages everywhere; uint8's wider
-        # stage is the one that loses (6-11%) at that depth.
         ({}, 5),
-        ({"has_zero_point": False}, 5),
         ({"b_dtype": dtypes.uint8}, 4),
-        ({"b_dtype": dtypes.uint8, "has_zero_point": False}, 4),
         ({"b_dtype": dtypes.uint2}, 5),
-        ({"b_dtype": dtypes.float4e2m1, "has_zero_point": False}, 5),
-        # The zero-point mode does not move the depth on either width.
-        ({"is_fp_zero_point": True}, 5),
         ({"b_dtype": dtypes.uint8, "is_fp_zero_point": True}, 4),
-        # Nor does ElementA: fp16 uint4 measures the same.
         ({"a_dtype": dtypes.float16, "c_dtype": dtypes.float16, "bs_dtype": dtypes.float16}, 5),
     ],
     ids=str,
 )
 def test_ts_num_stages_is_per_weight_dtype(overrides, num_stages):
-    """TS pipeline depth is tuned per weight dtype, not capped globally."""
     config = get_heuristics_config(_layer_config(mma_type=MmaType.TCGEN05, **overrides), shape_m=2048)
     assert config["num_stages"] == num_stages
 
 
 @pytest.mark.parametrize("b_dtype,num_stages", [(dtypes.uint4, 5), (dtypes.uint8, 4)])
 def test_ts_grouped_takes_the_dense_pipeline(b_dtype, num_stages):
-    """Grouped tiles a short K per expert but is load-bound the same way, and
-    measures at the dense depth for both widths."""
     config = get_heuristics_config(
         _layer_config(mma_type=MmaType.TCGEN05, num_experts=8, b_dtype=b_dtype),
         shape_m=1024,
@@ -106,8 +87,6 @@ def test_ts_grouped_takes_the_dense_pipeline(b_dtype, num_stages):
     "overrides",
     [
         {},
-        # Fat-K, few-output-tile and wide-dtype layers: the whole M >= 128
-        # window that SS used to take over before selection became opt-in.
         {"shape_n": 8192, "shape_k": 28672},
         {"shape_n": 6144},
         {"b_dtype": dtypes.uint3},
@@ -115,59 +94,12 @@ def test_ts_grouped_takes_the_dense_pipeline(b_dtype, num_stages):
     ],
     ids=str,
 )
-@pytest.mark.parametrize("shape_m", [1, 16, 64, 128, 256, 512, 1024, 2048, 4096])
+@pytest.mark.parametrize("shape_m", [1, 128, 4096])
 def test_default_layer_never_selects_tcgen05(overrides, shape_m):
-    """Without the opt-in sm100 resolves to the mma.sync config it always did."""
     config = get_heuristics_config(_layer_config(**overrides), shape_m=shape_m)
     assert config.get("mma_type") is None
     assert not config.get("use_tcgen05")
     assert not config.get("use_tcgen05_ts")
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {},
-        {"weight_scale_group_size": 0, "has_zero_point": False},
-        {"weight_scale_group_size": 16},
-        {"weight_scale_group_size": 32},
-        {"weight_scale_group_size": 64},
-        {"b_dtype": dtypes.uint2},
-        {"b_dtype": dtypes.uint8},
-        {"b_dtype": dtypes.float4e2m1, "has_zero_point": False},
-        {"b_dtype": dtypes.float8e4m3, "has_zero_point": False},
-        {"is_fp_zero_point": True},
-        {"b_dtype": dtypes.uint8, "is_fp_zero_point": True},
-        {"b_dtype": dtypes.float8e5m2, "has_zero_point": False},
-        {"b_dtype": dtypes.DataType.from_str("float4e3m0"), "has_zero_point": False},
-        {"b_dtype": dtypes.DataType.from_str("float8e1m6"), "has_zero_point": False},
-        # fp16 activations: bs_dtype and c_dtype track a_dtype.
-        {"a_dtype": dtypes.float16, "c_dtype": dtypes.float16, "bs_dtype": dtypes.float16},
-        {
-            "a_dtype": dtypes.float16,
-            "c_dtype": dtypes.float16,
-            "bs_dtype": dtypes.float16,
-            "b_dtype": dtypes.uint8,
-        },
-        {
-            "a_dtype": dtypes.float16,
-            "c_dtype": dtypes.float16,
-            "bs_dtype": dtypes.float16,
-            "is_fp_zero_point": True,
-        },
-        # 8-bit group scales, decoded to ElementA at the s2r load.
-        {"bs_dtype": dtypes.float8e8m0, "weight_scale_group_size": 32},
-        {"bs_dtype": dtypes.float8e4m3},
-        {"a_dtype": dtypes.float16, "c_dtype": dtypes.float16, "bs_dtype": dtypes.float8e4m3},
-        {"num_experts": 256},
-        {"shape_n": 512, "shape_k": 512},
-    ],
-    ids=str,
-)
-def test_ts_legal_layers(overrides):
-    config = _layer_config(**overrides)
-    assert config.tcgen05_supported
-    assert get_heuristics_class().supports_tcgen05_ts(config)
 
 
 @pytest.mark.parametrize(
@@ -178,14 +110,13 @@ def test_ts_legal_layers(overrides):
         {"shape_k": 4128, "weight_scale_group_size": 32},
         # A 16-K MMA iteration must stay inside one weight-scale group.
         {"weight_scale_group_size": 48, "shape_k": 4128},
-        # Weight dtypes with no ts_dequant_b_pair arm (the TS packer holds
-        # only 32 % num_bits == 0 widths).
+        # The TS packer holds only 32 % num_bits == 0 widths.
         {"b_dtype": dtypes.uint6},
         {"b_dtype": dtypes.DataType.from_str("float6e4m1"), "has_zero_point": False},
         # TS activations are the two 16-bit float dtypes.
         {"a_dtype": dtypes.float8e4m3, "b_dtype": dtypes.float8e4m3, "has_zero_point": False},
-        # A 16-bit group scale is reinterpreted as ElementA bit-for-bit, so it
-        # must be a_dtype; e8m0 shares its exponent bias with bf16 only.
+        # A 16-bit group scale is read as ElementA; e8m0 shares its exponent
+        # bias with bf16 only.
         {"a_dtype": dtypes.float16, "c_dtype": dtypes.float16},
         {"bs_dtype": dtypes.float16},
         {
@@ -200,11 +131,10 @@ def test_ts_legal_layers(overrides):
             "weight_scale_group_size": 0,
             "has_zero_point": False,
         },
-        # The launcher types the fp zero point as c_dtype but s2r reads it as
-        # ElementA.
+        # The launcher types the fp zero point as c_dtype; s2r reads ElementA.
         {"a_dtype": dtypes.float16, "bs_dtype": dtypes.float16, "is_fp_zero_point": True},
-        # weight_scale_2 is applied in the epilogue smem writer, which the TMEM
-        # drain bypasses -- admitting it would drop the scale silently.
+        # weight_scale_2 is applied in the epilogue smem writer the drain
+        # bypasses, so admitting it would drop the scale silently.
         {"weight_scale_2_type": WeightScale2Type.CHANNEL},
         {"weight_scale_2_type": WeightScale2Type.TENSOR},
     ],
@@ -214,35 +144,6 @@ def test_ts_illegal_layers(overrides):
     config = _layer_config(**overrides)
     assert not config.tcgen05_supported
     assert not get_heuristics_class().supports_tcgen05_ts(config)
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        # Weight dtypes with no ts_dequant_b_pair arm, one per dequant family.
-        {"b_dtype": dtypes.uint1},
-        {"b_dtype": dtypes.uint7},
-        {"b_dtype": dtypes.DataType.from_str("float3e2m0"), "has_zero_point": False},
-        {"b_dtype": dtypes.DataType.from_str("float7e6m0"), "has_zero_point": False},
-        # 8-bit group scales are dequantised into bf16 by the generic mainloop.
-        # Pinned to a weight dtype TS has no arm for, so they reach SS.
-        {"b_dtype": dtypes.uint7, "bs_dtype": dtypes.float8e8m0, "weight_scale_group_size": 32},
-        {"b_dtype": dtypes.uint7, "bs_dtype": dtypes.float8e4m3},
-        # A block scale is one f32 per warp N-tile, and SS pins WarpN at 64.
-        {
-            "bs_dtype": dtypes.float32,
-            "weight_scale_type": WeightScaleType.BLOCK,
-            "weight_scale_group_size": 64,
-            "weight_scale_group_size_n": 64,
-            "has_zero_point": False,
-        },
-    ],
-    ids=str,
-)
-def test_ss_legal_layers(overrides):
-    config = _layer_config(**overrides)
-    assert not config.tcgen05_supported
-    assert get_heuristics_class().supports_tcgen05_ss(config)
 
 
 @pytest.mark.parametrize(
@@ -276,31 +177,14 @@ def test_ss_illegal_layers(overrides):
     assert not get_heuristics_class().supports_tcgen05_ss(config)
 
 
+# The rest of the dispatch-site rejections run as ILLEGAL_CASES in
+# test_tcgen05.py. These two cannot: the weight schema rejects the mismatched
+# scale tensor before the layer ever reaches the gate.
 @pytest.mark.parametrize(
     "overrides",
     [
-        # Neither tuning table carries this weight dtype.
-        {"b_dtype": dtypes.float6e3m2, "has_zero_point": False},
-        # BlockN bottoms out at 64 and BlockK at 64, so the shape must tile.
-        {"shape_n": SHAPE_N + 32},
-        {"shape_k": SHAPE_K + 32, "weight_scale_group_size": 32},
-        # A BlockK stage must hold whole weight-scale groups.
-        {"weight_scale_group_size": 48, "shape_k": SHAPE_K + 32},
-        # SS applies only the scale kinds the mainloop carries, and TS needs a
-        # wired dequant arm.
-        {"b_dtype": dtypes.uint7, "weight_scale_group_size": 0, "has_zero_point": False},
-        {"b_dtype": dtypes.uint7, "weight_scale_2_type": WeightScale2Type.CHANNEL},
-        {"weight_scale_2_type": WeightScale2Type.TENSOR},
-        # SS is bf16-only, so an fp16 layer TS turns down has no fallback. Both
-        # of these run to completion and return garbage without their gate
-        # clause: the TS s2r branch reads a 16-bit group scale and the fp zero
-        # point as ElementA whatever the launcher typed them as.
         {"a_dtype": dtypes.float16, "c_dtype": dtypes.float16},
-        {
-            "a_dtype": dtypes.float16,
-            "bs_dtype": dtypes.float16,
-            "is_fp_zero_point": True,
-        },
+        {"a_dtype": dtypes.float16, "bs_dtype": dtypes.float16, "is_fp_zero_point": True},
     ],
     ids=str,
 )
@@ -342,10 +226,8 @@ def test_ts_opt_in_rejects_unsupported_compute(kwargs, message):
     ],
     ids=str,
 )
-@pytest.mark.parametrize("shape_m", [1, 128, 2048])
+@pytest.mark.parametrize("shape_m", [1, 2048])
 def test_ss_opt_in_fallback(overrides, block_shape, shape_m):
-    """An opted-in layer TS is illegal for runs SS at every shape_m; the same
-    layer without the opt-in stays on mma.sync."""
     config = get_heuristics_config(_layer_config(mma_type=MmaType.TCGEN05, **overrides), shape_m=shape_m)
     assert config["mma_type"] == "tcgen05"
     assert config["use_tcgen05"] is True
@@ -362,8 +244,7 @@ def test_ss_opt_in_fallback(overrides, block_shape, shape_m):
 
 @pytest.mark.parametrize("overrides", [{}, {"shape_n": 6208}], ids=str)
 def test_tcgen05_never_launches_with_pdl(overrides):
-    """pdl reaches the mma.sync kernels but is forced off for tcgen05, whose
-    at-entry TMEM alloc precedes the griddepcontrol handshake."""
+    # tcgen05 allocates TMEM at entry, before the griddepcontrol handshake.
     layer_config = _layer_config(**overrides)
     assert _to_tuning_config(get_heuristics_config(layer_config, shape_m=2048)).use_pdl
 

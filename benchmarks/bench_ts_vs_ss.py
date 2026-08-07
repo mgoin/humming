@@ -1,10 +1,7 @@
 """tcgen05 TS mode vs SS mode vs mma.sync on sm100, W4A16.
 
-The three paths run the same layer, so the columns differ only in the mainloop:
-mma.sync dequantises into registers, SS mode stages the dequantised weights in
-SMEM for tcgen05.mma, and TS mode stages them in TMEM. The mma.sync column is
-what the sm100 heuristic emits without the mma_type="tcgen05" opt-in, so it is
-also the upstream baseline.
+The sweep behind TS being the mainloop the tcgen05 opt-in selects in
+humming/tune/sm100.py.
 """
 
 import torch
@@ -76,8 +73,7 @@ def main() -> None:
     for label, shape_n, shape_k in SHAPES:
         layer = build_layer(shape_n, shape_k)
         ts_layer = build_layer(shape_n, shape_k, mma_type="tcgen05")
-        # SS reads the ordinary weight layout, so it runs on the non-opted-in
-        # layer; its geometry does not depend on shape_m.
+        # SS reads the ordinary weight layout and does not depend on shape_m.
         ss_config = Sm100Heuristics._ss_config(layer.humming_config, GemmType.DENSE)
         for shape_m in SHAPE_MS:
             inputs = torch.randn((shape_m, shape_k), dtype=torch.bfloat16, device="cuda:0")

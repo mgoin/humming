@@ -1,11 +1,6 @@
-"""Standalone unit test for the vectorized transposed TMEM drain.
-
-Fills the TMEM D region with a known [n=128, m=BlockM] f32 pattern via
-tcgen05.st -- the transposed orientation the TS-mode MMA produces -- drains it
-with either the scalar reference or the vectorized 8x8 transpose, and compares
-against a Python model of gmem_writer's sectioned XOR-swizzled smem.reduce
-layout. Guards the register-transpose bookkeeping and the swizzled addressing
-independently of the mainloop.
+"""Drains a known TMEM pattern in the transposed orientation the TS-mode MMA
+produces and compares it against a Python model of gmem_writer's sectioned
+XOR-swizzled smem.reduce layout, independently of the mainloop.
 """
 
 import ctypes
@@ -26,7 +21,7 @@ CODE = r"""
 #include <humming/utils/ptx/tcgen05.cuh>
 #include <humming/epilogue/tmem_ts_drain.cuh>
 
-template <uint32_t kBlockM, uint32_t kSmemBase, bool kVectorized, bool kApplyRowScale>
+template <uint32_t kBlockM, uint32_t kSmemBase, bool kApplyRowScale>
 __global__ void tmem_drain_test(const float *src, int4 *out, float bias_val, float scale_val) {
   __shared__ alignas(16) uint32_t tmem_slot;
   constexpr uint32_t kReduceInt4 = 2u * kBlockM * 8u;  // two 64-row sections
@@ -57,33 +52,8 @@ __global__ void tmem_drain_test(const float *src, int4 *out, float bias_val, flo
   __syncthreads();
   tcgen05_fence_after_thread_sync();
 
-  if constexpr (kVectorized) {
-    tmem_ts_drain_transposed<kBlockM, BFloat16, kApplyRowScale>(
-        tmem_base, n, reduce, kSmemBase, bias_val, scale_val);
-  } else {
-    // Scalar reference: the 2-byte scatter the vectorized drain replaced.
-    uint16_t *red16 = reinterpret_cast<uint16_t *>(reduce);
-    uint32_t section_row_base = (n / 64u) * kBlockM;
-    uint32_t section_col = (n / 8u) % 8u;
-    PRAGMA_UNROLL
-    for (uint32_t chunk = 0; chunk < kBlockM / 32u; chunk++) {
-      uint32_t tmp[32];
-      tcgen05_ld_32x32b_x32(tmem_base + chunk * 32u, tmp);
-      tcgen05_wait_ld();
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < 32u; i++) {
-        uint32_t m = chunk * 32u + i;
-        float f = *reinterpret_cast<float *>(&tmp[i]);
-        if constexpr (kApplyRowScale) {
-          f *= scale_val;
-        }
-        uint32_t smem_row = section_row_base + m;
-        uint32_t col = section_col ^ ((smem_row + kSmemBase) % 8u);
-        __nv_bfloat16 fb = __float2bfloat16(f + bias_val);
-        red16[(smem_row * 8u + col) * 8u + (n % 8u)] = *reinterpret_cast<uint16_t *>(&fb);
-      }
-    }
-  }
+  tmem_ts_drain_transposed<kBlockM, BFloat16, kApplyRowScale>(
+      tmem_base, n, reduce, kSmemBase, bias_val, scale_val);
   __syncthreads();
 
   for (uint32_t i = threadIdx.x; i < kReduceInt4; i += blockDim.x) {
@@ -103,14 +73,12 @@ class TmemDrainTest(KernelRuntime):
     name: ClassVar[str] = "tmem_drain_test"
     block_m: int
     smem_base: int
-    vectorized: bool
     apply_row_scale: bool = False
 
     def init_kernel(self):
         self.code = CODE
         self.kernel_expr = (
             f"tmem_drain_test<{self.block_m}u, {self.smem_base}u, "
-            f"{'true' if self.vectorized else 'false'}, "
             f"{'true' if self.apply_row_scale else 'false'}>"
         )
         self.arg_types = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_float)
@@ -143,7 +111,7 @@ def _expected_reduce(src, block_m, smem_base, bias_val, scale_val):
     return expected.to(torch.uint16)
 
 
-def _run_drain(block_m, smem_base, vectorized, apply_row_scale, bias_val, scale_val):
+def _run_drain(block_m, smem_base, apply_row_scale, bias_val, scale_val):
     skip_if_unsupported(mma_type="tcgen05")
     torch.manual_seed(7)
     src = torch.randn(128, block_m, dtype=torch.float32, device="cuda")
@@ -151,7 +119,6 @@ def _run_drain(block_m, smem_base, vectorized, apply_row_scale, bias_val, scale_
     kernel = TmemDrainTest(
         block_m=block_m,
         smem_base=smem_base,
-        vectorized=vectorized,
         apply_row_scale=apply_row_scale,
     )
     kernel(src, out, bias_val, scale_val)
@@ -167,18 +134,15 @@ def _run_drain(block_m, smem_base, vectorized, apply_row_scale, bias_val, scale_
         )
 
 
-@pytest.mark.parametrize("vectorized", [False, True])
 @pytest.mark.parametrize("smem_base", [0, 3])
 @pytest.mark.parametrize("block_m", [64, 128])
-def test_tmem_ts_drain(block_m, smem_base, vectorized):
-    _run_drain(block_m, smem_base, vectorized, False, 0.0, 1.0)
+def test_tmem_ts_drain(block_m, smem_base):
+    _run_drain(block_m, smem_base, False, 0.0, 1.0)
 
 
-@pytest.mark.parametrize("vectorized", [False, True])
-def test_tmem_ts_drain_bias(vectorized):
-    _run_drain(128, 3, vectorized, False, -0.5, 1.0)
+def test_tmem_ts_drain_bias():
+    _run_drain(128, 3, False, -0.5, 1.0)
 
 
-@pytest.mark.parametrize("vectorized", [False, True])
-def test_tmem_ts_drain_row_scale(vectorized):
-    _run_drain(128, 3, vectorized, True, 0.25, 0.5)
+def test_tmem_ts_drain_row_scale():
+    _run_drain(128, 3, True, 0.25, 0.5)

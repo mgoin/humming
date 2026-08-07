@@ -1,10 +1,7 @@
 """tcgen05 SS mode vs mma.sync across the weight-dtype matrix, bf16 activations.
 
-For each weight dtype this walks the (block_k, num_stages) ladder the SS mainloop
-accepts, checks the result against the mma.sync path on the same layer, and
-reports the fastest correct entry -- the sweep behind _SS_B_DTYPE_CONFIG in
-humming/tune/sm100.py. Dtypes that no ladder entry fits, or that the SS mainloop
-rejects, print "--" and stay out of that table.
+Reports the fastest correct (block_k, num_stages) per weight dtype -- the sweep
+behind _SS_B_DTYPE_CONFIG in humming/tune/sm100.py.
 """
 
 import torch
@@ -18,8 +15,7 @@ from humming.tune.sm100 import Sm100Heuristics
 
 GROUP_SIZE = 128
 
-# (weight dtype, has_zero_point) -- unsigned codes carry an integer zero point,
-# signed and float codes are symmetric.
+# Unsigned codes carry an integer zero point; signed and float are symmetric.
 B_DTYPES = [
     ("uint2", True),
     ("uint3", True),
@@ -44,8 +40,8 @@ SHAPES = [
 ]
 SHAPE_MS = [256, 2048]
 
-# Widest first; wide weight dtypes need fewer stages or block_k=64 because the
-# bf16 b_dequant staging buffer pushes them over the SMEM cap.
+# Widest first: the bf16 b_dequant staging buffer pushes wide weight dtypes over
+# the SMEM cap at the deeper entries.
 SS_LADDER = [(128, 4), (128, 3), (64, 4), (64, 3)]
 
 

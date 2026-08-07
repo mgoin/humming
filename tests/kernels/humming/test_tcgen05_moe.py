@@ -64,9 +64,8 @@ def _case(
     )
 
 
-# Grouping lives above the MMA (scheduler, g2s loaders, epilogue), so the TS
-# mainloop and drain are shared with the dense path; these cases pin that the
-# grouped scatter and the TS weight layout agree.
+# Grouping lives above the MMA, so these pin that the grouped scatter and the
+# shared TS mainloop agree.
 MOE_CASES = (
     _case("grouped-contiguous", GemmType.GROUPED_CONTIGUOUS),
     _case("grouped-contiguous-zp", GemmType.GROUPED_CONTIGUOUS, has_zero_point=True),
@@ -120,7 +119,6 @@ def test_tcgen05_moe(test_case):
     [(8, 2048, 128), (8, 512, 64), (128, 2048, 64), (256, 512, 64)],
 )
 def test_tcgen05_moe_block_m(gemm_type, num_experts, shape_m, block_m):
-    """Tokens per expert, not the padded token total, drives the grouped tile."""
     config = _case("dispatch", gemm_type, num_experts=num_experts).layer_config
     skip_if_unsupported(mma_type=config.mma_type.value)
     heuristic_config = get_heuristics_config(config, shape_m=shape_m, gemm_type=gemm_type)
