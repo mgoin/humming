@@ -10,6 +10,10 @@ from humming.config import (
 
 _INT4 = 16
 
+# Mirror SharedStorage (utils/storage.cuh); bumping one side alone undercounts.
+_NUM_B_DEQUANT_BUFFERS = 2  # kNumBDequantBuffers
+_NUM_TCGEN05_TS_GROUPS = 2  # kTcgen05TsGroups, one mbarrier each
+
 
 def _align_up(size: int, alignment: int = 128) -> int:
     if size <= 0:
@@ -101,8 +105,10 @@ def estimate_smem_size_layer(
     bias_bytes = (block_n * 2) if layer_config.has_bias else 0
     channel_as_bytes = (block_m * 4) if (a_bits != 16 and layer_config.input_scale_group_size == 0) else 0
 
-    # SS-mode tcgen05 dequantises B into two buffers inside the stage union.
-    b_dequant_bytes = 2 * block_n * block_k * a_bits // 8 if (use_tcgen05 and not use_tcgen05_ts) else 0
+    # SS-mode tcgen05 dequantises B into the stage union.
+    b_dequant_stage_bytes = block_n * block_k * a_bits // 8
+    is_tcgen05_ss = use_tcgen05 and not use_tcgen05_ts
+    b_dequant_bytes = _NUM_B_DEQUANT_BUFFERS * b_dequant_stage_bytes if is_tcgen05_ss else 0
 
     struct_a = _struct_size(
         [
@@ -167,7 +173,7 @@ def estimate_smem_size_layer(
         add(4, 16)  # tcgen05_tmem_col
         add(8, 8)  # tcgen05_mbar
         if use_tcgen05_ts:
-            add(2 * 8, 8)  # tcgen05_ts_mbar
+            add(_NUM_TCGEN05_TS_GROUPS * 8, 8)  # tcgen05_ts_mbar
 
     return _align_up(offset, 1024)
 

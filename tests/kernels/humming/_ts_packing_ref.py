@@ -1,0 +1,221 @@
+"""Torch reference packer for the tcgen05 TS-mode weight layout.
+
+The executable specification for the layouts derived in
+``docs/tcgen05_ts_packing.md``: the CUDA repack
+(``ops.repack_weight(..., use_tcgen05_ts=True)``) is checked against
+``pack_weight_tcgen05_ts``, and ``simulate_ts_thread_regs`` emulates the
+loader gather plus the dequant slot extraction that consume it. Nothing
+here runs in production; ``humming/utils/ts_packing.py`` holds the
+runtime packers.
+
+All functions accept 2-D ``[N, K]``-shaped code tensors or 3-D
+``[E, N, K]`` (MoE) and operate on the last two dims.
+"""
+
+import torch
+
+
+def _check_codes(codes: torch.Tensor, weight_bits: int):
+    assert codes.dtype == torch.int32
+    assert weight_bits in (2, 4, 8), "reference packer covers 32 % bits == 0 widths {2, 4, 8}"
+    n, k = codes.shape[-2], codes.shape[-1]
+    assert n % 64 == 0, "N must be padded to a multiple of 64"
+    assert k % 16 == 0, "K must be a multiple of kPartMmaShapeK = 16"
+    assert (codes >= 0).all() and (codes < (1 << weight_bits)).all()
+    return n, k
+
+
+def pack_weight_tcgen05_ts(codes: torch.Tensor, weight_bits: int = 4) -> torch.Tensor:
+    """Pack ``[.., N, K]`` integer codes into the tcgen05-TS layout.
+
+    Returns int32 ``[.., K/16, N * 16 * weight_bits / 32]`` (identical
+    shape/tiling to the existing mma.sync packed tensor; only the
+    permutation inside each 64-row x 16-K block differs).
+
+    Word/bit position of code ``W[n, k]``:
+      c   = k // 16          (packed row)
+      j   = (k % 16) * weight_bits // 32   (word within the thread pair-slot)
+      e   = (k % 16) % (32 // weight_bits) (K-ascending element in word)
+      s   = (e % 2) * (V/2) + e // 2, V = 32 // weight_bits (bit slot)
+      B   = n // 64          (64-row block)
+      l   = n % 32           (lane)
+      h   = (n % 64) // 32   (32-row band half within the block)
+      W_r = 16 * weight_bits // 32         (words per row per 16-K chunk)
+      col = B * 64 * W_r + l * 2 * W_r + h * W_r + j
+      bits [s * weight_bits, (s+1) * weight_bits) of out[c, col]
+    """
+    n, k = _check_codes(codes, weight_bits)
+    dev = codes.device
+    vpw = 32 // weight_bits  # values per word
+    wpr = 16 * weight_bits // 32  # words per row per 16-K chunk
+    num_rows = k // 16
+    num_cols = n * wpr
+
+    # Build the inverse map: for output (col, slot) -> (n, k_in_chunk).
+    col = torch.arange(num_cols, device=dev, dtype=torch.long)
+    B = col // (64 * wpr)
+    r = col % (64 * wpr)
+    lane = r // (2 * wpr)
+    q = r % (2 * wpr)
+    h = q // wpr
+    j = q % wpr
+    src_n = B * 64 + h * 32 + lane  # [num_cols]
+
+    s = torch.arange(vpw, device=dev, dtype=torch.long)
+    e = (s % (vpw // 2)) * 2 + s // (vpw // 2)  # [vpw]
+    k_in = j.unsqueeze(1) * vpw + e.unsqueeze(0)  # [num_cols, vpw]
+
+    # gather: vals[.., c, col, s] = codes[.., src_n[col], c*16 + k_in[col, s]]
+    codes_v = codes.reshape(*codes.shape[:-2], n, num_rows, 16)
+    # -> [.., num_rows, n, 16]
+    codes_v = codes_v.movedim(-2, -3)
+    flat_idx = (src_n.unsqueeze(1) * 16 + k_in).reshape(-1)  # [num_cols*vpw]
+    gathered = codes_v.reshape(*codes_v.shape[:-2], n * 16)[..., flat_idx].reshape(
+        *codes_v.shape[:-2], num_cols, vpw
+    )
+
+    shifts = torch.arange(vpw, device=dev, dtype=torch.int32) * weight_bits
+    out = (gathered.to(torch.int64) << shifts.to(torch.int64)).sum(-1)
+    return (out & 0xFFFFFFFF).to(torch.uint32).view(torch.int32).contiguous()
+
+
+def unpack_weight_tcgen05_ts(
+    packed: torch.Tensor, shape_n: int, shape_k: int, weight_bits: int = 4
+) -> torch.Tensor:
+    """Inverse of :func:`pack_weight_tcgen05_ts` -> ``[.., N, K]`` codes."""
+    assert packed.dtype == torch.int32
+    vpw = 32 // weight_bits
+    wpr = 16 * weight_bits // 32
+    num_rows = shape_k // 16
+    num_cols = shape_n * wpr
+    assert packed.shape[-2:] == (num_rows, num_cols), (
+        f"expected [..,{num_rows},{num_cols}], got {tuple(packed.shape[-2:])}"
+    )
+    dev = packed.device
+
+    words = packed.view(torch.uint32).to(torch.int64)  # [.., c, col]
+    s = torch.arange(vpw, device=dev, dtype=torch.int64)
+    vals = (words.unsqueeze(-1) >> (s * weight_bits)) & ((1 << weight_bits) - 1)
+    # vals[.., c, col, s] -> codes[.., n, k]
+    col = torch.arange(num_cols, device=dev, dtype=torch.long)
+    B = col // (64 * wpr)
+    r = col % (64 * wpr)
+    lane = r // (2 * wpr)
+    q = r % (2 * wpr)
+    h = q // wpr
+    j = q % wpr
+    src_n = B * 64 + h * 32 + lane
+    e = (s % (vpw // 2)) * 2 + s // (vpw // 2)
+    k_in = j.unsqueeze(1) * vpw + e.unsqueeze(0)  # [num_cols, vpw]
+
+    out = torch.empty((*packed.shape[:-2], shape_n, shape_k), dtype=torch.int32, device=dev)
+    n_idx = src_n.unsqueeze(1).expand(num_cols, vpw).reshape(-1)
+    c_idx = torch.arange(num_rows, device=dev, dtype=torch.long)
+    k_idx = c_idx.view(-1, 1) * 16 + k_in.reshape(-1).view(1, -1)  # [num_rows, num_cols*vpw]
+    out_flat = out.reshape(*packed.shape[:-2], shape_n * shape_k)
+    flat_dst = n_idx.view(1, -1) * shape_k + k_idx  # [num_rows, num_cols*vpw]
+    out_flat.scatter_(
+        -1,
+        flat_dst.reshape(1, -1).expand(*packed.shape[:-2], -1) if packed.dim() > 2 else flat_dst.reshape(-1),
+        vals.reshape(*packed.shape[:-2], -1).to(torch.int32),
+    )
+    return out
+
+
+def unpack_weight_mma_sync(
+    packed: torch.Tensor, shape_n: int, shape_k: int, weight_bits: int = 4
+) -> torch.Tensor:
+    """Python inverse of the mma.sync repack (interleave_mode=3, no wgmma
+    mini-block transpose, no int2fp preprocessing -- i.e. the u4/bf16
+    W4A16 production path).
+
+    Word/bit position of code ``W[n, k]`` in the mma.sync layout:
+      c    = k // 16;  k_in = k % 16
+      B    = n // 64;  n_in = n % 64
+      w    = n_in // 16                 (word within the thread's 4)
+      tid  = 4 * (n_in % 8) + (k_in % 8) // 2
+      e'   = 4 * ((n_in % 16) // 8) + 2 * (k_in // 8) + (k_in % 2)
+      s    = (e' % 2) * 4 + e' // 2     (same lop3 pre-compensation)
+      col  = 128 * B + 4 * tid + w
+    """
+    assert weight_bits == 4, "mma.sync reference inverse implemented for u4"
+    assert packed.dtype == torch.int32
+    num_rows = shape_k // 16
+    num_cols = shape_n * 2
+    assert packed.shape[-2:] == (num_rows, num_cols)
+    dev = packed.device
+
+    n = torch.arange(shape_n, device=dev, dtype=torch.long).view(-1, 1)
+    k_in = torch.arange(16, device=dev, dtype=torch.long).view(1, -1)
+    B = n // 64
+    n_in = n % 64
+    w = n_in // 16
+    tid = 4 * (n_in % 8) + (k_in % 8) // 2
+    e = 4 * ((n_in % 16) // 8) + 2 * (k_in // 8) + (k_in % 2)
+    s = (e % 2) * 4 + e // 2
+    col = 128 * B + 4 * tid + w  # [shape_n, 16]
+
+    words = packed.view(torch.uint32).to(torch.int64)  # [.., c, col]
+    gathered = words[..., col.reshape(-1)].reshape(*packed.shape[:-2], num_rows, shape_n, 16)
+    vals = (gathered >> (s.reshape(-1).view(1, 1, -1).reshape(1, shape_n, 16) * 4)) & 0xF
+    # [.., c, n, k_in] -> [.., n, c*16 + k_in]
+    vals = vals.movedim(-3, -2).reshape(*packed.shape[:-2], shape_n, shape_k)
+    return vals.to(torch.int32)
+
+
+def unpack_zero_point_tcgen05_ts(packed: torch.Tensor, shape_n: int, weight_bits: int = 4) -> torch.Tensor:
+    """Inverse of ``humming.utils.ts_packing.pack_zero_point_tcgen05_ts``."""
+    zp_bits = 4 if weight_bits <= 4 else 8
+    vpw = 32 // zp_bits
+    words = packed.view(torch.uint32).to(torch.int64)
+    s = torch.arange(vpw, device=packed.device, dtype=torch.int64)
+    vals = (words.unsqueeze(-1) >> (s * zp_bits)) & ((1 << zp_bits) - 1)
+    vals = vals.reshape(*packed.shape[:-1], shape_n)
+    return vals.transpose(-1, -2).contiguous().to(torch.int32)
+
+
+def simulate_ts_thread_regs(
+    packed: torch.Tensor,
+    n_warp_id: int,
+    lane: int,
+    k_chunk: int,
+    block_n: int = 128,
+    n_block_id: int = 0,
+    weight_bits: int = 4,
+) -> torch.Tensor:
+    """Emulate loader_b's WarpN==32 half-group gather + the dequant
+    value-slot extraction for one thread and one 16-K chunk.
+
+    Returns the 16 integer codes the thread's dequant regs would hold,
+    in reg order: entry ``2r`` = reg r lo half (K = 2r), entry
+    ``2r + 1`` = reg r hi half (K = 2r + 1). If the pack honors the
+    contract these equal ``W[row, 16*k_chunk : 16*k_chunk + 16]`` for
+    ``row = n_block_id * block_n + 32 * n_warp_id + lane``.
+    """
+    assert packed.dim() == 2
+    vpw = 32 // weight_bits
+    wpr = 16 * weight_bits // 32
+    words_row = packed[k_chunk].view(torch.uint32).to(torch.int64)
+
+    # g2s: kSmemStride words of this K-chunk row, offset by the n-block.
+    smem_base_word = n_block_id * block_n * wpr
+    # s2r half-group gather (loader_b.cuh): LoadType covers
+    # kNumIntsPerThread = kBits/2 words; int-index of the first word:
+    #   idx  = 32 * (n_warp_id / 2) + lane        (16-B slot index)
+    #   word = idx * 2*wpr + (n_warp_id % 2) * wpr + j,  j in [0, wpr)
+    slot = 32 * (n_warp_id // 2) + lane
+    first = smem_base_word + slot * 2 * wpr + (n_warp_id % 2) * wpr
+    my_words = words_row[first : first + wpr]
+
+    out = torch.empty(16, dtype=torch.int32)
+    for j in range(wpr):
+        word = int(my_words[j])
+        for r_in in range(vpw // 2):  # regs produced from this word
+            lo_slot = r_in
+            hi_slot = r_in + vpw // 2
+            lo = (word >> (lo_slot * weight_bits)) & ((1 << weight_bits) - 1)
+            hi = (word >> (hi_slot * weight_bits)) & ((1 << weight_bits) - 1)
+            r = j * (vpw // 2) + r_in
+            out[2 * r] = lo
+            out[2 * r + 1] = hi
+    return out

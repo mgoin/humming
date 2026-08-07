@@ -375,7 +375,7 @@ def _run(test_case: KernelTestCase, *, expect_ts: bool = False) -> list:
 def test_tcgen05_ts(test_case):
     config = test_case.layer_config
     skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value)
-    assert config.tcgen05_supported
+    assert config.tcgen05_ts_supported
     _run(test_case, expect_ts=True)
 
 
@@ -387,7 +387,7 @@ def test_tcgen05_ts(test_case):
 def test_tcgen05_ts_max_magnitude(test_case, weight_window):
     config = test_case.layer_config
     skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value)
-    assert config.tcgen05_supported
+    assert config.tcgen05_ts_supported
     runner = KernelTestRunner(test_case)
     weight_max = runner.weight_ref.float().abs().max().item()
     assert weight_window[0] <= weight_max <= weight_window[1]
@@ -428,13 +428,13 @@ def test_tcgen05_ts_fp_weight_covers_every_code():
 
 @pytest.mark.parametrize("test_case", ILLEGAL_CASES, ids=str)
 def test_tcgen05_rejects_illegal_layer(test_case):
+    # Dispatch is the only gate: transform packs the default layout for these
+    # layers, so nothing reaches a kernel.
     config = test_case.layer_config
     skip_if_unsupported(mma_type=config.mma_type.value)
-    assert not config.tcgen05_supported
+    assert not config.tcgen05_ts_supported
     with pytest.raises(AssertionError, match="legal for neither"):
         get_heuristics_config(config, shape_m=512)
-    with pytest.raises(AssertionError, match="legal for neither"):
-        KernelTestRunner(test_case)
 
 
 @pytest.mark.parametrize("test_case", SS_CASES, ids=str)
@@ -442,7 +442,7 @@ def test_tcgen05_ss(test_case):
     config = test_case.layer_config
     skip_if_unsupported(a_dtype=config.a_dtype, mma_type="tcgen05")
     assert config.mma_type == MmaType.TCGEN05
-    assert not config.tcgen05_supported
+    assert not config.tcgen05_ts_supported
     heuristic_config = get_heuristics_config(config, shape_m=1024)
     assert heuristic_config["mma_type"] == "tcgen05"
     assert heuristic_config["use_tcgen05"] is True

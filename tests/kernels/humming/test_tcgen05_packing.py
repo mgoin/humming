@@ -2,19 +2,21 @@ import itertools
 
 import pytest
 import torch
-
-from humming import ops
-from humming.testing import skip_if_unsupported
-from humming.utils.ts_packing import (
-    pack_scales_tcgen05_ts,
+from _ts_packing_ref import (
     pack_weight_tcgen05_ts,
-    pack_zero_point_tcgen05_ts,
     simulate_ts_thread_regs,
-    unpack_scales_tcgen05_ts,
     unpack_weight_mma_sync,
     unpack_weight_tcgen05_ts,
     unpack_zero_point_tcgen05_ts,
 )
+
+from humming import dtypes, ops
+from humming.config import LayerConfig, MmaType
+from humming.schema import HummingWeightSchema
+from humming.testing import skip_if_unsupported
+from humming.testing.data import generate_random_tensor
+from humming.transform import transform_humming_tensors, transform_humming_weight_scale
+from humming.utils.ts_packing import pack_zero_point_tcgen05_ts
 
 SHAPES = [(64, 64), (128, 128), (128, 256), (256, 512), (512, 1024), (192, 320)]
 WEIGHT_BITS = [2, 4, 8]
@@ -24,6 +26,34 @@ def _random_codes(shape_n, shape_k, weight_bits=4, seed=0, device="cpu"):
     generator = torch.Generator(device="cpu").manual_seed(seed)
     codes = torch.randint(0, 1 << weight_bits, (shape_n, shape_k), generator=generator, dtype=torch.int32)
     return codes.to(device)
+
+
+def _quantized_w4a16_layer(mma_type: MmaType) -> tuple[LayerConfig, dict]:
+    config = LayerConfig(
+        shape_n=256,
+        shape_k=256,
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=128,
+        has_zero_point=True,
+        mma_type=mma_type,
+    )
+    schema = HummingWeightSchema(
+        b_dtype=config.b_dtype,
+        bs_dtype=config.bs_dtype,
+        weight_scale_group_size=config.weight_scale_group_size,
+        weight_scale_type=config.weight_scale_type,
+        has_zero_point=True,
+    )
+    torch.manual_seed(11)
+    weight = generate_random_tensor(
+        (config.shape_n, config.shape_k),
+        dtype=torch.bfloat16,
+        group_size=config.weight_scale_group_size,
+    )
+    return config, schema.quant_tensor(weight, schema, torch.bfloat16)
 
 
 @pytest.mark.parametrize("shape", SHAPES)
@@ -75,13 +105,13 @@ def test_register_contract_block_n64():
                 assert torch.equal(regs, expected)
 
 
-def test_scale_stream_roundtrip():
+def test_scale_stream_keeps_natural_row_order():
+    # The thread owning row n reads its scale at index n: no permutation.
     generator = torch.Generator().manual_seed(3)
     weight_scale = torch.randn(128, 8, generator=generator, dtype=torch.float32).to(torch.bfloat16)
-    packed = pack_scales_tcgen05_ts(weight_scale)
+    packed = transform_humming_weight_scale(weight_scale, use_tcgen05_ts=True)
     assert packed.shape == (8, 128)
-    assert torch.equal(packed[5, 77], weight_scale[77, 5])
-    assert torch.equal(unpack_scales_tcgen05_ts(packed), weight_scale)
+    assert torch.equal(packed.transpose(0, 1), weight_scale)
 
 
 @pytest.mark.parametrize("weight_bits", WEIGHT_BITS)
@@ -218,6 +248,25 @@ def test_ss_scatter_closed_form_matches_reference(block_n, block_k):
         args = (g, t, warp * warp_n, iteration, i, frag, pair, base_div128)
         ref, closed = _ss_scatter_ref_offset(*args), _ss_scatter_closed_offset(*args)
         assert ref == closed, f"{base_div128=} {warp=} {t=} {iteration=} {i=} {frag=} {pair=}"
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (10, 0), (12, 0)])
+def test_transform_layout_does_not_depend_on_the_packing_host(capability, monkeypatch):
+    # A checkpoint packed anywhere must load on Blackwell, so mma_type="tcgen05"
+    # has to pick the TS layout from the layer alone.
+    skip_if_unsupported()
+    config, tensors = _quantized_w4a16_layer(MmaType.TCGEN05)
+    assert config.tcgen05_ts_supported
+    expected = transform_humming_tensors(config, tensors)
+
+    mma_config, mma_tensors = _quantized_w4a16_layer(MmaType.MMA)
+    assert not torch.equal(transform_humming_tensors(mma_config, mma_tensors)["weight"], expected["weight"])
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: capability)
+    packed = transform_humming_tensors(config, tensors)
+    assert packed.keys() == expected.keys()
+    for name, tensor in expected.items():
+        assert torch.equal(packed[name].view(torch.uint8), tensor.view(torch.uint8)), name
 
 
 def test_cuda_repack_moe():

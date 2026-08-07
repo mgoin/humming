@@ -50,6 +50,10 @@ _TS_B_DTYPE_STAGES: dict[dtypes.DataType, int] = {
 }
 _TS_DEFAULT_NUM_STAGES = 5
 
+# The TS mainloop static_asserts kNumStages >= 3 (kernel/humming_ws.cuh) and the
+# SS depths are tuned from 3 up, so nothing shallower is offered.
+_MIN_NUM_STAGES = 3
+
 
 # TODO (mgoin): add proper heuristics
 class Sm100Heuristics(Sm80Heuristics):
@@ -59,7 +63,8 @@ class Sm100Heuristics(Sm80Heuristics):
 
     @classmethod
     def supports_tcgen05_ts(cls, layer_config: LayerConfig) -> bool:
-        return layer_config.tcgen05_supported
+        # Selecting this class is the device gate; the rest is layer legality.
+        return layer_config.tcgen05_ts_supported
 
     @classmethod
     def supports_tcgen05_ss(cls, layer_config: LayerConfig) -> bool:
@@ -110,7 +115,7 @@ class Sm100Heuristics(Sm80Heuristics):
             ss_config = cls._ss_config(layer_config, gemm_type)
             assert ss_config is not None, (
                 "mma_type='tcgen05' is legal for neither the TS kernel (see "
-                "LayerConfig.tcgen05_supported) nor the SS fallback"
+                "LayerConfig.tcgen05_ts_supported) nor the SS fallback"
             )
             return ss_config
 
@@ -202,9 +207,8 @@ class Sm100Heuristics(Sm80Heuristics):
         gemm_type: GemmType,
         max_num_stages: int,
     ) -> int:
-        best = 2
-        for num_stages in range(3, max_num_stages + 1):
-            smem_size = estimate_smem_size_layer(
+        def smem_size(num_stages: int) -> int:
+            return estimate_smem_size_layer(
                 layer_config,
                 config["block_shape"],
                 gemm_type,
@@ -216,6 +220,13 @@ class Sm100Heuristics(Sm80Heuristics):
                 use_tcgen05=config["use_tcgen05"],
                 use_tcgen05_ts=config.get("use_tcgen05_ts", False),
             )
-            if smem_size <= cls.max_smem_size:
+
+        best = 0
+        for num_stages in range(_MIN_NUM_STAGES, max_num_stages + 1):
+            if smem_size(num_stages) <= cls.max_smem_size:
                 best = num_stages
+        assert best, (
+            f"tcgen05 needs {smem_size(_MIN_NUM_STAGES)} B of SMEM for this layer at "
+            f"num_stages={_MIN_NUM_STAGES}, over the {cls.max_smem_size} B limit"
+        )
         return best

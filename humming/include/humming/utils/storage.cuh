@@ -94,7 +94,6 @@
 #define IF_USE_TCGEN05(x)
 #endif
 
-// TS stages weights in TMEM, so it needs the WAR mbarriers, not b_dequant.
 #if HUMMING_USE_TCGEN05 && HUMMING_USE_TCGEN05_TS
 #define IF_USE_TCGEN05_TS(x) x
 #else
@@ -188,8 +187,6 @@ public:
   static constexpr uint32_t kChannelBytesBZP = kChannelSizeBZP * sizeof(int4);
   static constexpr uint32_t kBiasBytes = kBiasSize * sizeof(int4);
 
-  // SS-mode staging for dequantised B: one BlockN x BlockK ElementA tile per
-  // ping-pong slot, indexed by iter_id % 2.
   static constexpr uint32_t kNumBDequantBuffers = 2;
   static constexpr uint32_t kStageSizeBDequant = BlockShape::N * BlockShape::K * ElementA::kBits / 32 / 4;
 
@@ -248,9 +245,8 @@ public:
   // kTcgen05TsGroups stages resident at once, one mbarrier each.
   static constexpr uint32_t kTcgen05TsGroups = 2;
   static constexpr uint32_t kTcgen05TsSlots = kTcgen05TsGroups * (WarpShape::K / kPartMmaShapeK);
-  static constexpr uint32_t kTcgen05TsMbars = kTcgen05TsGroups;
   // WAR gate against the in-flight MMA batch still reading the slots.
-  IF_USE_TCGEN05_TS(alignas(8) uint64_t tcgen05_ts_mbar[kTcgen05TsMbars];)
+  IF_USE_TCGEN05_TS(alignas(8) uint64_t tcgen05_ts_mbar[kTcgen05TsGroups];)
 
 #if HUMMING_USE_TCGEN05
   // TMEM columns to allocate (power of two). SS: BlockN accumulator columns.

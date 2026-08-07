@@ -47,7 +47,7 @@ CUDA_INLINE uint32_t ts_dequant_b_pair(uint32_t shifted, uint32_t bias2) {
     return *reinterpret_cast<uint32_t *>(&t);
   } else {
     static_assert(EB::kBits == 0,
-                  "TCGEN05_TS transform_b: weight dtype not wired -- add a "
+                  "TCGEN05TS transform_b: weight dtype not wired -- add a "
                   "ts_dequant_b_pair branch and extend the allowlist");
     return 0u;
   }
@@ -55,7 +55,7 @@ CUDA_INLINE uint32_t ts_dequant_b_pair(uint32_t shifted, uint32_t bias2) {
 
 
 template <class Ctx, class ArithClass>
-struct TCGEN05_TS {
+struct TCGEN05TS {
 public:
   using MmaOpClass = typename Ctx::MmaOpClass;
   using MmaShape = typename Ctx::MmaShape;
@@ -77,14 +77,12 @@ public:
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
 
-  // Weight-dtype geometry, all compile-time.
+  // Weight-dtype geometry, all compile-time. A thread holds one row of a 16-K
+  // chunk, so kWordsPerKChunk * kRegsPerWord == 8 ElementA pairs for any width.
   static constexpr uint32_t kBBits = ElementB::kBits;
-  // Words per row per 16-K chunk (u2:1, u4:2, u8:4).
-  static constexpr uint32_t kWpr = 16u * kBBits / 32u;
-  // Codes per packed word (u2:16, u4:8, u8:4).
-  static constexpr uint32_t kVpw = 32u / kBBits;
-  // ElementA pairs produced per word (= kVpw / 2). kWpr * kRegsPerWord == 8.
-  static constexpr uint32_t kRegsPerWord = kVpw / 2u;
+  static constexpr uint32_t kWordsPerKChunk = 16u * kBBits / 32u;
+  static constexpr uint32_t kCodesPerWord = 32u / kBBits;
+  static constexpr uint32_t kRegsPerWord = kCodesPerWord / 2u;
 
   // One 128-row weight tile, 4 warps x 32 lanes.
   static constexpr uint32_t kMmaM = 128;
@@ -104,43 +102,43 @@ public:
   static_assert(kNumTsSlots == SharedStorage::kTcgen05TsSlots &&
                     kDColOffset + BlockShape::M <=
                         SharedStorage::kTcgen05TmemCols,
-                "TCGEN05_TS: staging depth must fit the TMEM reservation");
+                "TCGEN05TS: staging depth must fit the TMEM reservation");
   // The mainloop stages one iter ahead -- index i calls transform_b(i + 1) --
   // so kTsWaitIter = kWarpIters - 2 is reached at mainloop index kWarpIters - 3,
   // which must exist and precede the consumer.arrive at index kWarpIters - 2.
   static_assert(kNumTsGroups == 1 || kTsSlotsPerStage >= 3,
-                "TCGEN05_TS: multi-group staging needs the WAR wait one warp "
+                "TCGEN05TS: multi-group staging needs the WAR wait one warp "
                 "iter ahead of the mainloop's consumer.arrive");
   static_assert(MmaOpClass::kCtaGroup == 1,
-                "TCGEN05_TS: only cta_group::1 is wired up");
+                "TCGEN05TS: only cta_group::1 is wired up");
   static_assert(BlockShape::N == 128,
-                "TCGEN05_TS: BlockN must be 128 (exactly one 128-row "
+                "TCGEN05TS: BlockN must be 128 (exactly one 128-row "
                 "MMA-M tile; multi-tile BlockN=256 is not wired up)");
   static_assert(WarpShape::N == 32,
-                "TCGEN05_TS: WarpN must be 32 (contract: warp w owns "
+                "TCGEN05TS: WarpN must be 32 (contract: warp w owns "
                 "rows (w%4)*32 + lane; a warp can only tcgen05.st its "
                 "own TMEM sub-partition)");
   static_assert(WarpShape::M == BlockShape::M,
-                "TCGEN05_TS: M_WARPS must be 1 (TMEM D is CTA-level; "
+                "TCGEN05TS: M_WARPS must be 1 (TMEM D is CTA-level; "
                 "multiple M-warps would need sequential m-passes)");
   static_assert(WarpShape::K == BlockShape::K,
-                "TCGEN05_TS: K_WARPS must be 1 (K accumulates in TMEM D)");
+                "TCGEN05TS: K_WARPS must be 1 (K accumulates in TMEM D)");
   static_assert(BlockShape::K == 64,
-                "TCGEN05_TS: BlockK must be 64 ElementA (single 64-K "
+                "TCGEN05TS: BlockK must be 64 ElementA (single 64-K "
                 "section; BlockK > 64 needs section-major staging)");
   static_assert(BlockShape::M == 32 || BlockShape::M == 64 ||
                     BlockShape::M == 128,
-                "TCGEN05_TS: BlockM (= MMA-N) must be 32, 64 or 128 "
+                "TCGEN05TS: BlockM (= MMA-N) must be 32, 64 or 128 "
                 "(M=128 atom requires N % 16 == 0, N <= 256; the drain "
                 "loops kBlockM/32 so BlockM must be a multiple of 32)");
   static_assert(std::is_same<ElementA, BFloat16>::value ||
                     std::is_same<ElementA, Float16>::value,
-                "TCGEN05_TS: ElementA must be BFloat16 or Float16 (both issue "
+                "TCGEN05TS: ElementA must be BFloat16 or Float16 (both issue "
                 "kind::f16; the dequant base is chosen per ElementA -- bf16 "
                 "0x4300 vs fp16 0x6400)");
   // TS weight-dtype allowlist. Extending it requires, in lockstep: a
-  // ts_dequant_b_pair branch, a ts_packing.py guard, and a
-  // supports_tcgen05_ts clause.
+  // ts_dequant_b_pair branch, a TCGEN05_TS_B_DTYPES entry (config/config.py),
+  // and a reference-packer width (tests/kernels/humming/_ts_packing_ref.py).
   static constexpr bool kTsBDtypeSupported =
       std::is_same<ElementB, UInt4>::value ||
       std::is_same<ElementB, UInt2>::value ||
@@ -151,27 +149,27 @@ public:
       std::is_same<ElementB, Float8E5M2>::value ||
       std::is_same<ElementB, Float8E1M6>::value;
   static_assert(kTsBDtypeSupported,
-                "TCGEN05_TS: ElementB not in the TS weight-dtype allowlist "
+                "TCGEN05TS: ElementB not in the TS weight-dtype allowlist "
                 "(currently {uint2, uint4, uint8, float4e2m1, float4e3m0, "
                 "float8e1m6, float8e4m3, float8e5m2})");
   static_assert(!kIsFpZeroPoint ||
                     (ElementB::kIsIntegerType && !ElementB::kIsSigned),
-                "TCGEN05_TS fp zero-point: unsigned-integer weight dtypes only "
+                "TCGEN05TS fp zero-point: unsigned-integer weight dtypes only "
                 "(mirrors MainloopArithmetic); both dequant arms return the "
                 "raw code at full magnitude, so transform_b's post-dequant "
                 "subtract is exact for either");
   static_assert(Ctx::kIsGroupWeightScale || Ctx::kIsChannelWeightScale,
-                "TCGEN05_TS: group or channelwise weight scale (block/mx "
+                "TCGEN05TS: group or channelwise weight scale (block/mx "
                 "unsupported)");
   static_assert(!Ctx::kIsGroupWeightScale ||
                     Ctx::kWeightScaleGroupSize >= BlockShape::K ||
                     (BlockShape::K % Ctx::kWeightScaleGroupSize == 0 &&
                      Ctx::kWeightScaleGroupSize % kPartMmaShapeK == 0),
-                "TCGEN05_TS group scale: gs >= BlockK (one group per stage), "
+                "TCGEN05TS group scale: gs >= BlockK (one group per stage), "
                 "OR gs divides BlockK and is a multiple of the 16-K iter so "
                 "each iter stays within a single group (no intra-iter split)");
   static_assert(!Ctx::kReduceOverlapLastStageOnly,
-                "TCGEN05_TS: reduce_overlap_last_stage_only unsupported");
+                "TCGEN05TS: reduce_overlap_last_stage_only unsupported");
 
   Ctx &ctx;
   SharedStorage &smem;
@@ -179,20 +177,19 @@ public:
 
   // Interface parity: never written.
   alignas(16) int4 regs_a[1];
-  // Per-thread quantised codes: one row x 16 K, packed into kWpr uint32
-  // (u2:1, u4:2, u8:4), double-buffered. Written by the TS branch of
+  // Per-thread quantised codes, double-buffered. Written by the TS branch of
   // s2r_pipeline. alignas(16): loader_b vectorizes the u8 gather as int4.
-  alignas(16) uint32_t regs_qb[2][kWpr];
+  alignas(16) uint32_t regs_qb[2][kWordsPerKChunk];
   // Per-lane ElementA broadcast scale (s, s) and dequant bias
   // (base + zp, base + zp), also filled by the s2r TS branch.
-  uint32_t regs_bs2_ts[2];
-  uint32_t regs_bias2_ts[2];
+  uint32_t regs_bs2[2];
+  uint32_t regs_bias2[2];
   // Per-lane ElementA fp zero-point (kIsFpZeroPoint only), subtracted post-dequant
   // and pre-scale. Never written on the integer-zp path.
-  uint32_t regs_zpfp2_ts[2];
+  uint32_t regs_zpfp2[2];
 
   CUDA_INLINE
-  TCGEN05_TS(Ctx &ctx_, ArithClass &arith_)
+  TCGEN05TS(Ctx &ctx_, ArithClass &arith_)
       : ctx(ctx_), smem(ctx_.smem), arith(arith_) {}
 
   CUDA_INLINE
@@ -208,16 +205,17 @@ public:
   void transform_b(uint32_t buffer_id, uint32_t iter_id) {
     using Scalar2 = typename F16Conversion<ElementA>::scalar_t2;
     uint32_t out[8];
-    uint32_t bias2 = regs_bias2_ts[buffer_id];
+    uint32_t bias2 = regs_bias2[buffer_id];
     const Scalar2 scale =
-        *reinterpret_cast<const Scalar2 *>(&regs_bs2_ts[buffer_id]);
+        *reinterpret_cast<const Scalar2 *>(&regs_bs2[buffer_id]);
     PRAGMA_UNROLL
-    for (uint32_t w = 0; w < kWpr; w++) {
+    for (uint32_t w = 0; w < kWordsPerKChunk; w++) {
       uint32_t q = regs_qb[buffer_id][w];
       PRAGMA_UNROLL
       for (uint32_t r = 0; r < kRegsPerWord; r++) {
-        // Extract the (r, r + kVpw/2) codes into the lo/hi halves; the pack
-        // pre-compensates the slot order to yield reg = (K = 2*idx, K = 2*idx + 1).
+        // Extract the (r, r + kRegsPerWord) codes into the lo/hi halves; the
+        // pack pre-compensates the slot order to yield reg = (K = 2*idx,
+        // K = 2*idx + 1).
         uint32_t v =
             ts_dequant_b_pair<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint>(
                 q >> (r * kBBits), bias2);
@@ -226,7 +224,7 @@ public:
         // before the scale, matching the SS order (code - zp_fp) * scale.
         if constexpr (kIsFpZeroPoint) {
           const Scalar2 zpfp =
-              *reinterpret_cast<const Scalar2 *>(&regs_zpfp2_ts[buffer_id]);
+              *reinterpret_cast<const Scalar2 *>(&regs_zpfp2[buffer_id]);
           t = __hsub2(t, zpfp);
         }
         // Channelwise scale is K-invariant and commutes with the K-sum, so it is

@@ -24,7 +24,7 @@ template <class Ctx, class ArithClass>
 struct MmaSelector<MmaType::TCGEN05, Ctx, ArithClass> {
   // SS = B staged in SMEM; TS = B staged in TMEM (opt-in via use_tcgen05_ts).
   using Type = std::conditional_t<Ctx::TuningConfig::kUseTcgen05Ts,
-                                  TCGEN05_TS<Ctx, ArithClass>,
+                                  TCGEN05TS<Ctx, ArithClass>,
                                   TCGEN05<Ctx, ArithClass>>;
 };
 

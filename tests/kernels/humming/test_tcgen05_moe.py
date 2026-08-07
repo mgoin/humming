@@ -96,7 +96,7 @@ MOE_CASES = (
 def test_tcgen05_moe(test_case):
     config = test_case.layer_config
     skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value)
-    assert config.tcgen05_supported
+    assert config.tcgen05_ts_supported
     results = KernelTestRunner(test_case).run()
     for result in results:
         assert result.tuning_values["use_tcgen05_ts"] is True

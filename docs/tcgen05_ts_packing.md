@@ -9,9 +9,10 @@ Reference implementations:
 
 | artifact | where |
 | --- | --- |
-| Python/torch packer + inverse (weights, scales, zp) | `humming/utils/ts_packing.py` |
+| runtime packers | `humming/utils/ts_packing.py` (zero-points), `transform_humming_weight_scale` in `humming/transform.py` (scales) |
+| torch reference packer + inverses | `tests/kernels/humming/_ts_packing_ref.py` |
 | CUDA repack variant | `weight_repack_nk<..., kUseTcgen05Ts=true>` in `humming/include/humming/kernel/process.cuh`, exposed as `ops.repack_weight(..., use_tcgen05_ts=True)` and selected for a layer by `mma_type="tcgen05"` |
-| loader+dequant simulator | `simulate_ts_thread_regs` in `humming/utils/ts_packing.py` |
+| loader+dequant simulator | `simulate_ts_thread_regs` in `tests/kernels/humming/_ts_packing_ref.py` |
 | tests | `tests/kernels/humming/test_tcgen05_packing.py` |
 
 Scope: 16-bit activations (`kNumBitsA == 16`), power-of-2 even-bit B codes (u4
@@ -165,7 +166,7 @@ The mma.sync streams give thread `t` the values for rows `t/4 + 8·f` (the
 needs its OWN row's scale/zp. New streams (natural order — the permutation
 disappears entirely):
 
-**Scales** (`pack_scales_tcgen05_ts`):
+**Scales**:
 
 ```
 [ K/gs , N ]           — scale of (row n, group g) at packed[g, n]

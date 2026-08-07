@@ -103,7 +103,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       __mbarrier_init(&smem.tcgen05_mbar, /*expected_count=*/1);
       if constexpr (TuningConfig::kUseTcgen05Ts) {
         PRAGMA_UNROLL
-        for (uint32_t i = 0; i < SharedStorage::kTcgen05TsMbars; i++) {
+        for (uint32_t i = 0; i < SharedStorage::kTcgen05TsGroups; i++) {
           __mbarrier_init(&smem.tcgen05_ts_mbar[i], /*expected_count=*/1);
         }
       }

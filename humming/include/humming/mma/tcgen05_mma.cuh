@@ -139,9 +139,6 @@ public:
           regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
       arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
     }
-
-    // The r2s is deferred to run(), which knows the K index. Nothing to fence
-    // here: this writes registers only.
   }
 
   CUDA_INLINE

@@ -130,7 +130,7 @@ public:
       if constexpr (ElementBS::kBits == 16) {
         // The gate pins bs_dtype == a_dtype, so the word is ElementA already.
         uint32_t s = reinterpret_cast<const uint16_t *>(smem.stages[stage_id].bs)[index];
-        mma.regs_bs2_ts[buffer_id] = (s << 16) | s;
+        mma.regs_bs2[buffer_id] = (s << 16) | s;
       } else {
         // 8-bit software float scale (e8m0 / e4m3): broadcast the byte to the
         // top of both halves, then fp_to_fp + 2^kOff. e == 0 flushes to zero
@@ -141,7 +141,7 @@ public:
         uint32_t e = reinterpret_cast<const uint8_t *>(smem.stages[stage_id].bs)[index];
         uint32_t raw = fp_to_fp<ElementBS, ElementA>((e * 0x00010001u) << (16u - ElementBS::kBits));
         Scalar2 s = ts_mul_pow2<kScaleOff, ElementA>(*reinterpret_cast<Scalar2 *>(&raw));
-        mma.regs_bs2_ts[buffer_id] = *reinterpret_cast<uint32_t *>(&s);
+        mma.regs_bs2[buffer_id] = *reinterpret_cast<uint32_t *>(&s);
       }
     }
 
@@ -159,10 +159,10 @@ public:
     if constexpr (kIsFpZeroPoint) {
       // Both dequant arms return the raw code at full magnitude, so the fp zp is
       // subtracted in transform_b post-dequant; the bias carries only the base.
-      mma.regs_bias2_ts[buffer_id] = kBiasIsF16x2 ? kBiasBase : 0u;
+      mma.regs_bias2[buffer_id] = kBiasIsF16x2 ? kBiasBase : 0u;
       uint32_t z = 0u;
       if constexpr (kHasZeroPoint) z = zp_elem<uint16_t>(stage_id, bs_group * BlockShape::N + n);
-      mma.regs_zpfp2_ts[buffer_id] = (z << 16) | z;
+      mma.regs_zpfp2[buffer_id] = (z << 16) | z;
     } else {
       // No-zp uses the symmetric midpoint 2^(kBits - 1) in the f16x2 format,
       // matching the reference dequant; the normalized arm bakes its own.
@@ -176,7 +176,7 @@ public:
           zp = zp_elem<uint8_t>(stage_id, bs_group * BlockShape::N + n);
         }
       }
-      mma.regs_bias2_ts[buffer_id] = kBiasIsF16x2 ? (kBiasBase | (zp << 16) | zp) : zp;
+      mma.regs_bias2[buffer_id] = kBiasIsF16x2 ? (kBiasBase | (zp << 16) | zp) : zp;
     }
   }
 

@@ -76,11 +76,11 @@ class LayerConfig(BaseHummingConfig):
     )
 
     @property
-    def tcgen05_supported(self):
+    def tcgen05_ts_supported(self):
         # Legality of the TS-mode kernel; mirrors the static_asserts in
-        # mma/tcgen05_ts_mma.cuh.
-        if torch.cuda.get_device_capability()[0] != 10:
-            return False
+        # mma/tcgen05_ts_mma.cuh. Deliberately device-free: TS packs a distinct
+        # weight layout, so the layout a checkpoint is packed in must not depend
+        # on the packing host. Sm100Heuristics adds the device gate.
         if self.a_dtype not in TCGEN05_TS_A_DTYPES:
             return False
         if self.b_dtype not in TCGEN05_TS_B_DTYPES:
@@ -469,8 +469,9 @@ class TuningConfig(BaseHummingConfig):
         if self.use_tcgen05:
             # The pdl handshake sits after the at-entry tcgen05.alloc, so a
             # dependent CTA can contend for TMEM with the primary kernel it
-            # overlaps; unaudited, so fail closed.
-            self.use_pdl = False
+            # overlaps; unaudited, so fail closed. The tcgen05 heuristics never
+            # ask for it, so only an explicit request lands here.
+            assert not self.use_pdl, "use_pdl with tcgen05 is unaudited (TMEM is allocated at entry)"
 
         if self.use_tcgen05_ts:
             # The tile geometry the TS mainloop static_asserts.

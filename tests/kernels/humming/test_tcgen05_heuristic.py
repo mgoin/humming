@@ -142,7 +142,7 @@ def test_default_layer_never_selects_tcgen05(overrides, shape_m):
 )
 def test_ts_illegal_layers(overrides):
     config = _layer_config(**overrides)
-    assert not config.tcgen05_supported
+    assert not config.tcgen05_ts_supported
     assert not get_heuristics_class().supports_tcgen05_ts(config)
 
 
@@ -256,12 +256,12 @@ def test_tcgen05_never_launches_with_pdl(overrides):
     tcgen05 = _layer_config(mma_type=MmaType.TCGEN05, **overrides)
     assert not _to_tuning_config(get_heuristics_config(tcgen05, shape_m=2048)).use_pdl
 
-    explicit = TuningConfig(
-        block_shape=(128, 128, 64),
-        warp_shape=(128, 32, 64),
-        use_tcgen05_ts=True,
-        use_warp_spec=True,
-        num_stages=4,
-        use_pdl=True,
-    )
-    assert not explicit.use_pdl
+    with pytest.raises(AssertionError, match="unaudited"):
+        TuningConfig(
+            block_shape=(128, 128, 64),
+            warp_shape=(128, 32, 64),
+            use_tcgen05_ts=True,
+            use_warp_spec=True,
+            num_stages=4,
+            use_pdl=True,
+        )

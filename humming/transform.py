@@ -5,7 +5,7 @@ import torch
 from humming import dtypes, ops
 from humming.config import LayerConfig, MmaType, WeightScale2Type, WeightScaleType
 from humming.schema import HummingInputSchema, HummingWeightSchema
-from humming.utils.ts_packing import pack_scales_tcgen05_ts, pack_zero_point_tcgen05_ts
+from humming.utils.ts_packing import pack_zero_point_tcgen05_ts
 
 
 def prepare_layer_config(
@@ -336,7 +336,7 @@ def transform_humming_weight_scale(
         # TS-mode ownership is lane = weight row, so the scale keeps its
         # natural [K/gs, N] order with no fragment permutation.
         assert not to_apply_on_c and not is_blockwise and not is_mxmma
-        return pack_scales_tcgen05_ts(weight_scale)
+        return weight_scale.transpose(-1, -2).contiguous()
 
     if is_blockwise:
         return weight_scale.transpose(-1, -2).contiguous()
@@ -456,17 +456,11 @@ def transform_humming_tensors(
     if config.use_fused_e8m0_scale and config.a_dtype == dtypes.float8e4m3:
         interleave_mode = 2
 
-    # Packing must agree with the gate the heuristic dispatches on.
-    use_tcgen05_ts = False
-    if config.mma_type == MmaType.TCGEN05:
-        from humming.tune import get_heuristics_class
-
-        heuristics_cls = get_heuristics_class()
-        use_tcgen05_ts = heuristics_cls.supports_tcgen05_ts(config)
-        assert use_tcgen05_ts or heuristics_cls.supports_tcgen05_ss(config), (
-            "mma_type='tcgen05' is legal for neither the TS kernel (see "
-            "LayerConfig.tcgen05_supported) nor the SS fallback on this device"
-        )
+    # Packing must agree with the gate the heuristic dispatches on. Both read
+    # the same device-free property, so the packed layout is a function of the
+    # layer alone; a layer that is legal for neither tcgen05 kernel takes the
+    # default layout here and is rejected at dispatch (tune/sm100.py).
+    use_tcgen05_ts = config.mma_type == MmaType.TCGEN05 and config.tcgen05_ts_supported
 
     weight = transform_humming_weight(
         weight=weight,
