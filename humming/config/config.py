@@ -9,9 +9,8 @@ from humming.config.base import BaseHummingConfig
 from humming.config.enum import GemmType, MmaType, WeightScale2Type, WeightScaleType
 
 # Weight dtypes wired into the TS-mode dequant (ts_dequant_b_pair in
-# mma/tcgen05_ts_mma.cuh and the guards in utils/ts_packing.py). The floating
-# dtypes all share one generic arm; the list is limited to the widths the TS
-# packer holds (32 % num_bits == 0).
+# mma/tcgen05_ts_mma.cuh), limited to the widths the TS packer holds
+# (32 % num_bits == 0).
 TCGEN05_TS_B_DTYPES = (
     dtypes.uint2,
     dtypes.uint4,
@@ -23,9 +22,7 @@ TCGEN05_TS_B_DTYPES = (
     dtypes.float8e5m2,
 )
 
-# Activation dtypes the TS mainloop is instantiated for. Both issue
-# tcgen05.mma kind::f16; ElementA picks the dequant base and the exponent
-# offsets (mma/tcgen05_ts_mma.cuh).
+# Activation dtypes the TS mainloop is instantiated for.
 TCGEN05_TS_A_DTYPES = (dtypes.bfloat16, dtypes.float16)
 
 
@@ -80,11 +77,8 @@ class LayerConfig(BaseHummingConfig):
 
     @property
     def tcgen05_supported(self):
-        # Legality of the TS-mode tcgen05 kernel, mirroring the static_asserts
-        # in mma/tcgen05_ts_mma.cuh. Unlike mxmma_supported this is not wired
-        # into __post_init__: TS packs weight/scale/zero point in a layout no
-        # other kernel can read, so it stays an explicit mma_type="tcgen05"
-        # opt-in for v1.
+        # Legality of the TS-mode kernel; mirrors the static_asserts in
+        # mma/tcgen05_ts_mma.cuh.
         if torch.cuda.get_device_capability()[0] != 10:
             return False
         if self.a_dtype not in TCGEN05_TS_A_DTYPES:
@@ -94,7 +88,7 @@ class LayerConfig(BaseHummingConfig):
         if self.is_fp_zero_point and self.c_dtype != self.a_dtype:
             # The launcher types the fp zero-point tensor as c_dtype
             # (csrc/launcher/tensor.h) but the TS s2r branch reads it as
-            # ElementA, so a c_dtype/a_dtype split is silently wrong.
+            # ElementA; a c_dtype/a_dtype split is silently wrong.
             return False
         if self.is_channel_weight_scale:
             # Folded into the TMEM drain through F16Conversion<ElementBS>.
@@ -104,7 +98,7 @@ class LayerConfig(BaseHummingConfig):
             if self.bs_dtype == dtypes.float8e8m0:
                 # e8m0 and bf16 share exponent bias 127, so the s2r decode is a
                 # pure exp << 7. fp16's bias is 15, which would need a rebase
-                # plus over/underflow handling; fail closed instead.
+                # plus over/underflow handling.
                 if self.a_dtype != dtypes.bfloat16:
                     return False
             elif self.bs_dtype != self.a_dtype and self.bs_dtype != dtypes.float8e4m3:
@@ -116,7 +110,7 @@ class LayerConfig(BaseHummingConfig):
         if self.weight_scale_2_type != WeightScale2Type.NONE:
             # weight_scale_2 is applied in EpilogueArithmetic::may_apply_on_smem_write
             # and every tcgen05 drain bypasses the smem writer, so it would be
-            # silently dropped rather than applied.
+            # silently dropped.
             return False
         group_size = self.weight_scale_group_size
         if group_size and group_size < 64 and (group_size % 16 or 64 % group_size):
@@ -208,12 +202,7 @@ class LayerConfig(BaseHummingConfig):
 
         if self.has_zero_point:
             # Every dequant arm that subtracts a zero point takes an unsigned
-            # integer source: datatype/dequant_single.cuh static_asserts
-            # !kHasZeroPoint on the fp->fp and identity arms and
-            # arith/mainloop_arith.cuh does the same for the fp zero point.
-            # tcgen05 TS has no such assert -- ts_dequant_b_pair's fp arm just
-            # never reads the bias -- so an fp b_dtype must be rejected here or
-            # the zero point is silently dropped.
+            # integer source; an fp b_dtype would drop the zero point silently.
             assert self.b_dtype.is_integer_type and not self.b_dtype.is_signed, (
                 "a zero point requires an unsigned-integer b_dtype "
                 f"(datatype/dequant_single.cuh static_asserts it), got {self.b_dtype}"
@@ -374,8 +363,7 @@ class LayerConfig(BaseHummingConfig):
         elif self.mma_type == MmaType.WGMMA:
             return self.weight_scale_group_size == 0
         elif self.mma_type == MmaType.TCGEN05:
-            # TS-mode folds the per-row scale into the TMEM drain, so the
-            # weight scale is never re-applied on C.
+            # The weight scale is folded into the TMEM drain.
             return False
         elif self.mma_type == MmaType.MXMMA:
             return self.is_channel_weight_scale
@@ -446,10 +434,6 @@ class TuningConfig(BaseHummingConfig):
     use_pdl: bool = False
     raster_group_m: int = 1
 
-    # Blackwell tcgen05.mma (UMMA): TMEM-backed accumulator with SMEM-resident
-    # operands. TS mode additionally stages the dequantised weights in TMEM via
-    # tcgen05.st and consumes them as the (A<->B swapped) TMEM operand, which
-    # requires weights/scales/zero points packed by the TS contract packer.
     use_tcgen05: bool | None = None
     use_tcgen05_ts: bool | None = None
 
@@ -485,13 +469,11 @@ class TuningConfig(BaseHummingConfig):
         if self.use_tcgen05:
             # The pdl handshake sits after the at-entry tcgen05.alloc, so a
             # dependent CTA can contend for TMEM with the primary kernel it
-            # overlaps; unaudited, so fail closed rather than launch with it.
+            # overlaps; unaudited, so fail closed.
             self.use_pdl = False
 
         if self.use_tcgen05_ts:
-            # Fail closed on the tile geometry the TS mainloop static_asserts
-            # (mma/tcgen05_ts_mma.cuh) so an illegal config is rejected here
-            # instead of deep inside NVRTC.
+            # The tile geometry the TS mainloop static_asserts.
             assert self.use_tcgen05, "use_tcgen05_ts requires use_tcgen05"
             assert self.block_shape[1] == 128, "tcgen05 TS requires block_shape_n=128"
             assert self.warp_shape[1] == 32, "tcgen05 TS requires warp_shape_n=32"

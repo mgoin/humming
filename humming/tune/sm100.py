@@ -1,40 +1,10 @@
-"""sm_100 (Blackwell) tuning heuristics.
-
-Two tcgen05 mainloops sit on top of the mma.sync baseline, and neither is
-reachable without the per-layer ``mma_type="tcgen05"`` opt-in: a default
-LayerConfig resolves to exactly the mma.sync config it did before tcgen05
-existed.
-
-* TS mode stages the dequantised weights in TMEM. It is the tcgen05 default,
-  1.86-2.14x faster than SS at every M where both are legal
-  (benchmarks/bench_ts_vs_ss.py). Against the mma.sync config this heuristic
-  otherwise emits, TS wins 1.55-1.68x at M=2048 and 1.39-1.49x at M=512, is
-  mixed at M=128 (0.91-1.33x) and loses below: with use_stream_k off and
-  raster_group_m=1 the grid is N/BlockN CTAs, so at M=16 only 64 of 148 SMs
-  have work (raster_group_m > 1 costs TS a further 1-4%). TS packs weights,
-  scales and zero points in a layout no other kernel reads, so a TS layer runs TS at every
-  shape_m -- there is no per-M fallback. Its pipeline depth is per-dtype
-  (_TS_B_DTYPE_STAGES) rather than a single cap: uint8 loses 6-11% at the
-  depth every other weight dtype wants.
-* SS mode stages them in SMEM. It is the substrate TS was built on and the
-  tcgen05 fallback for layers TS is not legal for. It never beats mma.sync at
-  any shape measured -- 0.13-0.91x in benchmarks/bench_tcgen05_vs_wmma.py and
-  0.56-0.94x in benchmarks/bench_tcgen05_dtypes.py -- which is exactly why
-  selection is opt-in rather than automatic.
-"""
-
 from humming import dtypes
 from humming.config import GemmType, LayerConfig, MmaType, WeightScale2Type, WeightScaleType
 from humming.tune.sm8x import Sm80Heuristics
 from humming.utils.smem import estimate_smem_size_layer
 
-# Every weight dtype the library pairs with a bf16 activation, mapped to the
-# (block_k, num_stages) SS runs it at. SS reads the ordinary mma.sync weight
-# layout, so this is a tuning table and not a capability gate: the entries
-# benchmarks/bench_tcgen05_dtypes.py swept keep their tuned values, and the rest
-# take the deepest pipeline estimate_smem_size_layer fits at BlockK=128 -- the
-# bf16 b_dequant staging buffer binds there (uint4 at four stages needs
-# 234,496 B against the device's 232,448 B cap).
+# (block_k, max num_stages) per weight dtype; membership also gates SS.
+# Retune with benchmarks/bench_tcgen05_dtypes.py.
 _SS_B_DTYPE_CONFIG: dict[dtypes.DataType, tuple[int, int]] = {
     dtypes.DataType.from_str(name): value
     for name, value in {
@@ -63,9 +33,6 @@ _SS_B_DTYPE_CONFIG: dict[dtypes.DataType, tuple[int, int]] = {
     }.items()
 }
 
-# Weight-scale dtypes the generic mainloop dequantises into ElementA before
-# applying them on B. A 16-bit scale is reinterpreted as ElementA bit-for-bit,
-# so only bs_dtype == a_dtype is legal there.
 _SS_GROUP_BS_DTYPES = (
     dtypes.bfloat16,
     dtypes.float8e4m3,
@@ -75,24 +42,17 @@ _SS_GROUP_BS_DTYPES = (
 
 _TS_GEMM_TYPES = (GemmType.DENSE, GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
 
-# TS num_stages for the weight dtypes that want something other than the
-# default five. TS stages only the packed weights -- there is no bf16
-# b_dequant buffer -- so nothing here is SMEM-bound below nine stages. Since
-# the staging handshake was batched to once per BlockK stage the mainloop is
-# load-bound (ablating the whole dequant/r2t path off the math warps buys
-# 3.9%), so the depth is TMA runway rather than dequant latency: five is the
-# knee for every dtype except uint8, whose stage is wide enough that a fifth
-# costs 6-11%. The dequant arm and the zero-point mode no longer move it, and
-# neither does the grouped scheduler.
+# Per-dtype TS pipeline depth cap; five is the knee except for uint8, whose
+# stage is wide enough that a fifth costs throughput.
+# Retune with benchmarks/bench_ts_vs_ss.py.
 _TS_B_DTYPE_STAGES: dict[dtypes.DataType, int] = {
     dtypes.uint8: 4,
 }
 _TS_DEFAULT_NUM_STAGES = 5
 
 
+# TODO (mgoin): add proper heuristics
 class Sm100Heuristics(Sm80Heuristics):
-    # Blackwell datacenter dies expose 228 KiB of shared memory per SM to a
-    # CTA; round down for the driver's reserved bytes (same as Sm90).
     max_smem_size: int = 227 * 1024
     sm_version: int = 100
     b8_allowed_dtypes: list[dtypes.DataType] = [dtypes.int8, dtypes.float8e4m3, dtypes.float8e5m2]
@@ -103,32 +63,15 @@ class Sm100Heuristics(Sm80Heuristics):
 
     @classmethod
     def supports_tcgen05_ss(cls, layer_config: LayerConfig) -> bool:
-        """Whether the SS-mode tcgen05 kernel can run `layer_config`.
-
-        Mirrors the static_asserts in mma/tcgen05_mma.cuh: bf16 activations
-        against a narrow B dtype, read from the ordinary mma.sync weight layout.
-        Every quantisation parameter is admitted by name rather than by absence
-        of a check, because the SS drain replicates only what the mainloop
-        applies: anything the epilogue smem writer would have applied is
-        silently dropped instead of raising. Gates dispatch and packing, which
-        must agree, so transform_humming_tensors calls it too.
-        """
         if layer_config.a_dtype != dtypes.bfloat16:
-            # Deliberately narrower than the TS gate, which also admits fp16:
-            # mma/tcgen05_mma.cuh static_asserts ElementA == BFloat16 because
-            # the SS r2s scatter and its drain_accum epilogue are written
-            # against bf16 bit patterns (__nv_bfloat162 / __floats2bfloat162_rn).
-            # An fp16 layer TS cannot take is rejected, not downgraded to SS.
+            # mma/tcgen05_mma.cuh static_asserts ElementA == BFloat16: the SS
+            # r2s scatter and drain_accum are written against bf16 bit patterns.
             return False
         if layer_config.b_dtype not in _SS_B_DTYPE_CONFIG:
             return False
         if layer_config.weight_scale_2_type != WeightScale2Type.NONE:
-            # weight_scale_2 lives in EpilogueArithmetic::may_apply_on_smem_write,
-            # which drain_accum bypasses.
             return False
-        # CHANNEL and TENSOR weight scales are applied on C, and
-        # should_apply_bs_on_c is False for TCGEN05, so only the scale kinds the
-        # mainloop applies on B are legal.
+        # Only the scale kinds the mainloop applies on B are legal.
         if layer_config.weight_scale_type == WeightScaleType.GROUP:
             if layer_config.bs_dtype not in _SS_GROUP_BS_DTYPES:
                 return False
@@ -185,9 +128,6 @@ class Sm100Heuristics(Sm80Heuristics):
         else:
             # Grouped: shape_m counts padded tokens over all experts, but the
             # scheduler tiles per expert, so tokens-per-expert sets occupancy.
-            # BlockM=32 is a legal TS atom but is never selected -- the
-            # fine-grained cost is per-tile r2t/handshake overhead rather than
-            # MMA-row waste, so a smaller token tile does not recover it.
             tokens_per_expert = shape_m // max(layer_config.num_experts, 1)
             block_m = 128 if tokens_per_expert >= 128 else 64
 
@@ -203,15 +143,13 @@ class Sm100Heuristics(Sm80Heuristics):
             "use_tma": True,
             "use_cp_async": False,
             "use_mbarrier": True,
-            # A group weight scale with a zero point trips the launcher's
-            # BZP assert under TMA; BZP is small, so keep it on cp.async.
+            # A group weight scale with a zero point trips the launcher's BZP
+            # assert under TMA, and BZP is small, so keep it on cp.async.
             "use_tma_bzp": False,
-            # The TS epilogue drains TMEM straight to the TMA-C store and has
-            # no cross-CTA partial-K reduction, so stream-K would corrupt any
-            # output whose K is split across CTAs.
+            # The TS epilogue has no cross-CTA partial-K reduction, so stream-K
+            # would corrupt any output whose K is split across CTAs.
             "use_stream_k": False,
-            # tune/raster.py's grouping is tuned for the mma.sync/wgmma
-            # kernels; opt out until a tcgen05 raster sweep says otherwise.
+            # TODO: tune/raster.py's grouping is tuned for mma.sync/wgmma.
             "raster_group_m": 1,
         }
         config["num_stages"] = cls._fit_num_stages(
@@ -225,21 +163,12 @@ class Sm100Heuristics(Sm80Heuristics):
 
     @classmethod
     def _ss_config(cls, layer_config: LayerConfig, gemm_type: GemmType) -> dict | None:
-        """SS-mode config, or None when SS cannot run this layer.
-
-        Reached only under the mma_type="tcgen05" opt-in, and only where TS is
-        illegal. SS never beats the mma.sync config this heuristic otherwise
-        emits, so it carries no profitability cutoff: an opted-in layer gets
-        tcgen05 at every shape_m, or an error.
-        """
         if gemm_type != GemmType.DENSE or not cls.supports_tcgen05_ss(layer_config):
             return None
 
         block_n = 128 if layer_config.shape_n % 128 == 0 else 64
 
-        # BlockK=128 halves the K-iter count and wins 3-8% over BlockK=64
-        # wherever shape_k and the weight-scale group allow it; the per-dtype
-        # entry picks the deepest pipeline that still fits in SMEM.
+        # BlockK=128 halves the K-iter count where shape_k and the group allow it.
         block_k, num_stages = _SS_B_DTYPE_CONFIG[layer_config.b_dtype]
         group_size = layer_config.weight_scale_group_size
         if layer_config.shape_k % block_k or (group_size % block_k and block_k % group_size):

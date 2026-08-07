@@ -2,28 +2,10 @@
 
 This module is the executable specification for the packed-weight /
 scale / zero-point layouts consumed by the TS-mode (TMEM-A) tcgen05
-mainloop. See ``docs/tcgen05_ts_packing.md`` for the derivation and
-the interface contract.
-
-Register-layout contract (what the kernel sees after ``dequant()``):
-
-* An MMA-M tile covers ``min(BlockN, 128)`` weight rows (humming "N").
-* Within a 128-row tile, warp ``w`` (of the ``MmaM / 32`` warps that
-  cover the tile) owns rows ``(w % 4) * 32 + lane``.
-* Per 16-K chunk each thread holds its single row's 16 bf16 in 8
-  uint32: reg ``r`` = bf16 pair ``(K = 2r`` in lo half, ``K = 2r + 1``
-  in hi half), ascending K. TMEM cell ``(lane, col c)`` =
-  ``W[row, 2c .. 2c+1]`` -- K-major, the layout TS-mode A requires.
-* Scales / zero-points follow the same ``lane = row`` ownership.
-
-Packed-word bit layout (the lop3 ``(i, i+4)`` pre-compensation): the
-``uint_to_f16`` dequant extracts, per output reg, the value at bits
-``[b*s, b*s+kBits)`` (lo half) and ``[16+b*s, ...)`` (hi half) of the
-shifted word. Pre-compensating so reg ``r`` comes out K-ascending
-means value-slot ``s`` of a word holds K-element
-``e = (s % (V/2)) * 2 + s // (V/2)`` where ``V = 32 / kBits`` values
-per word; equivalently element ``e`` lands in slot
-``s = (e % 2) * (V/2) + e // 2``.
+mainloop; ``docs/tcgen05_ts_packing.md`` derives them and states the
+register-layout contract the pack targets. Only the two ``pack_``
+helpers transform.py calls have runtime callers; the inverses and
+``simulate_ts_thread_regs`` back the packing tests.
 
 All functions accept 2-D ``[N, K]``-shaped code tensors or 3-D
 ``[E, N, K]`` (MoE) and operate on the last two dims.
@@ -153,9 +135,9 @@ def unpack_weight_tcgen05_ts(
 def unpack_weight_mma_sync(
     packed: torch.Tensor, shape_n: int, shape_k: int, weight_bits: int = 4
 ) -> torch.Tensor:
-    """Python inverse of the EXISTING mma.sync repack (interleave_mode=3,
-    no wgmma mini-block transpose, no int2fp preprocessing -- i.e. the
-    u4/bf16 W4A16 production path).
+    """Python inverse of the mma.sync repack (interleave_mode=3, no wgmma
+    mini-block transpose, no int2fp preprocessing -- i.e. the u4/bf16
+    W4A16 production path).
 
     Word/bit position of code ``W[n, k]`` in the mma.sync layout:
       c    = k // 16;  k_in = k % 16
@@ -189,11 +171,6 @@ def unpack_weight_mma_sync(
     # [.., c, n, k_in] -> [.., n, c*16 + k_in]
     vals = vals.movedim(-3, -2).reshape(*packed.shape[:-2], shape_n, shape_k)
     return vals.to(torch.int32)
-
-
-# ---------------------------------------------------------------------------
-# Scale / zero-point streams (lane = row ownership)
-# ---------------------------------------------------------------------------
 
 
 def pack_scales_tcgen05_ts(weight_scale: torch.Tensor) -> torch.Tensor:
@@ -239,11 +216,6 @@ def unpack_zero_point_tcgen05_ts(packed: torch.Tensor, shape_n: int, weight_bits
     vals = (words.unsqueeze(-1) >> (s * zp_bits)) & ((1 << zp_bits) - 1)
     vals = vals.reshape(*packed.shape[:-1], shape_n)
     return vals.transpose(-1, -2).contiguous().to(torch.int32)
-
-
-# ---------------------------------------------------------------------------
-# Kernel-side simulation (loader_b half-group gather + lop3 dequant)
-# ---------------------------------------------------------------------------
 
 
 def simulate_ts_thread_regs(

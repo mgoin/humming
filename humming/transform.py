@@ -375,8 +375,6 @@ def transform_humming_zero_point(
     use_tcgen05_ts: bool = False,
 ) -> torch.Tensor | None:
     if zero_point.dtype.is_floating_point:
-        # An fp zero point is a param-dtype stream in the same [K/gs, N] layout
-        # as the weight scale, so it takes the same packer.
         return transform_humming_weight_scale(zero_point, False, use_tcgen05_ts=use_tcgen05_ts)
 
     if packed:
@@ -417,8 +415,7 @@ def transform_humming_zero_point(
 
 def transform_humming_bias(bias: torch.Tensor, use_tcgen05_ts: bool = False) -> torch.Tensor:
     if use_tcgen05_ts:
-        # The TS drain reads the bias per weight row, so it keeps its natural
-        # order instead of the C-fragment permutation.
+        # The TS drain reads the bias per weight row, so no C-fragment permute.
         return bias.contiguous()
     return transform_humming_weight_scale(bias.unsqueeze(-1), True).squeeze(-2)
 
@@ -459,10 +456,7 @@ def transform_humming_tensors(
     if config.use_fused_e8m0_scale and config.a_dtype == dtypes.float8e4m3:
         interleave_mode = 2
 
-    # mma_type=TCGEN05 opts the layer into the tcgen05 kernels. TS mode reads
-    # slot-paired weight/scale/zero-point layouts no other kernel can read, so
-    # pack in lockstep with the gate the heuristic dispatches on; the SS
-    # fallback reads the ordinary layout and needs no packing change.
+    # Packing must agree with the gate the heuristic dispatches on.
     use_tcgen05_ts = False
     if config.mma_type == MmaType.TCGEN05:
         from humming.tune import get_heuristics_class

@@ -101,8 +101,7 @@ def estimate_smem_size_layer(
     bias_bytes = (block_n * 2) if layer_config.has_bias else 0
     channel_as_bytes = (block_m * 4) if (a_bits != 16 and layer_config.input_scale_group_size == 0) else 0
 
-    # SS-mode tcgen05 stages the dequantised B operand in two BlockN x BlockK
-    # ElementA buffers that live inside the stage union.
+    # SS-mode tcgen05 dequantises B into two buffers inside the stage union.
     b_dequant_bytes = 2 * block_n * block_k * a_bits // 8 if (use_tcgen05 and not use_tcgen05_ts) else 0
 
     struct_a = _struct_size(

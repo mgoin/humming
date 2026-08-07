@@ -319,20 +319,14 @@ class WgmmaOpClassImpl:
 class Tcgen05OpClassImpl:
     """Blackwell ``tcgen05.mma`` (UMMA) instruction descriptor.
 
-    Differences from the warp-level impls above:
-      * The MMA is issued by a single elected thread against SMEM/TMEM
-        descriptors, so there are no A/B register-tile counts to emit.
-      * The accumulator lives in TMEM. The epilogue does its own t2r load,
-        so a CRegisters alias still describes the RMEM-side tile, but the
-        mainloop never touches C registers.
+    The MMA is issued by a single elected thread against SMEM/TMEM descriptors,
+    so there are no A/B register-tile counts to emit, and the accumulator lives
+    in TMEM: CRegisters only sizes the epilogue t2r staging tile.
 
-    Divergence from the other OpClass impls: the ``tcgen05.mma`` PTX is
-    emitted by ``include/humming/utils/ptx/tcgen05.cuh`` instead of here,
-    because the instruction descriptor depends on the operand-swapped MMA
-    shape the TS mainloop picks (weights become MMA-A). The parts that do
-    not depend on that swap -- cta group and the operand/accumulator format
-    codes -- are emitted here so the codegen surface still describes the
-    instruction.
+    The ``tcgen05.mma`` PTX itself is emitted by
+    ``include/humming/utils/ptx/tcgen05.cuh``, because the instruction
+    descriptor depends on the operand-swapped MMA shape the TS mainloop picks
+    (weights become MMA-A).
     """
 
     def __init__(self, m, n, k, a_dtype, b_dtype, cd_dtype, warp_shape=None):
@@ -386,7 +380,6 @@ class Tcgen05OpClassImpl:
             f"static constexpr uint32_t kDTypeBits = {DTYPE_BIT_WIDTH_MAP[self.cd_dtype]};",
             # Weights are always software-dequantised to the activation dtype
             # and issued as kind::f16, so tcgen05 is never a native-mixed MMA.
-            # mainloop/epilogue arith read kNativeMixed unconditionally.
             "static constexpr bool kNativeMixed = false;",
             "",
             "static constexpr uint32_t kCtaGroup = 1;",
@@ -394,8 +387,6 @@ class Tcgen05OpClassImpl:
             f"static constexpr uint32_t kInstrDescBFormat = {TCGEN05_OPERAND_FORMAT_MAP[self.b_dtype]};",
             f"static constexpr uint32_t kInstrDescCFormat = {TCGEN05_ACCUM_FORMAT_MAP[self.cd_dtype]};",
             "",
-            # Operands come from SMEM/TMEM descriptors, not per-warp register
-            # tiles; only the C footprint is needed, to size the t2r staging.
             f"using CRegisters = {self.reg_cd_type}[{self.reg_cd_count}];",
             f"using DRegisters = {self.reg_cd_type}[{self.reg_cd_count}];",
         ]

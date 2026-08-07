@@ -289,10 +289,6 @@ class HummingLayer(torch.nn.Module):
     num_experts: int | None = None
     has_bias: bool = False
     torch_dtype: torch.dtype | None = None
-    # Opt into an explicit MMA path. None keeps the per-device default;
-    # "tcgen05" requests the Blackwell tcgen05 kernels -- TS mode with its
-    # packed weight/scale/zero-point layouts where the layer is TS-legal (see
-    # LayerConfig.tcgen05_supported), SS mode otherwise.
     mma_type: MmaType | str | None = None
 
     def __post_init__(self) -> None:

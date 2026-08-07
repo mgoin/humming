@@ -24,7 +24,7 @@ HummingKernel configurations are divided into three categories:
 | `has_zero_point` | Whether to enable zero point. When enabled, the dequantization changes from `x * scale` to `(x - zp) * scale`. Humming supports two zero point types (see below). |
 | `is_fp_zero_point` | Whether to use FP-type zero point. See `has_zero_point` for details. |
 | `has_bias` | Whether to use fused bias addition. |
-| `mma_type` | Can be `mma` or `wgmma`. Since the MMA type affects weight layout, it is classified under LayerConfig. |
+| `mma_type` | Can be `mma`, `wgmma`, `mxmma` or `tcgen05`. Since the MMA type affects weight layout, it is classified under LayerConfig. `tcgen05` is an explicit opt-in to the Blackwell tcgen05 kernels: TS mode where the layer is TS-legal (see `LayerConfig.tcgen05_supported`), SS mode otherwise. |
 
 **`use_int_weight_scale` preprocessing:**
 
