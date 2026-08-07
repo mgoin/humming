@@ -49,7 +49,7 @@ values per word (u4: V=8, u8: V=4). For reg `i` the word is shifted right by
 where "value-slot s" = bits `[s·kBitsB, (s+1)·kBitsB)` of the word. This is
 the "(i, i+4) in-word interleave" for u4. It is a property of the dequant
 instruction sequence, not of any layout — so the pack must pre-compensate
-for **whatever** logical order we want the regs to come out in.
+for the logical reg order the consumer requires.
 
 Wanted TS reg order (contract): reg `r` = activation-dtype pair `(K=2r, K=2r+1)`,
 ascending K. Solving: logical K-ascending element `e` of a word must be
