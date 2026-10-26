@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from humming.config import GemmType
+from humming.utils.math import ceil_div
 
 
 def generate_random_tensor(
@@ -22,7 +23,7 @@ def generate_random_tensor(
     assert group_size > 0
 
     # A partial last group is generated whole and trimmed below.
-    num_groups = -(-shape_k // group_size)
+    num_groups = ceil_div(shape_k, group_size)
     grouped_shape = (*shape[:-1], num_groups, group_size)
     stat_shape = (*shape[:-1], num_groups, 1)
 

@@ -9,6 +9,7 @@ from humming.testing.process_input import (
     process_input_ref,
     skip_if_process_input_unsupported,
 )
+from humming.utils.math import ceil_div
 
 
 @pytest.mark.parametrize("use_pdl", [False, True])
@@ -56,7 +57,7 @@ def test_quantization_scales(
     skip_if_process_input_unsupported(quant_dtype, group_scale_dtype)
     torch.manual_seed(0)
 
-    num_groups = -(-hidden_size // quant_group_size)
+    num_groups = ceil_div(hidden_size, quant_group_size)
     inputs = torch.randn(shape_m, num_groups, quant_group_size, device="cuda")
 
     group_exponents = torch.arange(num_groups, device="cuda") % 5 - 2

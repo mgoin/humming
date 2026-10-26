@@ -3,7 +3,7 @@ import torch
 from humming import dtypes, ops
 from humming.config import ActivationType, InputQuantizationMode, ProcessInputLayoutType
 from humming.config.mma import UNDOCUMENTED_FP_DTYPES, supports_undocumented_fp_dtypes
-from humming.utils.math import is_pow_of_two, round_up
+from humming.utils.math import ceil_div, is_pow_of_two, round_up
 
 ACTIVATION_TYPE_IMPL_TEST_MAP = {
     ActivationType.None_: {
@@ -440,7 +440,7 @@ def assert_process_input_close(
 
     if quant_mode.has_group_scale:
         assert quant_group_size is not None
-        num_groups = -(-hidden_size // quant_group_size)
+        num_groups = ceil_div(hidden_size, quant_group_size)
         assert actual_group_scales.shape == expected_group_scales.shape
         assert actual_group_scales.dtype == expected_group_scales.dtype
         actual_group_scales = unpack_group_scales(
