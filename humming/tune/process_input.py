@@ -533,9 +533,12 @@ def _tuning_config_for_device(config: ProcessInputProblemConfig, shape_m: int, d
         tile_size = config.hadamard_block_size
 
     # Candidate enumeration must satisfy the kernel's group/transform boundaries.
+    # The last quantization group may be partial; Hadamard blocks may not.
     for size in (tile_size, config.hadamard_block_size):
         assert 0 < size <= 512 and is_pow_of_two(size)
-        assert config.hidden_size % size == 0
+    assert config.hidden_size % config.hadamard_block_size == 0
+    if not quant_mode.has_group_scale:
+        assert config.hidden_size % tile_size == 0
     if quant_mode.has_group_scale:
         assert config.quant_group_size >= 2
 
@@ -562,7 +565,7 @@ def _tuning_config_for_device(config: ProcessInputProblemConfig, shape_m: int, d
         **config.to_dict(),
         should_quantize=quant_mode.should_quantize,
         tile_size=tile_size,
-        num_tiles=config.hidden_size // tile_size,
+        num_tiles=ceil_div(config.hidden_size, tile_size),
         source_bits=config.input_dtype.num_bits,
         target_bits=target_bits,
         num_work_rows=num_work_rows,

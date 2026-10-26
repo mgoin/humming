@@ -37,7 +37,8 @@ private:
   static_assert(!kUseRowMajorTma || SharedStorage::kUseUmmaRowMajorSmemInputScale);
   static constexpr uint32_t kGroupSize = kIsGroupScale ? Ctx::kInputScaleGroupSize : ProblemShape::K;
 
-  static_assert(ProblemShape::K == kGroupSize || (ProblemShape::K - PadShape::K) % kGroupSize == 0);
+  // The unpadded K may end in a partial group; columns past it are zero-filled.
+  static_assert(ProblemShape::K == kGroupSize || ProblemShape::K % kGroupSize == 0);
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kProblemNumGroups = CEIL_DIV(ProblemShape::K - PadShape::K, kGroupSize);
   static constexpr uint32_t kNumGroups = CEIL_DIV(BlockShape::K, kGroupSize);

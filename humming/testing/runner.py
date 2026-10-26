@@ -29,6 +29,7 @@ from humming.testing.tuning import (
     sample_test_tuning_configs,
 )
 from humming.transform import prepare_fp16_e8m0_scale, transform_humming_tensors
+from humming.utils.math import ceil_div
 
 _DEFAULT_SHAPE_MS = (1, 30, 257, 1024, 4090)
 TEST_TUNING_SOURCE_ENV = "HUMMING_TEST_TUNING_SOURCE"
@@ -319,7 +320,7 @@ class KernelTestRunner:
 
         if group_scale_ref is not None:
             scale_ref = group_scale_ref.view(dtypes.torch_dtype_map[config.as_dtype])
-            scale_ref = scale_ref[:, : shape_k // config.input_scale_group_size].float()
+            scale_ref = scale_ref[:, : ceil_div(shape_k, config.input_scale_group_size)].float()
             if token_scale_ref is not None:
                 scale_ref = scale_ref * token_scale_ref.float().reshape(-1, 1)
             group_size = config.input_scale_group_size
@@ -327,7 +328,8 @@ class KernelTestRunner:
             assert token_scale_ref is not None
             scale_ref = token_scale_ref.float().reshape(-1, 1)
             group_size = shape_k
-        inputs_ref = dequant_inputs.float() * scale_ref.repeat_interleave(group_size, 1)
+        # A partial last group expands past shape_k; trim it.
+        inputs_ref = dequant_inputs.float() * scale_ref.repeat_interleave(group_size, 1)[:, :shape_k]
         return inputs_ref, inputs, input_scale, input_scale_2
 
     def _sample_inputs(

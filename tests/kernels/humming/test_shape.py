@@ -231,7 +231,27 @@ NATIVE_SHAPE_CASES = tuple(
 )
 
 
-SHAPE_CASES = PROBLEM_SHAPE_CASES + PAD_SHAPE_CASES + NATIVE_SHAPE_CASES
+# FP8 GS128 activations x MXFP4 weights whose unpadded K ends in a partial input
+# scale group, e.g. a TP-split MoE intermediate (2304 / 4 = 576) padded to 640.
+PARTIAL_INPUT_GROUP_CASES = tuple(
+    _case(
+        f"fp8-gs128-mxfp4-n{shape_n}-k{shape_k}-pad{pad_shape_k}",
+        shape_n=shape_n,
+        shape_k=shape_k,
+        pad_shape_k=pad_shape_k,
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float4e2m1,
+        as_dtype=dtypes.float32,
+        bs_dtype=dtypes.float8e8m0,
+        input_scale_group_size=128,
+        weight_scale_group_size=32,
+        input_quant_mode="dynamic_group",
+    )
+    for shape_n, shape_k, pad_shape_k in ((512, 640, 64), (256, 384, 96), (256, 2944, 64))
+)
+
+
+SHAPE_CASES = PROBLEM_SHAPE_CASES + PAD_SHAPE_CASES + NATIVE_SHAPE_CASES + PARTIAL_INPUT_GROUP_CASES
 
 
 @pytest.mark.parametrize("test_case", SHAPE_CASES, ids=str)

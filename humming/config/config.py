@@ -725,7 +725,7 @@ class ProcessInputProblemConfig(BaseHummingConfig):
         return dtypes.torch_dtype_map[self.group_scale_dtype]
 
     def get_group_scale_shape(self, rows: int) -> tuple[int, int]:
-        groups = self.hidden_size // self.quant_group_size
+        groups = -(-self.hidden_size // self.quant_group_size)
         if self.group_scale_dtype.num_bits == 8:
             groups = (groups + 3) // 4
         if self.use_m_major_input_scale:

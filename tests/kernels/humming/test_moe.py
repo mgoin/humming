@@ -239,6 +239,29 @@ MOE_CASES = (
         input_scale_group_size=64,
         weight_scale_group_size=64,
     ),
+) + tuple(
+    # FP8 GS128 x MXFP4 whose unpadded K (576, a TP-split MoE intermediate)
+    # ends in a partial input-scale group.
+    _case(
+        f"{name}-fp8-gs128-mxfp4-partial-input-group",
+        gemm_type,
+        use_m_major_input_scale=use_m_major_input_scale,
+        shape_k=640,
+        pad_shape_k=64,
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float4e2m1,
+        as_dtype=dtypes.float32,
+        bs_dtype=dtypes.float8e8m0,
+        input_quant_mode="dynamic_group",
+        input_scale_group_size=128,
+        weight_scale_group_size=32,
+    )
+    for name, gemm_type, use_m_major_input_scale in (
+        ("indexed", GemmType.INDEXED, False),
+        ("grouped-contiguous", GemmType.GROUPED_CONTIGUOUS, False),
+        ("m-major-grouped-contiguous", GemmType.GROUPED_CONTIGUOUS, True),
+        ("grouped-masked", GemmType.GROUPED_MASKED, False),
+    )
 )
 
 

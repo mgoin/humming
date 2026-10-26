@@ -32,6 +32,15 @@ from humming.testing.process_input import (
         (3, 768, 128, "static_tensor_dynamic_group", "float8e8m0", False),
         (3, 768, 128, "dynamic_group_token", "float8e4m3", False),
         (129, 32768, 512, "dynamic_group_token", "float8e4m3", True),
+        # Partial last group, e.g. a TP-split MoE intermediate (2304 / 4 = 576).
+        (3, 576, 128, "dynamic_group", "float32", False),
+        (3, 576, 128, "dynamic_group", "float32", True),
+        (129, 288, 128, "dynamic_group", "float32", False),
+        (2049, 2880, 128, "dynamic_group", "float32", False),
+        (3, 576, 128, "dynamic_group", "float8e8m0", False),
+        (3, 576, 128, "dynamic_group", "float8e4m3", True),
+        (3, 576, 128, "static_tensor_dynamic_group", "float32", False),
+        (3, 576, 128, "dynamic_group_token", "float8e4m3", False),
     ],
 )
 def test_quantization_scales(
@@ -47,13 +56,13 @@ def test_quantization_scales(
     skip_if_process_input_unsupported(quant_dtype, group_scale_dtype)
     torch.manual_seed(0)
 
-    num_groups = hidden_size // quant_group_size
+    num_groups = -(-hidden_size // quant_group_size)
     inputs = torch.randn(shape_m, num_groups, quant_group_size, device="cuda")
 
     group_exponents = torch.arange(num_groups, device="cuda") % 5 - 2
     group_amplitudes = torch.exp2(group_exponents.float())
     inputs *= group_amplitudes[None, :, None]
-    inputs = inputs.flatten(1)
+    inputs = inputs.flatten(1)[:, :hidden_size].contiguous()
     inputs[0] = 0
 
     quant_mode = InputQuantizationMode(quant_mode)
